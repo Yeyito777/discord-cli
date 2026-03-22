@@ -389,6 +389,133 @@ def send_message(channel_id, content, reply_to=None, tts=False):
     return post(f"/channels/{channel_id}/messages", body=body)
 
 
+def send_message_with_files(channel_id, file_paths, content=None, reply_to=None, tts=False):
+    """Send a message with file attachments using multipart/form-data.
+
+    Discord expects:
+      - A 'payload_json' part with the message body (application/json)
+      - One or more 'files[N]' parts with the actual file data
+    """
+    import mimetypes
+    import os
+
+    boundary = f"----ExoDiscord{uuid.uuid4().hex}"
+
+    # Build payload_json
+    payload = {"tts": tts}
+    if content:
+        payload["content"] = content
+    if reply_to:
+        payload["message_reference"] = {"message_id": reply_to}
+
+    # Populate attachments metadata so Discord knows about each file
+    attachments = []
+    for i, fp in enumerate(file_paths):
+        attachments.append({
+            "id": i,
+            "filename": os.path.basename(fp),
+        })
+    payload["attachments"] = attachments
+
+    # Build multipart body
+    parts = []
+
+    # payload_json part
+    parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="payload_json"\r\n'
+        f"Content-Type: application/json\r\n"
+        f"\r\n"
+        f"{json.dumps(payload)}\r\n"
+    )
+
+    # File parts
+    for i, fp in enumerate(file_paths):
+        filename = os.path.basename(fp)
+        mime_type = mimetypes.guess_type(fp)[0] or "application/octet-stream"
+        with open(fp, "rb") as f:
+            file_data = f.read()
+
+        # Header portion (text)
+        header = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="files[{i}]"; filename="{filename}"\r\n'
+            f"Content-Type: {mime_type}\r\n"
+            f"\r\n"
+        )
+        parts.append(header.encode("utf-8") + file_data + b"\r\n")
+
+    # Closing boundary
+    parts.append(f"--{boundary}--\r\n")
+
+    # Combine into a single bytes body
+    body_parts = []
+    for part in parts:
+        if isinstance(part, str):
+            body_parts.append(part.encode("utf-8"))
+        else:
+            body_parts.append(part)
+    body = b"".join(body_parts)
+
+    # Build headers — start from standard auth headers but override Content-Type
+    hdrs = dict(_headers())
+    hdrs["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    hdrs["Content-Length"] = str(len(body))
+
+    url = f"{API_BASE}/channels/{channel_id}/messages"
+
+    entry = _get_connection()
+    conn = entry[0]
+
+    try:
+        try:
+            conn.request("POST", url, body, hdrs)
+            resp = conn.getresponse()
+            raw = resp.read()
+        except (BrokenPipeError, ConnectionResetError, http.client.RemoteDisconnected, TimeoutError):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = http.client.HTTPSConnection(API_HOST, 443, timeout=30)
+            entry[0] = conn
+            conn.request("POST", url, body, hdrs)
+            resp = conn.getresponse()
+            raw = resp.read()
+
+        status = resp.status
+
+        if status == 204:
+            return None
+        if 200 <= status < 300:
+            if not raw:
+                return None
+            return json.loads(raw)
+
+        try:
+            err = json.loads(raw)
+            msg = err.get("message", raw.decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            msg = raw.decode("utf-8", errors="replace") if raw else f"HTTP {status}"
+
+        raise RuntimeError(f"HTTP {status}: {msg}")
+
+    except Exception as e:
+        if isinstance(e, RuntimeError):
+            raise
+        try:
+            conn.close()
+        except Exception:
+            pass
+        with _pool_lock:
+            if entry in _pool:
+                _pool.remove(entry)
+        raise RuntimeError(f"Network error: {e}")
+
+    finally:
+        _release_connection(entry)
+
+
 def edit_message(channel_id, message_id, content):
     """Edit a message."""
     return patch(
