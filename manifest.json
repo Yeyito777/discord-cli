@@ -1,0 +1,9 @@
+{
+  "name": "discord",
+  "bin": "./bin/discord",
+  "systemHint": "You have access to the user's Discord through the `discord` CLI tool (source at ~/Workspace/Exocortex/external-tools/discord-cli). Run `discord -h` for usage reference.",
+  "display": {
+    "label": "Discord",
+    "color": "#5865F2"
+  }
+}

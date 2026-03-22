@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Discord CLI — terminal client for Discord (Exocortex external tool).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+PYTHON="$PROJECT_DIR/.venv/bin/python3"
+
+export PYTHONPATH="$PROJECT_DIR"
+
+usage() {
+    cat <<'EOF'
+usage: discord <command> [args]
+
+commands:
+  guilds       List your servers                (alias: servers)
+  guild        Show server details              (alias: server)
+  channels     List channels in a server        (alias: chs)
+  messages     Read messages from a channel     (alias: msgs)
+  dms          List DM conversations
+  dm           Read or send DMs
+  search       Search messages                  (alias: s)
+  pins         Get pinned messages
+  threads      List active threads in a server
+  members      List or search server members
+  me           Show current user info
+  send         Send a message
+  reply        Reply to a message
+  edit         Edit a message
+  delete       Delete a message                 (alias: del)
+  react        React to a message
+  unreact      Remove a reaction
+  join         Join a server via invite link
+  leave        Leave a server
+  typing       Trigger typing indicator
+  read         Mark channel as read
+  login        Configure authentication         (alias: setup, auth)
+  logout       Remove saved credentials
+
+Run 'discord <command> --help' for command-specific usage.
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 1
+fi
+
+cmd="$1"; shift
+
+case "$cmd" in
+    guilds|servers|guild|server|channels|chs|messages|msgs|dms|dm|search|s|pins|threads|members|me)
+        exec "$PYTHON" -c "import sys; from src.reading import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
+    send|reply|edit|delete|del|react|unreact)
+        exec "$PYTHON" -c "import sys; from src.writing import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
+    join|leave|typing|read)
+        exec "$PYTHON" -c "import sys; from src.managing import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
+    login|setup|auth|logout)
+        exec "$PYTHON" -c "import sys; from src.auth import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
+    help|--help|-h)
+        usage ;;
+    *)
+        echo "discord: unknown command '$cmd'" >&2
+        echo "Run 'discord --help' for usage." >&2
+        exit 1 ;;
+esac
