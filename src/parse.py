@@ -83,7 +83,7 @@ def parse_message(msg):
         reply_to = {
             "id": ref["id"],
             "author": ref_author,
-            "content": ref.get("content", "")[:100],
+            "content": ref.get("content", ""),
         }
 
     # Stickers

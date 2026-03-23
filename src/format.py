@@ -27,11 +27,14 @@ def format_message(msg, indent=0):
     if msg["reply_to"]:
         ref = msg["reply_to"]
         ref_name = ref["author"]["display_name"]
-        ref_text = ref["content"][:80]
+        ref_id = ref["id"]
+        ref_text = ref["content"].replace("\n", " ")
+        if len(ref_text) > 200:
+            ref_text = ref_text[:200] + "…"
         if ref_text:
-            lines.append(f"{pad}  ↩ {ref_name}: {ref_text}")
+            lines.append(f"{pad}  ↩ {ref_name} [{ref_id}]: {ref_text}")
         else:
-            lines.append(f"{pad}  ↩ {ref_name}")
+            lines.append(f"{pad}  ↩ {ref_name} [{ref_id}]")
 
     # Header
     if username != name:
