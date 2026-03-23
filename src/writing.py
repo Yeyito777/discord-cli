@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import re
 
 from src import api
 from src.resolve import resolve_guild, resolve_channel
@@ -13,6 +14,54 @@ def _validate_files(file_paths):
         if not os.path.isfile(fp):
             raise RuntimeError(f"File not found: {fp}")
     return file_paths
+
+
+def _resolve_mentions(text, guild_id=None):
+    """Replace @username with <@user_id> in outgoing messages.
+
+    Checks notify config labels first (no API call), then tries guild
+    member search for server channels. Skips @everyone, @here, and
+    already-resolved mentions like <@123>.
+    """
+    if not text or "@" not in text:
+        return text
+
+    # Build username → user_id map from notify config
+    known = {}
+    try:
+        from src.notify import get_labels
+        for user_id, entry in get_labels().items():
+            if isinstance(entry, dict) and entry.get("username"):
+                known[entry["username"].lower()] = user_id
+    except Exception:
+        pass
+
+    def replacer(match):
+        username = match.group(1)
+        if username.lower() in ("everyone", "here"):
+            return match.group(0)  # leave @everyone/@here as-is
+
+        # Check known users first (from notify config)
+        uid = known.get(username.lower())
+        if uid:
+            return f"<@{uid}>"
+
+        # Try guild member search for server channels
+        if guild_id:
+            try:
+                members = api.search_guild_members(guild_id, username, limit=1)
+                if members:
+                    member = members[0]
+                    user = member.get("user", member)
+                    if user.get("username", "").lower() == username.lower():
+                        return f"<@{user['id']}>"
+            except Exception:
+                pass
+
+        return match.group(0)  # no match — leave as-is
+
+    # Match @username but not <@id> or email-like patterns
+    return re.sub(r"(?<![<\w])@([\w.]{2,32})(?![\w.])", replacer, text)
 
 
 def send(argv):
@@ -33,13 +82,15 @@ def send(argv):
         guild_id = g["id"]
     ch = resolve_channel(args.channel, guild_id)
 
+    text = _resolve_mentions(args.text, guild_id)
+
     if args.files:
         _validate_files(args.files)
         data = api.send_message_with_files(
-            ch["id"], args.files, content=args.text, reply_to=args.reply,
+            ch["id"], args.files, content=text, reply_to=args.reply,
         )
     else:
-        data = api.send_message(ch["id"], args.text, reply_to=args.reply)
+        data = api.send_message(ch["id"], text, reply_to=args.reply)
     print(f"Sent. Message ID: {data['id']}")
 
 
@@ -61,13 +112,15 @@ def reply(argv):
         guild_id = g["id"]
     ch = resolve_channel(args.channel, guild_id)
 
+    text = _resolve_mentions(args.text, guild_id)
+
     if args.files:
         _validate_files(args.files)
         data = api.send_message_with_files(
-            ch["id"], args.files, content=args.text, reply_to=args.message,
+            ch["id"], args.files, content=text, reply_to=args.message,
         )
     else:
-        data = api.send_message(ch["id"], args.text, reply_to=args.message)
+        data = api.send_message(ch["id"], text, reply_to=args.message)
     print(f"Replied. Message ID: {data['id']}")
 
 

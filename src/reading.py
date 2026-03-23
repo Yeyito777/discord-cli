@@ -82,6 +82,9 @@ def dm(argv):
 
     if args.send_text is not None:
         text = args.send_text or None  # convert empty string to None
+        if text:
+            from src.writing import _resolve_mentions
+            text = _resolve_mentions(text)
         if args.files:
             for fp in args.files:
                 if not os.path.isfile(fp):
