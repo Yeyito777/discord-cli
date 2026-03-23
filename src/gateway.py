@@ -410,7 +410,12 @@ class GatewayListener:
         threading.Thread(target=self._relay_sender, daemon=True).start()
 
     def _relay_sender(self):
-        """Process the relay queue — sends batched notifications via exo."""
+        """Process the relay queue — sends batched notifications via exo.
+
+        Tries `exo send` first (delivers as a user message to the conversation).
+        If that fails (e.g. conversation is actively streaming), falls back to
+        `exo queue` which the daemon holds and injects on the next turn.
+        """
         while self.running:
             with self._relay_lock:
                 if not self._relay_queue:
@@ -424,14 +429,41 @@ class GatewayListener:
 
             for conv_id in self.relay_targets:
                 try:
+                    # Try send first
                     result = subprocess.run(
                         ["exo", "send", msg, "-c", conv_id, "--timeout", "600"],
                         capture_output=True, text=True, timeout=660,
                     )
-                    if result.returncode != 0:
-                        self._log(f"Relay to {conv_id} failed: {result.stderr[:200]}")
+                    if result.returncode == 0:
+                        self._log(f"Relay to {conv_id}: sent via 'exo send'")
+                        continue
+
+                    # send failed — check if it's a streaming conflict or other error
+                    stderr = result.stderr or ""
+                    self._log(f"Relay to {conv_id}: send failed ({stderr.strip()[:120]}), falling back to queue")
+
+                    # Fall back to queue (next-turn delivery)
+                    qresult = subprocess.run(
+                        ["exo", "queue", conv_id, msg],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    if qresult.returncode == 0:
+                        self._log(f"Relay to {conv_id}: queued via 'exo queue'")
+                    else:
+                        self._log(f"Relay to {conv_id}: queue also failed: {qresult.stderr[:200]}")
                 except subprocess.TimeoutExpired:
-                    self._log(f"Relay to {conv_id} timed out")
+                    self._log(f"Relay to {conv_id} timed out, falling back to queue")
+                    try:
+                        qresult = subprocess.run(
+                            ["exo", "queue", conv_id, msg],
+                            capture_output=True, text=True, timeout=30,
+                        )
+                        if qresult.returncode == 0:
+                            self._log(f"Relay to {conv_id}: queued via 'exo queue' (after send timeout)")
+                        else:
+                            self._log(f"Relay to {conv_id}: queue fallback also failed: {qresult.stderr[:200]}")
+                    except Exception as qe:
+                        self._log(f"Relay to {conv_id}: queue fallback error: {qe}")
                 except Exception as e:
                     self._log(f"Relay to {conv_id} error: {e}")
 
