@@ -442,7 +442,7 @@ class GatewayListener:
         """Format notification batch into a human-readable message."""
         try:
             from src.notify import get_labels
-            labels = get_labels()
+            labels = get_labels()  # user_id → {label, username, ...}
         except Exception:
             labels = {}
 
@@ -450,7 +450,9 @@ class GatewayListener:
         for n in batch:
             name = n.get("display_name") or n.get("author", "?")
             username = n.get("author", "?")
-            label = labels.get(username, "")
+            author_id = n.get("author_id", "")
+            entry = labels.get(author_id, {})
+            label = entry.get("label", "") if isinstance(entry, dict) else entry
             label_str = f" [{label}]" if label else ""
             content = n.get("content", "")[:200]
 

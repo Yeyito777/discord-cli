@@ -50,7 +50,7 @@ def get_relay_targets():
 
 
 def get_labels():
-    """Return dict of username → label (e.g. 'owner', 'friend')."""
+    """Return dict of user_id → {label, username, display_name}."""
     return _load_config().get("labels", {})
 
 
@@ -92,25 +92,34 @@ def remove(argv):
 
 def label(argv):
     p = argparse.ArgumentParser(prog="discord notify label",
-        description="Set a label for a Discord username.")
-    p.add_argument("username", help="Discord username (e.g. yeyito777)")
-    p.add_argument("label", nargs="?", help="Label (e.g. owner, friend). Omit to remove.")
+        description="Set a label for a Discord user (keyed by user ID for security).")
+    p.add_argument("user_id", help="Discord user ID (snowflake)")
+    p.add_argument("label_value", nargs="?", metavar="label",
+                   help="Label (e.g. owner, friend). Omit to remove.")
+    p.add_argument("--username", "-u", help="Username (for display, not matching)")
+    p.add_argument("--name", "-n", help="Display name / nickname (for display)")
     args = p.parse_args(argv)
 
     cfg = _load_config()
     labels = cfg.setdefault("labels", {})
 
-    if args.label:
-        labels[args.username] = args.label
+    if args.label_value:
+        entry = {"label": args.label_value}
+        if args.username:
+            entry["username"] = args.username
+        if args.name:
+            entry["name"] = args.name
+        labels[args.user_id] = entry
         _save_config(cfg)
-        print(f"  @{args.username} → {args.label}")
+        display = f"@{args.username}" if args.username else args.user_id
+        print(f"  {display} → {args.label_value}")
     else:
-        if args.username in labels:
-            del labels[args.username]
+        if args.user_id in labels:
+            del labels[args.user_id]
             _save_config(cfg)
-            print(f"  Removed label for @{args.username}")
+            print(f"  Removed label for {args.user_id}")
         else:
-            print(f"  No label set for @{args.username}")
+            print(f"  No label set for {args.user_id}")
 
 
 def list_config(argv):
@@ -131,8 +140,17 @@ def list_config(argv):
 
     print("  Labels:")
     if labels:
-        for username, lbl in sorted(labels.items()):
-            print(f"    @{username} → {lbl}")
+        for user_id, entry in sorted(labels.items(), key=lambda x: x[1].get("label", "")):
+            if isinstance(entry, dict):
+                lbl = entry.get("label", "?")
+                uname = entry.get("username", "")
+                name = entry.get("name", "")
+                display = f"@{uname}" if uname else user_id
+                extra = f" ({name})" if name and name != uname else ""
+                print(f"    {display}{extra} [{user_id}] → {lbl}")
+            else:
+                # Legacy format (plain string)
+                print(f"    {user_id} → {entry}")
     else:
         print("    (none)")
 
