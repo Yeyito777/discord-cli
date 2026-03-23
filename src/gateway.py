@@ -94,12 +94,12 @@ class GatewayListener:
         signal.signal(signal.SIGINT, self._shutdown)
 
     def _shutdown(self, signum=None, frame=None):
+        sig_name = signal.Signals(signum).name if signum else "?"
+        self._log(f"Received {sig_name}, shutting down")
         self.running = False
-        if self.ws:
-            try:
-                self.ws.close()
-            except Exception:
-                pass
+        # Don't close ws here — we may be inside recv_data() on the main
+        # thread and ws.close() can deadlock.  The 1s socket timeout will
+        # break us out of recv, the loop checks self.running, and exits.
 
     # ─── Main loop ───────────────────────────────────────────────────────────
 
@@ -155,7 +155,7 @@ class GatewayListener:
 
         self._inflator = zlib.decompressobj()
         self.ws = websocket.WebSocket()
-        self.ws.settimeout(5)   # allow signal delivery between recvs
+        self.ws.settimeout(1)   # short timeout so SIGTERM is handled promptly
         self.ws.connect(
             f"{url}/?v=9&encoding=json&compress=zlib-stream",
             header=[
@@ -533,4 +533,14 @@ if __name__ == "__main__":
         sys.exit(1)
 
     targets = sys.argv[3:] if len(sys.argv) > 3 else []
+
+    # If no relay targets on CLI, try loading from config/notify.json
+    if not targets:
+        config_path = Path(project_root) / "config" / "notify.json"
+        try:
+            with open(config_path) as f:
+                targets = json.load(f).get("relay_targets", [])
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            pass
+
     GatewayListener(sys.argv[1], sys.argv[2], relay_targets=targets).run()
