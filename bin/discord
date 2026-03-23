@@ -30,6 +30,10 @@ commands:
   delete       Delete a message                 (alias: del)
   react        React to a message
   unreact      Remove a reaction
+  listen       Start real-time channel listener
+  unlisten     Stop a channel listener
+  listeners    List active listeners
+  notify       Manage notification relay           (add, remove, label, list, start, stop)
   join         Join a server via invite link
   leave        Leave a server
   typing       Trigger typing indicator
@@ -53,6 +57,10 @@ case "$cmd" in
         exec "$PYTHON" -c "import sys; from src.reading import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     send|reply|edit|delete|del|react|unreact)
         exec "$PYTHON" -c "import sys; from src.writing import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
+    listen|unlisten|listeners)
+        exec "$PYTHON" -c "import sys; from src.listening import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
+    notify)
+        exec "$PYTHON" -c "import sys; from src.notify import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     join|leave|typing|read)
         exec "$PYTHON" -c "import sys; from src.managing import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     login|setup|auth|logout)
