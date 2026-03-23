@@ -456,16 +456,19 @@ class GatewayListener:
             label_str = f" [{label}]" if label else ""
             content = n.get("content", "")[:200]
 
+            msg_id = n.get("msg_id", "")
+            id_tag = f" [msg:{msg_id}]" if msg_id else ""
+
             if n.get("type") == "dm":
                 parts.append(
-                    f'DM from {name} (@{username}){label_str}: "{content}"'
+                    f'DM from {name} (@{username}){label_str}{id_tag}: "{content}"'
                 )
             else:
                 guild = n.get("guild_name", "?")
                 channel = n.get("channel_name", "?")
                 parts.append(
                     f'@mention from {name} (@{username}){label_str}'
-                    f' in #{channel} ({guild}): "{content}"'
+                    f' in #{channel} ({guild}){id_tag}: "{content}"'
                 )
 
         if len(parts) == 1:
