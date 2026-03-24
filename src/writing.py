@@ -3,6 +3,7 @@
 import argparse
 import os
 import re
+import sys
 
 from src import api
 from src.resolve import resolve_guild, resolve_channel
@@ -58,6 +59,8 @@ def _resolve_mentions(text, guild_id=None):
     except Exception:
         pass
 
+    unresolved = []
+
     def replacer(match):
         mention = match.group(1)
         if mention.lower() in ("everyone", "here"):
@@ -84,10 +87,22 @@ def _resolve_mentions(text, guild_id=None):
             except Exception:
                 pass
 
-        return match.group(0)  # no match — leave as-is
+        unresolved.append(mention)
+        return match.group(0)
 
     # Match @username but not <@id> or email-like patterns
-    return re.sub(r"(?<![<\w])@([\w.]{2,32})(?![\w.])", replacer, text)
+    result = re.sub(r"(?<![<\w])@([\w.]{2,32})(?![\w.])", replacer, text)
+
+    if unresolved:
+        names = ", ".join(f"@{n}" for n in unresolved)
+        print(
+            f"Error: could not resolve mention(s): {names}\n"
+            f"Hint: not found in notify.json labels or guild member search",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return result
 
 
 def send(argv):
