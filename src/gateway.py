@@ -383,6 +383,17 @@ class GatewayListener:
             "msg_id": d.get("id", ""),
         }
 
+        # Extract reply reference if present
+        ref = d.get("referenced_message")
+        if ref and isinstance(ref, dict):
+            ref_author = ref.get("author", {})
+            notif["reply_to"] = {
+                "msg_id": ref.get("id", ""),
+                "author": ref_author.get("username", ""),
+                "display_name": ref_author.get("global_name") or ref_author.get("username", ""),
+                "content": (ref.get("content") or "")[:100],
+            }
+
         if not is_dm:
             guild_id = d.get("guild_id", "")
             notif["guild_id"] = guild_id
@@ -468,16 +479,24 @@ class GatewayListener:
             msg_id = n.get("msg_id", "")
             id_tag = f" [msg:{msg_id}]" if msg_id else ""
 
+            # Format reply context if present
+            reply_ctx = ""
+            reply_to = n.get("reply_to")
+            if reply_to:
+                ref_name = reply_to.get("display_name") or reply_to.get("author", "?")
+                ref_preview = reply_to.get("content", "")[:80]
+                reply_ctx = f' (replying to {ref_name}: "{ref_preview}")'
+
             if n.get("type") == "dm":
                 parts.append(
-                    f'DM from {name} (@{username}){label_str}{id_tag}: "{content}"'
+                    f'DM from {name} (@{username}){label_str}{id_tag}{reply_ctx}: "{content}"'
                 )
             else:
                 guild = n.get("guild_name", "?")
                 channel = n.get("channel_name", "?")
                 parts.append(
                     f'@mention from {name} (@{username}){label_str}'
-                    f' in #{channel} ({guild}){id_tag}: "{content}"'
+                    f' in #{channel} ({guild}){id_tag}{reply_ctx}: "{content}"'
                 )
 
         if len(parts) == 1:
