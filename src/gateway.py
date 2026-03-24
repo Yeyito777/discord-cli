@@ -10,6 +10,7 @@ import http.client
 import json
 import os
 import random
+import re
 import signal
 import subprocess
 import sys
@@ -84,6 +85,7 @@ class GatewayListener:
         self._inflator = zlib.decompressobj()
         self._guilds = {}      # guild_id → name (populated from READY, used in notify mode)
         self._channels = {}    # channel_id → {name, guild_name} (same)
+        self._members = {}     # user_id → display_name (from guild member data)
 
         # Notification relay queue (notify mode with relay_conv)
         self._relay_queue = []
@@ -501,7 +503,7 @@ class GatewayListener:
 
                 # Fetch recent channel history for server mentions
                 history_lines = self._fetch_channel_history(
-                    n.get("channel_id", ""), msg_id, history_cache
+                    n.get("channel_id", ""), msg_id, history_cache, labels
                 )
 
                 # Notification line — ⟶ prefix distinguishes from history
@@ -532,11 +534,12 @@ class GatewayListener:
             body = "\n".join(f"  \u2022 {p}" for p in parts)
             return f"{header}\n{body}"
 
-    def _fetch_channel_history(self, channel_id, exclude_msg_id, cache):
+    def _fetch_channel_history(self, channel_id, exclude_msg_id, cache, labels=None):
         """Fetch recent messages from a channel for context.
 
         Returns a list of formatted history lines (chronological), or empty list.
         Each line includes [msg:id] and reply context if applicable.
+        Resolves <@id> mentions to readable names and shows attachments/embeds.
         """
         if not channel_id:
             return []
@@ -554,6 +557,40 @@ class GatewayListener:
         if not messages:
             return []
 
+        # Build user_id → display_name map for mention resolution
+        user_names = {}
+
+        # 1. From labels config
+        if labels:
+            for uid, entry in labels.items():
+                if isinstance(entry, dict):
+                    name = entry.get("name") or entry.get("username")
+                else:
+                    name = str(entry)
+                if name:
+                    user_names[uid] = name
+
+        # 2. From guild member data (READY event)
+        for uid, name in self._members.items():
+            if uid not in user_names:
+                user_names[uid] = name
+
+        # 3. From message authors and mentions in this history batch
+        for m in messages:
+            author = m.get("author", {})
+            aid = author.get("id")
+            if aid and aid not in user_names:
+                user_names[aid] = author.get("global_name") or author.get("username", "?")
+            for mention in m.get("mentions", []):
+                mid = mention.get("id")
+                if mid and mid not in user_names:
+                    user_names[mid] = mention.get("global_name") or mention.get("username", "?")
+
+        def _resolve_mention(match):
+            uid = match.group(1)
+            name = user_names.get(uid)
+            return f"@{name}" if name else match.group(0)
+
         lines = []
         for m in messages:
             if m.get("id") == exclude_msg_id:
@@ -563,24 +600,56 @@ class GatewayListener:
             body = (m.get("content") or "")[:150]
             mid = m.get("id", "?")
 
-            if not body:
-                continue
+            # Resolve user mentions (<@id> and <@!id>) in body
+            if body:
+                body = re.sub(r'<@!?(\d+)>', _resolve_mention, body)
+
+            # Build attachment / embed / sticker indicators
+            extras = []
+
+            attachments = m.get("attachments") or []
+            if attachments:
+                filenames = [a.get("filename", "file") for a in attachments]
+                extras.append(f"[📎 {', '.join(filenames)}]")
+
+            for embed in (m.get("embeds") or []):
+                title = embed.get("title")
+                if title:
+                    extras.append(f"[🔗 {title}]")
+                elif embed.get("url"):
+                    extras.append(f"[🔗 {embed['url']}]")
+
+            for sticker in (m.get("sticker_items") or []):
+                extras.append(f"[sticker: {sticker.get('name', '?')}]")
+
+            extra_str = " ".join(extras)
+
+            # Combine body text and extras
+            if body and extra_str:
+                content = f"{body} {extra_str}"
+            elif body:
+                content = body
+            elif extra_str:
+                content = extra_str
+            else:
+                continue  # nothing to show
 
             # Check if this message is a reply
             ref = m.get("referenced_message")
             if ref and isinstance(ref, dict):
                 ref_author = ref.get("author", {})
                 ref_name = ref_author.get("global_name") or ref_author.get("username", "?")
-                lines.append(f"  [msg:{mid}] (reply to {ref_name}) {author_name}: {body}")
+                lines.append(f"  [msg:{mid}] (reply to {ref_name}) {author_name}: {content}")
             else:
-                lines.append(f"  [msg:{mid}] {author_name}: {body}")
+                lines.append(f"  [msg:{mid}] {author_name}: {content}")
 
         return lines
 
     def _build_name_maps(self, ready_data):
-        """Build guild/channel name mappings from the READY event."""
+        """Build guild/channel/member name mappings from the READY event."""
         self._guilds = {}
         self._channels = {}
+        self._members = {}
         for guild in ready_data.get("guilds", []):
             props = guild.get("properties", guild)
             gid = guild.get("id") or props.get("id", "")
@@ -591,6 +660,16 @@ class GatewayListener:
                     "name": ch.get("name", "?"),
                     "guild_name": gname,
                 }
+            # Extract member display names
+            for member in guild.get("members", []):
+                user = member.get("user", {})
+                uid = user.get("id")
+                if uid:
+                    name = (member.get("nick")
+                            or user.get("global_name")
+                            or user.get("username"))
+                    if name:
+                        self._members[uid] = name
 
     # ─── Output ──────────────────────────────────────────────────────────────
 
