@@ -466,6 +466,9 @@ class GatewayListener:
         except Exception:
             labels = {}
 
+        # Cache channel history fetches within this batch
+        history_cache = {}  # channel_id → list of message dicts (chronological)
+
         parts = []
         for n in batch:
             name = n.get("display_name") or n.get("author", "?")
@@ -494,17 +497,64 @@ class GatewayListener:
             else:
                 guild = n.get("guild_name", "?")
                 channel = n.get("channel_name", "?")
-                parts.append(
+
+                # Fetch recent channel history for server mentions
+                history_block = self._fetch_channel_history(
+                    n.get("channel_id", ""), channel, msg_id, history_cache
+                )
+
+                mention_line = (
                     f'@mention from {name} (@{username}){label_str}'
                     f' in #{channel} ({guild}){id_tag}{reply_ctx}: "{content}"'
                 )
+                if history_block:
+                    parts.append(f'{history_block}\n{mention_line}')
+                else:
+                    parts.append(mention_line)
 
         if len(parts) == 1:
-            return f"[Discord Notification] {parts[0]}"
+            # Server mentions with history are multiline; DMs stay on one line
+            if "\n" in parts[0]:
+                return f"[Discord Notification]\n{parts[0]}"
+            else:
+                return f"[Discord Notification] {parts[0]}"
         else:
             header = f"[Discord Notification] {len(parts)} new:"
             body = "\n".join(f"  • {p}" for p in parts)
             return f"{header}\n{body}"
+
+    def _fetch_channel_history(self, channel_id, channel_name, exclude_msg_id, cache):
+        """Fetch recent messages from a channel for context. Returns formatted string or empty."""
+        if not channel_id:
+            return ""
+
+        if channel_id not in cache:
+            try:
+                from src.api import get_messages
+                msgs = get_messages(channel_id, limit=7)
+                cache[channel_id] = list(reversed(msgs)) if msgs else []
+            except Exception as e:
+                self._log(f"Failed to fetch history for {channel_id}: {e}")
+                cache[channel_id] = []
+
+        messages = cache[channel_id]
+        if not messages:
+            return ""
+
+        lines = []
+        for m in messages:
+            if m.get("id") == exclude_msg_id:
+                continue
+            author = m.get("author", {})
+            author_name = author.get("global_name") or author.get("username", "?")
+            body = (m.get("content") or "")[:150]
+            if body:
+                lines.append(f"  {author_name}: {body}")
+
+        if not lines:
+            return ""
+
+        return f"Recent #{channel_name} history:\n" + "\n".join(lines)
 
     def _build_name_maps(self, ready_data):
         """Build guild/channel name mappings from the READY event."""
