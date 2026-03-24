@@ -86,6 +86,7 @@ class GatewayListener:
         self._guilds = {}      # guild_id → name (populated from READY, used in notify mode)
         self._channels = {}    # channel_id → {name, guild_name} (same)
         self._members = {}     # user_id → display_name (from guild member data)
+        self._dm_channel_names = {}  # channel_id → friendly name for DMs
 
         # Notification relay queue (notify mode with relay_conv)
         self._relay_queue = []
@@ -493,9 +494,11 @@ class GatewayListener:
                 reply_ctx = f' (replying to {ref_name}: "{ref_preview}")'
 
             if n.get("type") == "dm":
-                # DMs: no history, no header, keep exactly as-is
+                ch_id = n.get("channel_id", "")
+                ch_name = self._dm_channel_names.get(ch_id, ch_id)
+                ch_tag = f" [ch:{ch_name}]" if ch_id else ""
                 parts.append(
-                    f'DM from {name} (@{username}){label_str}{id_tag}{reply_ctx}: "{content}"'
+                    f'DM from {name} (@{username}){label_str}{ch_tag}{id_tag}{reply_ctx}: "{content}"'
                 )
             else:
                 guild = n.get("guild_name", "?")
@@ -670,6 +673,25 @@ class GatewayListener:
                             or user.get("username"))
                     if name:
                         self._members[uid] = name
+
+        # Build friendly names for DM channels
+        self._dm_channel_names = {}
+        for ch in ready_data.get("private_channels", []):
+            ch_id = ch.get("id", "")
+            recipients = ch.get("recipients", ch.get("recipient_ids", []))
+            if ch.get("type") == 1 and recipients:  # 1-on-1 DM
+                r = recipients[0]
+                if isinstance(r, dict):
+                    self._dm_channel_names[ch_id] = r.get("username", ch_id)
+            elif ch.get("type") == 3:  # Group DM
+                name = ch.get("name")
+                if name:
+                    self._dm_channel_names[ch_id] = name
+                elif isinstance(recipients, list) and recipients:
+                    names = [r.get("global_name") or r.get("username", "?")
+                             for r in recipients if isinstance(r, dict)]
+                    if names:
+                        self._dm_channel_names[ch_id] = "+".join(sorted(names))
 
     # ─── Output ──────────────────────────────────────────────────────────────
 
