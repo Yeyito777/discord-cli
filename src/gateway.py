@@ -467,7 +467,7 @@ class GatewayListener:
             labels = {}
 
         # Cache channel history fetches within this batch
-        history_cache = {}  # channel_id → list of message dicts (chronological)
+        history_cache = {}  # channel_id → list of formatted history lines (chronological)
 
         parts = []
         for n in batch:
@@ -491,6 +491,7 @@ class GatewayListener:
                 reply_ctx = f' (replying to {ref_name}: "{ref_preview}")'
 
             if n.get("type") == "dm":
+                # DMs: no history, no header, keep exactly as-is
                 parts.append(
                     f'DM from {name} (@{username}){label_str}{id_tag}{reply_ctx}: "{content}"'
                 )
@@ -499,18 +500,26 @@ class GatewayListener:
                 channel = n.get("channel_name", "?")
 
                 # Fetch recent channel history for server mentions
-                history_block = self._fetch_channel_history(
-                    n.get("channel_id", ""), channel, msg_id, history_cache
+                history_lines = self._fetch_channel_history(
+                    n.get("channel_id", ""), msg_id, history_cache
                 )
 
-                mention_line = (
-                    f'@mention from {name} (@{username}){label_str}'
-                    f' in #{channel} ({guild}){id_tag}{reply_ctx}: "{content}"'
-                )
-                if history_block:
-                    parts.append(f'{history_block}\n{mention_line}')
+                # Notification line — ⟶ prefix distinguishes from history
+                if history_lines:
+                    # Server/channel in header, don't repeat in notification line
+                    mention_line = (
+                        f'\u27F6 @mention from {name} (@{username}){label_str}'
+                        f'{id_tag}{reply_ctx}: "{content}"'
+                    )
+                    header = f"Server: {guild} | Channel: #{channel}"
+                    history_block = "Recent history:\n" + "\n".join(history_lines)
+                    parts.append(f'{header}\n{history_block}\n{mention_line}')
                 else:
-                    parts.append(mention_line)
+                    # Fallback: no history available, include server/channel in notification line
+                    parts.append(
+                        f'\u27F6 @mention from {name} (@{username}){label_str}'
+                        f' in #{channel} ({guild}){id_tag}{reply_ctx}: "{content}"'
+                    )
 
         if len(parts) == 1:
             # Server mentions with history are multiline; DMs stay on one line
@@ -520,13 +529,17 @@ class GatewayListener:
                 return f"[Discord Notification] {parts[0]}"
         else:
             header = f"[Discord Notification] {len(parts)} new:"
-            body = "\n".join(f"  • {p}" for p in parts)
+            body = "\n".join(f"  \u2022 {p}" for p in parts)
             return f"{header}\n{body}"
 
-    def _fetch_channel_history(self, channel_id, channel_name, exclude_msg_id, cache):
-        """Fetch recent messages from a channel for context. Returns formatted string or empty."""
+    def _fetch_channel_history(self, channel_id, exclude_msg_id, cache):
+        """Fetch recent messages from a channel for context.
+
+        Returns a list of formatted history lines (chronological), or empty list.
+        Each line includes [msg:id] and reply context if applicable.
+        """
         if not channel_id:
-            return ""
+            return []
 
         if channel_id not in cache:
             try:
@@ -539,7 +552,7 @@ class GatewayListener:
 
         messages = cache[channel_id]
         if not messages:
-            return ""
+            return []
 
         lines = []
         for m in messages:
@@ -548,13 +561,21 @@ class GatewayListener:
             author = m.get("author", {})
             author_name = author.get("global_name") or author.get("username", "?")
             body = (m.get("content") or "")[:150]
-            if body:
-                lines.append(f"  {author_name}: {body}")
+            mid = m.get("id", "?")
 
-        if not lines:
-            return ""
+            if not body:
+                continue
 
-        return f"Recent #{channel_name} history:\n" + "\n".join(lines)
+            # Check if this message is a reply
+            ref = m.get("referenced_message")
+            if ref and isinstance(ref, dict):
+                ref_author = ref.get("author", {})
+                ref_name = ref_author.get("global_name") or ref_author.get("username", "?")
+                lines.append(f"  [msg:{mid}] (reply to {ref_name}) {author_name}: {body}")
+            else:
+                lines.append(f"  [msg:{mid}] {author_name}: {body}")
+
+        return lines
 
     def _build_name_maps(self, ready_data):
         """Build guild/channel name mappings from the READY event."""
