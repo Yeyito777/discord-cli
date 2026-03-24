@@ -26,34 +26,60 @@ def _resolve_mentions(text, guild_id=None):
     if not text or "@" not in text:
         return text
 
-    # Build username → user_id map from notify config
+    # Build name → user_id map from notify config.
+    # Maps usernames, label names, and display names — all case-insensitive.
+    # Ambiguous names (shared by multiple users) are removed.
     known = {}
+    _seen = {}  # lowercase name → user_id (to detect conflicts)
     try:
         from src.notify import get_labels
         for user_id, entry in get_labels().items():
-            if isinstance(entry, dict) and entry.get("username"):
-                known[entry["username"].lower()] = user_id
+            if not isinstance(entry, dict):
+                continue
+            names = []
+            if entry.get("username"):
+                names.append(entry["username"])
+            if entry.get("name"):
+                names.append(entry["name"])
+            if entry.get("display_name"):
+                names.append(entry["display_name"])
+            if entry.get("global_name"):
+                names.append(entry["global_name"])
+            for name in names:
+                key = name.lower()
+                if key in _seen:
+                    if _seen[key] != user_id:
+                        # Conflict — two users share this name; remove it
+                        known.pop(key, None)
+                        _seen[key] = None  # mark as conflicted
+                else:
+                    _seen[key] = user_id
+                    known[key] = user_id
     except Exception:
         pass
 
     def replacer(match):
-        username = match.group(1)
-        if username.lower() in ("everyone", "here"):
+        mention = match.group(1)
+        if mention.lower() in ("everyone", "here"):
             return match.group(0)  # leave @everyone/@here as-is
 
         # Check known users first (from notify config)
-        uid = known.get(username.lower())
+        uid = known.get(mention.lower())
         if uid:
             return f"<@{uid}>"
 
         # Try guild member search for server channels
         if guild_id:
             try:
-                members = api.search_guild_members(guild_id, username, limit=1)
-                if members:
-                    member = members[0]
+                members = api.search_guild_members(guild_id, mention, limit=5)
+                for member in members:
                     user = member.get("user", member)
-                    if user.get("username", "").lower() == username.lower():
+                    nick = member.get("nick") or ""
+                    uname = user.get("username") or ""
+                    global_name = user.get("global_name") or ""
+                    if mention.lower() in (
+                        uname.lower(), global_name.lower(), nick.lower(),
+                    ):
                         return f"<@{user['id']}>"
             except Exception:
                 pass
