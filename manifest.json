@@ -5,9 +5,5 @@
   "display": {
     "label": "Discord",
     "color": "#5865F2"
-  },
-  "daemon": {
-    "command": ".venv/bin/python3 src/gateway.py __notify__ /tmp/discord-listeners/__notify__.log",
-    "restart": "always"
   }
 }
