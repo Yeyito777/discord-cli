@@ -52,7 +52,7 @@ def get_relay_targets():
 def _find_notify_gateway_pid():
     """Return PID of any running __notify__ gateway process, or None.
 
-    Matches both daemon-managed processes (started by aitower with relative
+    Matches both daemon-managed processes (started by exocortexd with relative
     paths) and manually started ones (started via 'discord notify start' with
     absolute paths).  We key on 'gateway.py __notify__' which appears in both.
     """
@@ -188,7 +188,7 @@ def start(argv):
     LISTENER_DIR.mkdir(parents=True, exist_ok=True)
 
     # Check if ANY __notify__ gateway is already running — this catches both
-    # daemon-managed processes (started by aitower, no PID file written) and
+    # daemon-managed processes (started by exocortexd, no PID file written) and
     # manually started ones.  Without this check, calling 'notify start' while
     # the daemon is already running the gateway causes a duplicate connection.
     existing_pid = _find_notify_gateway_pid()
@@ -197,7 +197,7 @@ def start(argv):
         pid_file.write_text(str(existing_pid))
         print(f"  Notify gateway already running (PID {existing_pid})")
         print(f"  Relay targets read from config/notify.json at startup.")
-        print(f"  (Managed by aitower daemon — lifecycle is automatic)")
+        print(f"  (Managed by exocortexd daemon — lifecycle is automatic)")
         return
 
     # Stale PID file cleanup
@@ -271,7 +271,7 @@ def stop(argv):
         else:
             os.kill(pid, signal.SIGKILL)
         print(f"  Stopped notify listener (PID {pid})")
-        print(f"  Note: if managed by aitower daemon it will restart automatically.")
+        print(f"  Note: if managed by exocortexd daemon it will restart automatically.")
     except ProcessLookupError:
         print(f"  Notify listener already stopped")
 
