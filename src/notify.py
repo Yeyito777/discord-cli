@@ -49,6 +49,24 @@ def get_relay_targets():
     return _load_config().get("relay_targets", [])
 
 
+def _find_notify_gateway_pid():
+    """Return PID of any running __notify__ gateway process, or None.
+
+    Matches both daemon-managed processes (started by aitower with relative
+    paths) and manually started ones (started via 'discord notify start' with
+    absolute paths).  We key on 'gateway.py __notify__' which appears in both.
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", r"gateway\.py\s+__notify__"],
+            capture_output=True, text=True,
+        )
+        pids = [int(p) for p in result.stdout.strip().split() if p.strip()]
+        return pids[0] if pids else None
+    except Exception:
+        return None
+
+
 def get_labels():
     """Return dict of user_id → {label, username, display_name}."""
     return _load_config().get("labels", {})
@@ -169,14 +187,22 @@ def start(argv):
     log_file = LISTENER_DIR / "__notify__.log"
     LISTENER_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Check if ANY __notify__ gateway is already running — this catches both
+    # daemon-managed processes (started by aitower, no PID file written) and
+    # manually started ones.  Without this check, calling 'notify start' while
+    # the daemon is already running the gateway causes a duplicate connection.
+    existing_pid = _find_notify_gateway_pid()
+    if existing_pid:
+        # Keep PID file in sync so 'notify stop' can find it
+        pid_file.write_text(str(existing_pid))
+        print(f"  Notify gateway already running (PID {existing_pid})")
+        print(f"  Relay targets read from config/notify.json at startup.")
+        print(f"  (Managed by aitower daemon — lifecycle is automatic)")
+        return
+
+    # Stale PID file cleanup
     if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)
-            print(f"  Notify listener already running (PID {pid})")
-            return
-        except (ProcessLookupError, ValueError):
-            pid_file.unlink(missing_ok=True)
+        pid_file.unlink(missing_ok=True)
 
     gateway_script = PROJECT_DIR / "src" / "gateway.py"
     err_file = LISTENER_DIR / "__notify__.err"
@@ -215,11 +241,25 @@ def stop(argv):
     pid_file = LISTENER_DIR / "__notify__.pid"
     meta_file = LISTENER_DIR / "__notify__.meta"
 
-    if not pid_file.exists():
+    # Resolve actual PID: try PID file first, then fall back to pgrep.
+    # The daemon-managed process won't have an up-to-date PID file after a
+    # restart, so pgrep is the reliable fallback.
+    pid = None
+    if pid_file.exists():
+        try:
+            candidate = int(pid_file.read_text().strip())
+            os.kill(candidate, 0)   # check still alive
+            pid = candidate
+        except (ProcessLookupError, ValueError):
+            pid_file.unlink(missing_ok=True)
+
+    if pid is None:
+        pid = _find_notify_gateway_pid()
+
+    if pid is None:
         print("  Notify listener not running")
         return
 
-    pid = int(pid_file.read_text().strip())
     try:
         os.kill(pid, signal.SIGTERM)
         for _ in range(10):
@@ -231,6 +271,7 @@ def stop(argv):
         else:
             os.kill(pid, signal.SIGKILL)
         print(f"  Stopped notify listener (PID {pid})")
+        print(f"  Note: if managed by aitower daemon it will restart automatically.")
     except ProcessLookupError:
         print(f"  Notify listener already stopped")
 
