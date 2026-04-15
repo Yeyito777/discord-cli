@@ -49,8 +49,8 @@ def get_relay_targets():
     return _load_config().get("relay_targets", [])
 
 
-def _find_notify_gateway_pid():
-    """Return PID of any running __notify__ gateway process, or None.
+def _find_notify_gateway_pids():
+    """Return PIDs of any running __notify__ gateway processes.
 
     Matches both daemon-managed processes (started by exocortexd with relative
     paths) and manually started ones (started via 'discord notify start' with
@@ -61,10 +61,38 @@ def _find_notify_gateway_pid():
             ["pgrep", "-f", r"gateway\.py\s+__notify__"],
             capture_output=True, text=True,
         )
-        pids = [int(p) for p in result.stdout.strip().split() if p.strip()]
-        return pids[0] if pids else None
+        pids = []
+        for raw in result.stdout.strip().split():
+            if not raw.strip():
+                continue
+            try:
+                pid = int(raw)
+            except ValueError:
+                continue
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            pids.append(pid)
+        return pids
     except Exception:
-        return None
+        return []
+
+
+
+def _find_notify_gateway_pid():
+    """Return PID of any running __notify__ gateway process, or None."""
+    pids = _find_notify_gateway_pids()
+    return pids[0] if pids else None
+
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
 
 
 def get_labels():
@@ -191,11 +219,16 @@ def start(argv):
     # daemon-managed processes (started by exocortexd, no PID file written) and
     # manually started ones.  Without this check, calling 'notify start' while
     # the daemon is already running the gateway causes a duplicate connection.
-    existing_pid = _find_notify_gateway_pid()
-    if existing_pid:
+    existing_pids = _find_notify_gateway_pids()
+    if existing_pids:
+        existing_pid = existing_pids[0]
         # Keep PID file in sync so 'notify stop' can find it
         pid_file.write_text(str(existing_pid))
         print(f"  Notify gateway already running (PID {existing_pid})")
+        if len(existing_pids) > 1:
+            extras = ", ".join(str(pid) for pid in existing_pids[1:])
+            print(f"  Warning: found {len(existing_pids)} notify gateways already running (extra PIDs: {extras})")
+            print(f"  Run 'discord notify stop' to clean up duplicates.")
         print(f"  Relay targets read from config/notify.json at startup.")
         print(f"  (Managed by exocortexd daemon — lifecycle is automatic)")
         return
@@ -241,39 +274,76 @@ def stop(argv):
     pid_file = LISTENER_DIR / "__notify__.pid"
     meta_file = LISTENER_DIR / "__notify__.meta"
 
-    # Resolve actual PID: try PID file first, then fall back to pgrep.
+    # Resolve actual PIDs: try PID file first, then include every pgrep match.
     # The daemon-managed process won't have an up-to-date PID file after a
     # restart, so pgrep is the reliable fallback.
-    pid = None
+    pids = []
+    seen = set()
+
     if pid_file.exists():
         try:
             candidate = int(pid_file.read_text().strip())
             os.kill(candidate, 0)   # check still alive
-            pid = candidate
+            pids.append(candidate)
+            seen.add(candidate)
         except (ProcessLookupError, ValueError):
             pid_file.unlink(missing_ok=True)
 
-    if pid is None:
-        pid = _find_notify_gateway_pid()
+    for pid in _find_notify_gateway_pids():
+        if pid in seen:
+            continue
+        pids.append(pid)
+        seen.add(pid)
 
-    if pid is None:
+    if not pids:
         print("  Notify listener not running")
         return
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-        for _ in range(10):
-            time.sleep(0.5)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    alive = list(pids)
+    for _ in range(10):
+        if not alive:
+            break
+        time.sleep(0.5)
+        next_alive = []
+        for pid in alive:
             try:
                 os.kill(pid, 0)
+                next_alive.append(pid)
             except ProcessLookupError:
-                break
-        else:
+                pass
+        alive = next_alive
+
+    for pid in alive:
+        try:
             os.kill(pid, signal.SIGKILL)
-        print(f"  Stopped notify listener (PID {pid})")
+        except ProcessLookupError:
+            pass
+
+    if alive:
+        time.sleep(0.2)
+        alive = [pid for pid in alive if _pid_alive(pid)]
+
+    stopped = [pid for pid in pids if pid not in set(alive)]
+
+    if stopped:
+        if len(stopped) == 1:
+            print(f"  Stopped notify listener (PID {stopped[0]})")
+        else:
+            stopped_str = ", ".join(str(pid) for pid in stopped)
+            print(f"  Stopped {len(stopped)} notify listener(s): {stopped_str}")
         print(f"  Note: if managed by exocortexd daemon it will restart automatically.")
-    except ProcessLookupError:
-        print(f"  Notify listener already stopped")
+    else:
+        print("  Notify listener already stopped")
+
+    if alive:
+        alive_str = ", ".join(str(pid) for pid in alive)
+        print(f"  Warning: {len(alive)} notify listener(s) still alive: {alive_str}")
 
     pid_file.unlink(missing_ok=True)
     meta_file.unlink(missing_ok=True)

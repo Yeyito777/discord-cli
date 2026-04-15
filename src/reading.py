@@ -6,7 +6,9 @@ import sys
 
 from src import api
 from src import format as fmt
+from src.captcha_output import print_captcha_challenge
 from src.resolve import resolve_guild, resolve_channel, resolve_dm
+from src.webbroker import send_dm as browser_send_dm
 
 
 def guilds(argv):
@@ -64,7 +66,22 @@ def dms(argv):
 
 
 def dm(argv):
-    p = argparse.ArgumentParser(prog="discord dm", description="Read or send DMs.")
+    p = argparse.ArgumentParser(
+        prog="discord dm",
+        description=(
+            "Read or send DMs. Raw API is used by default; use --browser to send "
+            "through the dedicated browser-native path. Plain API sends may also "
+            "auto-fallback to the browser path on captcha-like failures."
+        ),
+        epilog=(
+            "examples:\n"
+            "  discord dm yeyito -n 10\n"
+            "  discord dm yeyito --send 'yo'\n"
+            "  discord dm yeyito --send 'yo' --browser\n"
+            "  discord dm 1031060518775038003 --send 'yo' --browser --seed-accessibility"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     p.add_argument("target", help="Username or DM channel ID")
     p.add_argument("-n", "--limit", type=int, default=20, help="Number of messages")
     p.add_argument("--send", dest="send_text", nargs="?", const="", default=None,
@@ -72,6 +89,8 @@ def dm(argv):
     p.add_argument("-f", "--file", nargs="+", dest="files", metavar="PATH",
                    help="File(s) to attach (requires --send)")
     p.add_argument("--before", help="Get messages before this message ID")
+    p.add_argument("--browser", action="store_true", help="Force browser-native sending instead of raw API")
+    p.add_argument("--seed-accessibility", action="store_true", help="Seed hCaptcha accessibility cookies into the dedicated browser profile first (mainly useful with --browser)")
     args = p.parse_args(argv)
 
     if args.files and args.send_text is None:
@@ -89,11 +108,31 @@ def dm(argv):
             for fp in args.files:
                 if not os.path.isfile(fp):
                     raise RuntimeError(f"File not found: {fp}")
+            if args.browser:
+                raise RuntimeError("Browser-native DM sending with attachments is not implemented yet.")
             data = api.send_message_with_files(channel_id, args.files, content=text)
         else:
             if not text:
                 p.error("must provide text with --send or use --file")
-            data = api.send_message(channel_id, text)
+            if args.browser:
+                result = browser_send_dm(channel_id, text, seed_accessibility=args.seed_accessibility)
+                if result.get("status") == "captcha_required":
+                    print_captcha_challenge(result)
+                    raise SystemExit(10)
+                print(f"Sent via browser. captcha={str(result.get('captcha', False)).lower()}")
+                return
+            try:
+                data = api.send_message(channel_id, text)
+            except RuntimeError as e:
+                msg = str(e).lower()
+                if 'captcha' in msg or 'update your app' in msg:
+                    result = browser_send_dm(channel_id, text, seed_accessibility=args.seed_accessibility)
+                    if result.get("status") == "captcha_required":
+                        print_captcha_challenge(result)
+                        raise SystemExit(10)
+                    print(f"Sent via browser fallback. captcha={str(result.get('captcha', False)).lower()}")
+                    return
+                raise
         print(f"Sent. Message ID: {data['id']}")
         return
 

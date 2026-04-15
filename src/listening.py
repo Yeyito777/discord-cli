@@ -29,7 +29,7 @@ def listen(argv):
     p.add_argument("--dm", action="store_true",
                    help="Listen to a DM conversation")
     p.add_argument("--notify", action="store_true",
-                   help="Listen for all DMs and @mentions (no target needed)")
+                   help="Listen for all DMs and @mentions (legacy alias; prefer 'discord notify start')")
     p.add_argument("--relay-conv", dest="relay_conv", metavar="ID",
                    help="Exo conversation ID for instant notification relay")
     args = p.parse_args(argv)
@@ -127,19 +127,26 @@ def listen(argv):
 
 def _start_notify_listener(relay_conv=None):
     """Start the notification listener (DMs + @mentions)."""
+    from src.notify import _find_notify_gateway_pids
+
     LISTENER_DIR.mkdir(parents=True, exist_ok=True)
     pid_file = LISTENER_DIR / "__notify__.pid"
     log_file = LISTENER_DIR / "__notify__.log"
 
+    existing_pids = _find_notify_gateway_pids()
+    if existing_pids:
+        pid = existing_pids[0]
+        pid_file.write_text(str(pid))
+        print(f"  Notify listener already running (PID {pid})")
+        if len(existing_pids) > 1:
+            extras = ", ".join(str(existing) for existing in existing_pids[1:])
+            print(f"  Warning: found {len(existing_pids)} notify gateways already running (extra PIDs: {extras})")
+            print(f"  Run 'discord notify stop' to clean up duplicates.")
+        print(f"  Output: {log_file}")
+        return
+
     if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)
-            print(f"  Notify listener already running (PID {pid})")
-            print(f"  Output: {log_file}")
-            return
-        except (ProcessLookupError, ValueError):
-            pid_file.unlink(missing_ok=True)
+        pid_file.unlink(missing_ok=True)
 
     gateway_script = PROJECT_DIR / "src" / "gateway.py"
     err_file = LISTENER_DIR / "__notify__.err"
@@ -181,13 +188,14 @@ def unlisten(argv):
     p.add_argument("-g", "--guild", "--server", dest="guild",
                    help="Server name or ID")
     p.add_argument("--dm", action="store_true", help="DM conversation")
-    p.add_argument("--notify", action="store_true", help="Stop notify listener")
+    p.add_argument("--notify", action="store_true", help="Stop notify listener (legacy alias; prefer 'discord notify stop')")
     p.add_argument("--all", action="store_true", dest="stop_all",
                    help="Stop all listeners")
     args = p.parse_args(argv)
 
     if args.notify:
-        _stop_one("__notify__")
+        from src.notify import stop as stop_notify
+        stop_notify([])
         return
 
     if args.stop_all:

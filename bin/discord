@@ -13,13 +13,13 @@ usage() {
 usage: discord <command> [args]
 
 commands:
-  guilds       List your servers                (alias: servers)
-  guild        Show server details              (alias: server)
-  channels     List channels in a server        (alias: chs)
-  messages     Read messages from a channel     (alias: msgs)
+  guilds       List your servers                       (alias: servers)
+  guild        Show server details                     (alias: server)
+  channels     List channels in a server              (alias: chs)
+  messages     Read messages from a channel           (alias: msgs)
   dms          List DM conversations
-  dm           Read or send DMs
-  search       Search messages                  (alias: s)
+  dm           Read or send DMs                       (--browser for browser-native send)
+  search       Search messages                        (alias: s)
   pins         Get pinned messages
   threads      List active threads in a server
   members      List or search server members
@@ -27,21 +27,52 @@ commands:
   send         Send a message
   reply        Reply to a message
   edit         Edit a message
-  delete       Delete a message                 (alias: del)
+  delete       Delete a message                       (alias: del)
   react        React to a message
   unreact      Remove a reaction
   listen       Start real-time channel listener
   unlisten     Stop a channel listener
   listeners    List active listeners
-  notify       Manage notification relay           (add, remove, label, list, start, stop)
-  join         Join a server via invite link
+  notify       Manage notification relay              (add, remove, label, list, start, stop)
+  join         Join a server via invite link          (browser-native default; --raw for legacy path)
   leave        Leave a server
   typing       Trigger typing indicator
   read         Mark channel as read
-  login        Configure authentication         (alias: setup, auth)
+  captcha      Manage browser-backed captcha flow     (setup, status, solve)
+  web          Manage dedicated Discord web profile   (setup, status, seed-accessibility,
+                                                      broker-start, broker-status, broker-stop,
+                                                      send-dm, join-invite)
+  login        Configure authentication               (alias: setup, auth)
   logout       Remove saved credentials
 
+notes:
+  - Browser-native paths use a dedicated persistent Chromium profile under config/web/
+  - `discord join` prefers the browser-native path because invite joins commonly trigger captcha
+  - `discord dm --send` can use `--browser`, and may auto-fallback on captcha-like API failures
+
 Run 'discord <command> --help' for command-specific usage.
+Run 'discord web --help' for browser-native subcommands.
+EOF
+}
+
+web_usage() {
+    cat <<'EOF'
+usage: discord web <subcommand> [args]
+
+subcommands:
+  setup               Open the dedicated Chromium profile for manual Discord login/bootstrap
+  status              Show local profile + broker status
+  seed-accessibility  Copy hCaptcha accessibility cookies from the captcha profile
+  broker-start        Start/reuse the persistent browser broker
+  broker-status       Show persistent broker status
+  broker-stop         Stop the persistent broker
+  send-dm             Send a DM through the browser-native path
+  join-invite         Join an invite through the browser-native path
+
+notes:
+  - The broker keeps one dedicated Chromium session alive to avoid relaunching Chrome per command
+  - Headless is the default; use --headed only for debugging
+  - `seed-accessibility` helps carry hCaptcha accessibility state into the web profile
 EOF
 }
 
@@ -63,6 +94,20 @@ case "$cmd" in
         exec "$PYTHON" -c "import sys; from src.notify import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     join|leave|typing|read)
         exec "$PYTHON" -c "import sys; from src.managing import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
+    captcha)
+        if [[ $# -eq 0 ]]; then
+            echo "usage: discord captcha <setup|status|solve>" >&2
+            exit 1
+        fi
+        subcmd="$1"; shift
+        exec "$PYTHON" -c "import sys; from src.captcha_cli import dispatch; dispatch('$subcmd', sys.argv[1:])" "$@" ;;
+    web)
+        if [[ $# -eq 0 || "$1" == "-h" || "$1" == "--help" || "$1" == "help" ]]; then
+            web_usage
+            exit 0
+        fi
+        subcmd="$1"; shift
+        exec "$PYTHON" -c "import sys; from src.websession_cli import dispatch; dispatch('$subcmd', sys.argv[1:])" "$@" ;;
     login|setup|auth|logout)
         exec "$PYTHON" -c "import sys; from src.auth import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     help|--help|-h)

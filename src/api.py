@@ -209,19 +209,79 @@ def _headers(token=None):
 
 # ─── Core request ────────────────────────────────────────────────────────────
 
-def _request(method, path, body=None, token=None, params=None):
+def _build_headers(token=None, extra_headers=None):
+    headers = dict(_headers(token))
+    if extra_headers:
+        headers.update(extra_headers)
+    return headers
+
+
+def _maybe_retry_with_captcha(method, path, *, body=None, body_bytes=None,
+                              token=None, params=None, extra_headers=None,
+                              status=None, raw=None, allow_captcha_retry=True):
+    """Retry a challenged request after solving Discord's hCaptcha flow."""
+    if not allow_captcha_retry or status != 400 or not raw:
+        return None
+
+    try:
+        err = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    if not isinstance(err, dict) or "captcha_key" not in err:
+        return None
+
+    if os.environ.get("DISCORD_CAPTCHA_DEBUG"):
+        try:
+            print(
+                "DISCORD_CAPTCHA_DEBUG payload:",
+                json.dumps(err, ensure_ascii=False),
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+
+    from src.captcha import CaptchaChallenge, solve_hcaptcha
+
+    challenge = CaptchaChallenge.from_discord_error(err)
+    solution = solve_hcaptcha(challenge)
+
+    retry_headers = dict(extra_headers or {})
+    retry_headers["X-Captcha-Key"] = solution.token
+    if challenge.session_id:
+        retry_headers["X-Captcha-Session-Id"] = challenge.session_id
+    if challenge.rqtoken:
+        retry_headers["X-Captcha-Rqtoken"] = challenge.rqtoken
+
+    return _request(
+        method,
+        path,
+        body=body,
+        body_bytes=body_bytes,
+        token=token,
+        params=params,
+        extra_headers=retry_headers,
+        allow_captcha_retry=False,
+    )
+
+
+def _request(method, path, body=None, body_bytes=None, token=None, params=None,
+             extra_headers=None, allow_captcha_retry=True):
     """Make an API request with connection pooling. Returns parsed JSON."""
+    if body is not None and body_bytes is not None:
+        raise ValueError("Provide either body or body_bytes, not both")
+
     url = f"{API_BASE}{path}"
 
     if params:
         qs = urllib.parse.urlencode(params, doseq=True)
         url = f"{url}?{qs}"
 
-    data = None
+    data = body_bytes
     if body is not None:
         data = json.dumps(body).encode("utf-8")
 
-    headers = _headers(token)
+    headers = _build_headers(token, extra_headers)
     entry = _get_connection()
     conn = entry[0]
 
@@ -251,6 +311,21 @@ def _request(method, path, body=None, token=None, params=None):
             if not raw:
                 return None
             return json.loads(raw)
+
+        retried = _maybe_retry_with_captcha(
+            method,
+            path,
+            body=body,
+            body_bytes=body_bytes,
+            token=token,
+            params=params,
+            extra_headers=extra_headers,
+            status=status,
+            raw=raw,
+            allow_captcha_retry=allow_captcha_retry,
+        )
+        if retried is not None:
+            return retried
 
         # Error handling
         try:
@@ -457,63 +532,15 @@ def send_message_with_files(channel_id, file_paths, content=None, reply_to=None,
             body_parts.append(part)
     body = b"".join(body_parts)
 
-    # Build headers — start from standard auth headers but override Content-Type
-    hdrs = dict(_headers())
-    hdrs["Content-Type"] = f"multipart/form-data; boundary={boundary}"
-    hdrs["Content-Length"] = str(len(body))
-
-    url = f"{API_BASE}/channels/{channel_id}/messages"
-
-    entry = _get_connection()
-    conn = entry[0]
-
-    try:
-        try:
-            conn.request("POST", url, body, hdrs)
-            resp = conn.getresponse()
-            raw = resp.read()
-        except (BrokenPipeError, ConnectionResetError, http.client.RemoteDisconnected, TimeoutError):
-            try:
-                conn.close()
-            except Exception:
-                pass
-            conn = http.client.HTTPSConnection(API_HOST, 443, timeout=30)
-            entry[0] = conn
-            conn.request("POST", url, body, hdrs)
-            resp = conn.getresponse()
-            raw = resp.read()
-
-        status = resp.status
-
-        if status == 204:
-            return None
-        if 200 <= status < 300:
-            if not raw:
-                return None
-            return json.loads(raw)
-
-        try:
-            err = json.loads(raw)
-            msg = err.get("message", raw.decode("utf-8", errors="replace"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            msg = raw.decode("utf-8", errors="replace") if raw else f"HTTP {status}"
-
-        raise RuntimeError(f"HTTP {status}: {msg}")
-
-    except Exception as e:
-        if isinstance(e, RuntimeError):
-            raise
-        try:
-            conn.close()
-        except Exception:
-            pass
-        with _pool_lock:
-            if entry in _pool:
-                _pool.remove(entry)
-        raise RuntimeError(f"Network error: {e}")
-
-    finally:
-        _release_connection(entry)
+    return _request(
+        "POST",
+        f"/channels/{channel_id}/messages",
+        body_bytes=body,
+        extra_headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+    )
 
 
 def edit_message(channel_id, message_id, content):
