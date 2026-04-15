@@ -6,6 +6,8 @@ reconnection, and streams events for a specific channel to a file.
 Gateway protocol adapted from endcord (https://github.com/sparklost/endcord).
 """
 
+import atexit
+import fcntl
 import http.client
 import json
 import os
@@ -36,6 +38,9 @@ _USER_AGENT = (
 GATEWAY_HOST = "discord.com"
 ZLIB_SUFFIX = b"\x00\x00\xff\xff"
 DEFAULT_CAPABILITIES = 30717
+NOTIFY_LISTENER_DIR = Path("/tmp/discord-listeners")
+NOTIFY_LOCK_PATH = NOTIFY_LISTENER_DIR / "__notify__.lock"
+NOTIFY_PID_PATH = NOTIFY_LISTENER_DIR / "__notify__.pid"
 
 # ─── Build number ────────────────────────────────────────────────────────────
 
@@ -85,8 +90,8 @@ class GatewayListener:
         self._inflator = zlib.decompressobj()
         self._guilds = {}      # guild_id → name (populated from READY, used in notify mode)
         self._channels = {}    # channel_id → {name, guild_name} (same)
-        self._members = {}     # user_id → display_name (from guild member data)
         self._dm_channel_names = {}  # channel_id → friendly name for DMs
+        self._notify_lock_fd = None
 
         # Notification relay queue (notify mode with relay_conv)
         self._relay_queue = []
@@ -96,6 +101,9 @@ class GatewayListener:
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
 
+        if self.channel_id == "__notify__":
+            self._acquire_notify_singleton()
+
     def _shutdown(self, signum=None, frame=None):
         sig_name = signal.Signals(signum).name if signum else "?"
         self._log(f"Received {sig_name}, shutting down")
@@ -103,6 +111,46 @@ class GatewayListener:
         # Don't close ws here — we may be inside recv_data() on the main
         # thread and ws.close() can deadlock.  The 1s socket timeout will
         # break us out of recv, the loop checks self.running, and exits.
+
+    def _acquire_notify_singleton(self):
+        NOTIFY_LISTENER_DIR.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(NOTIFY_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(lock_fd)
+            existing_pid = "?"
+            try:
+                existing_pid = NOTIFY_PID_PATH.read_text().strip() or "?"
+            except OSError:
+                pass
+            raise SystemExit(f"Notify listener already running (PID {existing_pid})")
+
+        os.ftruncate(lock_fd, 0)
+        os.write(lock_fd, f"{os.getpid()}\n".encode())
+        self._notify_lock_fd = lock_fd
+        NOTIFY_PID_PATH.write_text(f"{os.getpid()}\n")
+        atexit.register(self._release_notify_singleton)
+
+    def _release_notify_singleton(self):
+        try:
+            if NOTIFY_PID_PATH.exists():
+                current = NOTIFY_PID_PATH.read_text().strip()
+                if current == str(os.getpid()):
+                    NOTIFY_PID_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        if self._notify_lock_fd is not None:
+            try:
+                fcntl.flock(self._notify_lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(self._notify_lock_fd)
+            except OSError:
+                pass
+            self._notify_lock_fd = None
 
     # ─── Main loop ───────────────────────────────────────────────────────────
 
@@ -573,12 +621,7 @@ class GatewayListener:
                 if name:
                     user_names[uid] = name
 
-        # 2. From guild member data (READY event)
-        for uid, name in self._members.items():
-            if uid not in user_names:
-                user_names[uid] = name
-
-        # 3. From message authors and mentions in this history batch
+        # 2. From message authors and mentions in this history batch
         for m in messages:
             author = m.get("author", {})
             aid = author.get("id")
@@ -649,10 +692,9 @@ class GatewayListener:
         return lines
 
     def _build_name_maps(self, ready_data):
-        """Build guild/channel/member name mappings from the READY event."""
+        """Build guild/channel name mappings from the READY event."""
         self._guilds = {}
         self._channels = {}
-        self._members = {}
         for guild in ready_data.get("guilds", []):
             props = guild.get("properties", guild)
             gid = guild.get("id") or props.get("id", "")
@@ -663,16 +705,6 @@ class GatewayListener:
                     "name": ch.get("name", "?"),
                     "guild_name": gname,
                 }
-            # Extract member display names
-            for member in guild.get("members", []):
-                user = member.get("user", {})
-                uid = user.get("id")
-                if uid:
-                    name = (member.get("nick")
-                            or user.get("global_name")
-                            or user.get("username"))
-                    if name:
-                        self._members[uid] = name
 
         # Build friendly names for DM channels
         self._dm_channel_names = {}
