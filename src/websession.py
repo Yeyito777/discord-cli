@@ -13,6 +13,7 @@ import json
 import re
 import time
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from urllib.parse import urlencode
 
@@ -22,7 +23,6 @@ from src.webprofile import (
     COMPOSER_SELECTOR,
     DiscordWebError,
     extract_invite_code,
-    fetch_fingerprint,
     logged_in_js,
     open_dm,
     open_invite,
@@ -71,6 +71,24 @@ def _trace_event(trace, event: str, *, page=None, screenshot: bool = False, **fi
         trace(event, page=page, screenshot=screenshot, **fields)
     except Exception:
         pass
+
+
+def _generate_invite_session_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _decode_context_properties(value: str | None) -> dict:
+    if not value:
+        return {}
+    try:
+        padded = value + ('=' * (-len(value) % 4))
+        decoded = base64.b64decode(padded).decode('utf-8', errors='replace')
+        payload = json.loads(decoded)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        pass
+    return {}
 
 
 def _wait_for_body_contains(page, text: str, *, timeout_ms: int = 15_000) -> None:
@@ -390,6 +408,213 @@ def _click_accept_invite(page) -> None:
     page.get_by_role('button', name='Accept Invite').click()
 
 
+def _message_matches_invite(message: dict, code: str) -> bool:
+    needles = [
+        f'discord.gg/{code}'.lower(),
+        f'discord.com/invite/{code}'.lower(),
+        f'/invite/{code}'.lower(),
+    ]
+    chunks = [message.get('content') or '']
+    for key in ('embeds', 'components', 'attachments'):
+        value = message.get(key)
+        if value:
+            try:
+                chunks.append(json.dumps(value, ensure_ascii=False))
+            except Exception:
+                chunks.append(str(value))
+    haystack = '\n'.join(chunks).lower()
+    return any(needle in haystack for needle in needles)
+
+
+def _find_recent_dm_invite(code: str, *, channel_limit: int = 20, message_limit: int = 50) -> dict | None:
+    try:
+        channels = api.get_dm_channels()
+    except Exception:
+        return None
+
+    dm_channels = [
+        channel for channel in channels
+        if str(channel.get('type') or '') in {'1', '3'}
+    ]
+    dm_channels.sort(key=lambda channel: str(channel.get('last_message_id') or ''), reverse=True)
+
+    for channel in dm_channels[:channel_limit]:
+        channel_id = str(channel.get('id') or '')
+        if not channel_id:
+            continue
+        try:
+            messages = api.get_messages(channel_id, limit=message_limit)
+        except Exception:
+            continue
+        for message in messages:
+            if _message_matches_invite(message, code):
+                return {
+                    'channel_id': channel_id,
+                    'message_id': str(message.get('id') or ''),
+                }
+    return None
+
+
+def _click_recent_dm_invite_button(page, code: str, *, message_id: str | None = None) -> dict:
+    return page.evaluate(
+        """({ code, messageId }) => {
+            const inviteButtonLabels = new Set(['accept invite', 'join']);
+            const inviteNeedles = [
+                `discord.gg/${code}`.toLowerCase(),
+                `discord.com/invite/${code}`.toLowerCase(),
+                `/invite/${code}`.toLowerCase(),
+            ];
+            const buttonText = (node) => (node?.innerText || node?.textContent || '').trim();
+            const scrollables = [...document.querySelectorAll('*')].filter(node => {
+                try {
+                    return node.scrollHeight > (node.clientHeight + 200);
+                } catch (_) {
+                    return false;
+                }
+            }).sort((a, b) => b.scrollHeight - a.scrollHeight);
+            for (const node of scrollables.slice(0, 5)) {
+                try {
+                    node.scrollTop = node.scrollHeight;
+                } catch (_) {}
+            }
+            const containsInvite = (node) => {
+                const text = (node?.innerText || node?.textContent || '').toLowerCase();
+                return inviteNeedles.some(needle => text.includes(needle));
+            };
+            const scrollIntoView = (node) => {
+                try {
+                    node?.scrollIntoView({ block: 'center', inline: 'nearest' });
+                } catch (_) {}
+            };
+            const clickMatchingButton = (root, mode) => {
+                if (!root) return null;
+                scrollIntoView(root);
+                const buttons = [...root.querySelectorAll('button')].filter(btn => inviteButtonLabels.has(buttonText(btn).toLowerCase()));
+                if (!buttons.length) return null;
+                buttons[0].click();
+                return { clicked: true, mode, buttonCount: buttons.length, buttonLabel: buttonText(buttons[0]) };
+            };
+
+            if (messageId) {
+                const direct = document.getElementById(`chat-messages-${messageId}`)
+                    || document.getElementById(`message-accessories-${messageId}`)
+                    || document.querySelector(`[id$="${messageId}"]`);
+                const directHit = clickMatchingButton(direct, 'message-id');
+                if (directHit) return directHit;
+            }
+
+            const inviteLinks = [...document.querySelectorAll('a[href], [role="link"]')].filter(node => {
+                const href = (node.getAttribute('href') || '').toLowerCase();
+                const text = (node.innerText || node.textContent || '').toLowerCase();
+                return inviteNeedles.some(needle => href.includes(needle) || text.includes(needle));
+            });
+            for (const link of inviteLinks) {
+                scrollIntoView(link);
+                let node = link;
+                for (let depth = 0; depth < 8 && node; depth += 1, node = node.parentElement) {
+                    const hit = clickMatchingButton(node, 'invite-link-ancestor');
+                    if (hit) return hit;
+                }
+            }
+
+            const inviteTextNodes = [...document.querySelectorAll('*')].filter(node => {
+                const text = (node.innerText || node.textContent || '').toLowerCase().trim();
+                if (!text || text.length > 280) return false;
+                return inviteNeedles.some(needle => text.includes(needle));
+            }).sort((a, b) => {
+                const al = (a.innerText || a.textContent || '').length;
+                const bl = (b.innerText || b.textContent || '').length;
+                return al - bl;
+            });
+            for (const node0 of inviteTextNodes.slice(0, 10)) {
+                scrollIntoView(node0);
+                let node = node0;
+                for (let depth = 0; depth < 8 && node; depth += 1, node = node.parentElement) {
+                    const hit = clickMatchingButton(node, 'invite-text-ancestor');
+                    if (hit) return hit;
+                }
+            }
+
+            const allButtons = [...document.querySelectorAll('button')].filter(btn => inviteButtonLabels.has(buttonText(btn).toLowerCase()));
+            for (const button of allButtons) {
+                let node = button;
+                for (let depth = 0; depth < 8 && node; depth += 1, node = node.parentElement) {
+                    if (containsInvite(node)) {
+                        scrollIntoView(button);
+                        button.click();
+                        return { clicked: true, mode: 'ancestor-text', buttonCount: allButtons.length };
+                    }
+                }
+            }
+
+            if (allButtons.length === 1) {
+                scrollIntoView(allButtons[0]);
+                allButtons[0].click();
+                return { clicked: true, mode: 'single-visible-button', buttonCount: 1 };
+            }
+
+            return { clicked: false, buttonCount: allButtons.length, inviteLinkCount: inviteLinks.length };
+        }""",
+        {'code': code, 'messageId': message_id},
+    )
+
+
+def _open_recent_dm_invite(page, code: str, *, trace=None) -> dict | None:
+    invite_message = _find_recent_dm_invite(code)
+    if invite_message is None:
+        return None
+
+    channel_id = invite_message['channel_id']
+    message_id = invite_message.get('message_id') or None
+    try:
+        open_dm(page, channel_id)
+        _trace_event(
+            trace,
+            'invite_dm_opened',
+            page=page,
+            invite=code,
+            channel_id=channel_id,
+            message_id=message_id,
+        )
+    except Exception as e:
+        _trace_event(trace, 'invite_dm_open_error', page=page, invite=code, channel_id=channel_id, error=str(e))
+        return None
+
+    deadline = time.time() + 8.0
+    last_result = None
+    while time.time() < deadline:
+        try:
+            result = _click_recent_dm_invite_button(page, code, message_id=message_id)
+        except Exception as e:
+            last_result = {'clicked': False, 'error': str(e)}
+        else:
+            last_result = result
+            if result.get('clicked'):
+                _trace_event(
+                    trace,
+                    'invite_dm_clicked',
+                    page=page,
+                    invite=code,
+                    channel_id=channel_id,
+                    message_id=message_id,
+                    mode=result.get('mode'),
+                    button_count=result.get('buttonCount'),
+                )
+                return invite_message
+        time.sleep(0.5)
+
+    _trace_event(
+        trace,
+        'invite_dm_not_clickable',
+        page=page,
+        invite=code,
+        channel_id=channel_id,
+        message_id=message_id,
+        result=last_result,
+    )
+    return None
+
+
 def _invite_preview(code: str) -> dict:
     url = (
         f"https://discord.com/api/v9/invites/{code}"
@@ -470,9 +695,10 @@ def continue_join_invite_with_captcha(page, invite: str, *, answer: str | None =
                                       reclick_after_captcha: bool = False,
                                       open_invite_page: bool = False,
                                       click_accept: bool = False,
+                                      invite_request_session_id: str | None = None,
+                                      invite_request_instance_id: str | None = None,
                                       trace=None) -> dict:
     code = extract_invite_code(invite)
-    fingerprint = fetch_fingerprint()
     route_registered = False
     preview = {}
     preview_guild_id = ''
@@ -502,9 +728,76 @@ def continue_join_invite_with_captcha(page, invite: str, *, answer: str | None =
     next_membership_check_at = 0.0
     failure_page_first_seen_at = None
     failure_page_retry_count = 0
+    captcha_cleared_at: float | None = None
+    invite_seq_at_captcha_clear = 0
 
     def _invite_route(route):
-        route.continue_()
+        nonlocal invite_request_session_id, invite_request_instance_id
+        request = route.request
+        try:
+            if request.method.upper() != 'POST':
+                route.continue_()
+                return
+
+            headers = dict(request.headers or {})
+            raw_post_data = request.post_data or ''
+            body = {}
+            if raw_post_data:
+                try:
+                    parsed = json.loads(raw_post_data)
+                    if isinstance(parsed, dict):
+                        body = dict(parsed)
+                except Exception:
+                    body = {}
+
+            if invite_request_session_id is None:
+                existing_session_id = str(body.get('session_id') or '').strip()
+                invite_request_session_id = existing_session_id or _generate_invite_session_id()
+
+            if invite_request_instance_id is None:
+                existing_instance_id = str(body.get('invite_instance_id') or '').strip()
+                context_props = _decode_context_properties(
+                    headers.get('x-context-properties') or headers.get('X-Context-Properties')
+                )
+                header_instance_id = str(context_props.get('invite_instance_id') or '').strip()
+                invite_request_instance_id = existing_instance_id or header_instance_id or None
+
+            normalized_body = dict(body)
+            normalized_body['session_id'] = invite_request_session_id
+            if invite_request_instance_id and not normalized_body.get('invite_instance_id'):
+                normalized_body['invite_instance_id'] = invite_request_instance_id
+            normalized_post_data = json.dumps(normalized_body, separators=(',', ':'))
+
+            changed = normalized_post_data != raw_post_data
+            if changed:
+                headers = {
+                    k: v for k, v in headers.items()
+                    if k.lower() != 'content-length'
+                }
+                _trace_event(
+                    trace,
+                    'invite_request_body_normalized',
+                    page=page,
+                    url=request.url,
+                    original_post_data=_shorten(raw_post_data, 400),
+                    normalized_post_data=normalized_post_data,
+                    session_id=invite_request_session_id,
+                    invite_instance_id=invite_request_instance_id,
+                )
+                route.continue_(headers=headers, post_data=normalized_post_data)
+                return
+
+            route.continue_()
+        except Exception as e:
+            _trace_event(
+                trace,
+                'invite_route_error',
+                page=page,
+                error=str(e),
+                request_url=request.url,
+                request_post_data=_shorten(getattr(request, 'post_data', '') or '', 400),
+            )
+            route.continue_()
 
     def _record_invite_response(response):
         nonlocal invite_seq
@@ -539,6 +832,9 @@ def continue_join_invite_with_captcha(page, invite: str, *, answer: str | None =
                         'x-fingerprint',
                         'x-super-properties',
                         'x-context-properties',
+                        'x-installation-id',
+                        'x-debug-options',
+                        'x-discord-timezone',
                     }
                 },
                 'request_post_data': _shorten(req.post_data or '', 800),
@@ -564,16 +860,28 @@ def continue_join_invite_with_captcha(page, invite: str, *, answer: str | None =
         except Exception as e:
             _trace_event(trace, 'invite_api_trace_error', error=str(e))
 
-    if fingerprint:
-        page.route('**/api/v9/invites/*', _invite_route)
-        route_registered = True
+    page.route('**/api/v9/invites/*', _invite_route)
+    route_registered = True
     page.on('response', _record_invite_response)
 
     try:
+        dm_invite = None
         if open_invite_page:
-            open_invite(page, code)
-            _trace_event(trace, 'invite_opened', page=page, invite=code)
-            _wait_accept_invite_button(page, code)
+            dm_invite = _open_recent_dm_invite(page, code, trace=trace)
+            if dm_invite is None:
+                open_invite(page, code)
+                _trace_event(trace, 'invite_opened', page=page, invite=code)
+                _wait_accept_invite_button(page, code)
+            else:
+                _trace_event(
+                    trace,
+                    'invite_using_dm_embed',
+                    page=page,
+                    invite=code,
+                    channel_id=dm_invite.get('channel_id'),
+                    message_id=dm_invite.get('message_id'),
+                )
+                click_accept = False
 
         if click_accept:
             # Let the invite page hydrate a bit before clicking. In live testing,
@@ -642,10 +950,19 @@ def continue_join_invite_with_captcha(page, invite: str, *, answer: str | None =
                         "captcha": True,
                         "invite": code,
                         "reclick_after_captcha": reclick_after_captcha,
+                        "invite_request_session_id": invite_request_session_id,
+                        "invite_request_instance_id": invite_request_instance_id,
                     }
                 if step.get("status") == "captcha_cleared":
                     reclick_after_captcha = True
-                    _trace_event(trace, 'invite_captcha_cleared', page=page)
+                    captcha_cleared_at = time.time()
+                    invite_seq_at_captcha_clear = invite_seq
+                    _trace_event(
+                        trace,
+                        'invite_captcha_cleared',
+                        page=page,
+                        invite_seq_at_captcha_clear=invite_seq_at_captcha_clear,
+                    )
 
             body_text = _body_text(page)
             current_url = page.url or ''
@@ -684,6 +1001,16 @@ def continue_join_invite_with_captcha(page, invite: str, *, answer: str | None =
                     latest_post_payload,
                     latest_post.get('response_text') or '',
                 )
+                if reclick_after_captcha and latest_post['seq'] > invite_seq_at_captcha_clear:
+                    reclick_after_captcha = False
+                    captcha_cleared_at = None
+                    _trace_event(
+                        trace,
+                        'invite_post_detected_after_captcha_clear',
+                        page=page,
+                        seq=latest_post['seq'],
+                        status=latest_post_status,
+                    )
                 if 200 <= latest_post_status < 300:
                     guild_id = preview_guild_id or _current_channels_guild_id(current_url) or ''
                     guild_name = preview_guild_name
@@ -714,11 +1041,15 @@ def continue_join_invite_with_captcha(page, invite: str, *, answer: str | None =
                 }
 
             if reclick_after_captcha:
-                if _invite_has_accept_action(body_text):
+                wait_elapsed = None if captcha_cleared_at is None else (time.time() - captcha_cleared_at)
+                if wait_elapsed is None or wait_elapsed < 3.0:
+                    pass
+                elif _invite_has_accept_action(body_text):
                     try:
                         _click_accept_invite(page)
                         reclick_after_captcha = False
-                        _trace_event(trace, 'invite_accept_reclicked', page=page)
+                        captcha_cleared_at = None
+                        _trace_event(trace, 'invite_accept_reclicked', page=page, waited_secs=wait_elapsed)
                         time.sleep(1.0)
                         continue
                     except Exception as e:
@@ -729,7 +1060,8 @@ def continue_join_invite_with_captcha(page, invite: str, *, answer: str | None =
                         _wait_accept_invite_button(page, code)
                         _click_accept_invite(page)
                         reclick_after_captcha = False
-                        _trace_event(trace, 'invite_reopened_and_reclicked', page=page)
+                        captcha_cleared_at = None
+                        _trace_event(trace, 'invite_reopened_and_reclicked', page=page, waited_secs=wait_elapsed)
                         time.sleep(1.0)
                         continue
                     except Exception as e:

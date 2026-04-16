@@ -86,6 +86,8 @@ class PendingAction:
     text: str | None = None
     invite: str | None = None
     reclick_after_captcha: bool = False
+    invite_request_session_id: str | None = None
+    invite_request_instance_id: str | None = None
     prompt_count: int = 1
 
     def summary(self) -> dict:
@@ -139,6 +141,18 @@ def _ensure_ready_page(context, page):
         return fresh_page
 
 
+def _ensure_resume_page(context, page):
+    """Preserve the current page during pending captcha resume.
+
+    Re-running the normal readiness/bootstrap logic here can navigate away from
+    the live invite/DM captcha surface and restart the flow from `/app` or
+    `/login`, which loses Discord's in-page captcha state.
+    """
+    if page is None or page.is_closed():
+        return open_app(context)
+    return page
+
+
 def _annotate_result(result: dict, *, action_id: str) -> dict:
     result['action_id'] = action_id
     result['trace_path'] = str(trace_path(action_id))
@@ -160,6 +174,8 @@ def _new_pending_action(*, op: str, action_id: str, req: dict, result: dict) -> 
         kwargs.update(
             invite=req['invite'],
             reclick_after_captcha=bool(result.get('reclick_after_captcha', False)),
+            invite_request_session_id=result.get('invite_request_session_id'),
+            invite_request_instance_id=result.get('invite_request_instance_id'),
         )
     else:
         raise WebBrokerError(f'Unsupported pending action op: {op}')
@@ -173,6 +189,8 @@ def _refresh_pending_action(pending: PendingAction, result: dict) -> None:
     pending.prompt_count += 1
     if pending.op == 'join_invite':
         pending.reclick_after_captcha = bool(result.get('reclick_after_captcha', False))
+        pending.invite_request_session_id = result.get('invite_request_session_id') or pending.invite_request_session_id
+        pending.invite_request_instance_id = result.get('invite_request_instance_id') or pending.invite_request_instance_id
 
 
 def status() -> dict:
@@ -477,7 +495,7 @@ def run_server(*, headed: bool = False) -> None:
                                 if error is not None:
                                     resp = {"ok": False, "error": error}
                                 else:
-                                    page = _ensure_ready_page(context, page)
+                                    page = _ensure_resume_page(context, page)
                                     trace = make_tracer(pending.action_id, snapshot_fn=debug_snapshot)
                                     trace(
                                         'solve_requested',
@@ -502,6 +520,8 @@ def run_server(*, headed: bool = False) -> None:
                                             expected_prompt=pending.prompt,
                                             saw_captcha=bool(pending.captcha),
                                             reclick_after_captcha=bool(pending.reclick_after_captcha),
+                                            invite_request_session_id=pending.invite_request_session_id,
+                                            invite_request_instance_id=pending.invite_request_instance_id,
                                             trace=trace,
                                         )
                                     else:

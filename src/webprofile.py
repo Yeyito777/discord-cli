@@ -106,6 +106,52 @@ def existing_cookie_db(profile_dir: Path) -> Path | None:
     return None
 
 
+def _chrome_expires_utc_is_valid(expires_utc: int) -> bool:
+    if not expires_utc:
+        return True
+    unix_secs = (expires_utc / 1_000_000) - 11644473600
+    return unix_secs > time.time()
+
+
+def _cookie_db_has_valid_accessibility_cookie(path: Path) -> bool:
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            rows = con.execute(
+                "select name, coalesce(expires_utc, 0) from cookies where host_key like '%hcaptcha%'"
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return False
+    for name, expires_utc in rows:
+        if name == 'hc_accessibility' and _chrome_expires_utc_is_valid(int(expires_utc or 0)):
+            return True
+    return False
+
+
+def _hcaptcha_cookie_source_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    primary = existing_cookie_db(CAPTCHA_PROFILE_DIR)
+    if primary is not None:
+        candidates.append(primary)
+    for extra in (
+        Path.home() / '.runtime' / 'qutebrowser-exocortex' / 'data' / 'webengine' / 'Cookies',
+        Path.home() / '.runtime' / 'qutebrowser-yeyito' / 'data' / 'webengine' / 'Cookies',
+    ):
+        if extra.exists() and extra not in candidates:
+            candidates.append(extra)
+    return candidates
+
+
+def _pick_hcaptcha_cookie_source() -> Path | None:
+    candidates = _hcaptcha_cookie_source_candidates()
+    for path in candidates:
+        if _cookie_db_has_valid_accessibility_cookie(path):
+            return path
+    return candidates[0] if candidates else None
+
+
 def seed_hcaptcha_cookies_from_captcha_profile() -> int:
     """Copy hCaptcha-related cookies from captcha profile into the web profile.
 
@@ -113,10 +159,10 @@ def seed_hcaptcha_cookies_from_captcha_profile() -> int:
     This does not guarantee the target profile is authenticated to Discord; it
     only helps migrate the accessibility/browser state.
     """
-    src = existing_cookie_db(CAPTCHA_PROFILE_DIR)
+    src = _pick_hcaptcha_cookie_source()
     if src is None:
         raise DiscordWebError(
-            f"No captcha-profile cookie DB found under {CAPTCHA_PROFILE_DIR}"
+            f"No hCaptcha cookie source DB found under {CAPTCHA_PROFILE_DIR} or qutebrowser runtime profiles"
         )
 
     dst = existing_cookie_db(WEB_PROFILE_DIR)
