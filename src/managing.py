@@ -4,7 +4,8 @@ import argparse
 
 from src import api
 from src.captcha_output import print_captcha_challenge
-from src.resolve import resolve_guild
+from src.private_channels import private_channel_close_message
+from src.resolve import resolve_dm, resolve_guild
 from src.invite import join_server
 from src.webbroker import join_invite as browser_join_invite
 
@@ -55,12 +56,31 @@ def join(argv):
     )
 
 
+def _close_private_channel(target: str) -> None:
+    ch = resolve_dm(target)
+    api.close_private_channel(ch["id"])
+    print(private_channel_close_message(ch))
+
+
 def leave(argv):
-    p = argparse.ArgumentParser(prog="discord leave", description="Leave a server.")
-    p.add_argument("server", help="Server name or ID")
+    p = argparse.ArgumentParser(
+        prog="discord leave",
+        description="Leave a server, or close/leave a DM or group DM.",
+    )
+    p.add_argument("target", help="Server name/ID, or DM/group-DM name/ID with --dm")
+    p.add_argument("--dm", action="store_true", help="Treat target as a DM or group-DM conversation to close/leave")
     args = p.parse_args(argv)
 
-    g = resolve_guild(args.server)
+    if args.dm:
+        _close_private_channel(args.target)
+        return
+
+    try:
+        g = resolve_guild(args.target)
+    except RuntimeError:
+        _close_private_channel(args.target)
+        return
+
     api.leave_guild(g["id"])
     print(f"Left {g.get('name', g['id'])}.")
 

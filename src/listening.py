@@ -14,6 +14,13 @@ import sys
 import time
 from pathlib import Path
 
+from src.private_channels import (
+    private_channel_label_for_type,
+    private_channel_listener_label,
+    private_channel_name,
+    private_channel_type,
+)
+
 LISTENER_DIR = Path("/tmp/discord-listeners")
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
@@ -21,13 +28,13 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 def listen(argv):
     p = argparse.ArgumentParser(
         prog="discord listen",
-        description="Start listening to a channel or DM in real-time.",
+        description="Start listening to a channel, DM, or group DM in real-time.",
     )
-    p.add_argument("target", nargs="?", help="Channel name/ID, or username for DMs")
+    p.add_argument("target", nargs="?", help="Channel name/ID, or username/group name for DMs")
     p.add_argument("-g", "--guild", "--server", dest="guild",
                    help="Server name or ID (required for channel names)")
     p.add_argument("--dm", action="store_true",
-                   help="Listen to a DM conversation")
+                   help="Listen to a DM or group-DM conversation")
     p.add_argument("--notify", action="store_true",
                    help="Listen for all DMs and @mentions (legacy alias; prefer 'discord notify start')")
     p.add_argument("--relay-conv", dest="relay_conv", metavar="ID",
@@ -71,11 +78,9 @@ def listen(argv):
 
     # Friendly name for display
     if args.dm or ch.get("type") in (1, 3):
-        for r in ch.get("recipients", []):
-            channel_name = r.get("global_name") or r.get("username", "DM")
-            break
-        label = f"DM: {channel_name}"
-        ch_type = "dm"
+        channel_name = private_channel_name(ch)
+        label = private_channel_listener_label(ch)
+        ch_type = private_channel_type(ch) or "dm"
     else:
         channel_name = ch.get("name", args.target)
         label = f"#{channel_name}" + (f" ({guild_name})" if guild_name else "")
@@ -182,7 +187,7 @@ def _start_notify_listener(relay_conv=None):
 def unlisten(argv):
     p = argparse.ArgumentParser(
         prog="discord unlisten",
-        description="Stop listening to a channel or DM.",
+        description="Stop listening to a channel, DM, or group DM.",
     )
     p.add_argument("target", nargs="?", help="Channel name/ID, username, or PID")
     p.add_argument("-g", "--guild", "--server", dest="guild",
@@ -224,8 +229,8 @@ def _stop_one(channel_id):
         try:
             meta = json.loads(meta_file.read_text())
             name = meta.get("channel_name", "")
-            if meta.get("type") == "dm":
-                label = f"DM: {name}"
+            if meta.get("type") in {"dm", "group_dm"}:
+                label = private_channel_label_for_type(meta.get("type"), name)
             else:
                 guild = meta.get("guild_name", "")
                 label = f"#{name}" + (f" ({guild})" if guild else "")
@@ -353,8 +358,8 @@ def listeners(argv):
 
         if ch_type == "notify":
             label = "🔔 Notifications (DMs + @mentions)"
-        elif ch_type == "dm":
-            label = f"DM: {name}"
+        elif ch_type in {"dm", "group_dm"}:
+            label = private_channel_label_for_type(ch_type, name)
         else:
             label = f"#{name}" + (f" ({guild})" if guild else "")
 

@@ -1,6 +1,7 @@
 """Format parsed Discord data for terminal output."""
 
 import json
+from src.private_channels import private_channel_name
 from src.parse import (
     parse_message, parse_channel, parse_guild, parse_member, parse_user,
     _parse_timestamp,
@@ -176,7 +177,7 @@ def format_dms(raw_dms):
                 label = "Unknown"
             lines.append(f"  {parsed['id']:20}  DM     {label}")
         elif parsed["type"] == 3:  # Group DM
-            name = parsed["name"] or "Group DM"
+            name = private_channel_name(d)
             count = len(parsed["recipients"])
             lines.append(f"  {parsed['id']:20}  GROUP  {name} ({count + 1} members)")
     return "\n".join(lines)

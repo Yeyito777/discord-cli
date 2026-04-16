@@ -90,7 +90,7 @@ class GatewayListener:
         self._inflator = zlib.decompressobj()
         self._guilds = {}      # guild_id → name (populated from READY, used in notify mode)
         self._channels = {}    # channel_id → {name, guild_name} (same)
-        self._dm_channel_names = {}  # channel_id → friendly name for DMs
+        self._private_channels = {}  # channel_id → private-channel metadata for DMs / group DMs
         self._notify_lock_fd = None
 
         # Notification relay queue (notify mode with relay_conv)
@@ -409,6 +409,15 @@ class GatewayListener:
 
     def _on_notify(self, event_type, d):
         """Handle events for the notification listener — DMs and @mentions."""
+        if event_type in {"CHANNEL_CREATE", "CHANNEL_UPDATE"}:
+            if d.get("type") in (1, 3):
+                self._remember_private_channel(d)
+            return
+        if event_type == "CHANNEL_DELETE":
+            ch_id = d.get("id", "")
+            if ch_id:
+                self._private_channels.pop(ch_id, None)
+            return
         if event_type != "MESSAGE_CREATE":
             return
         if d.get("author", {}).get("id") == self.my_id:
@@ -423,16 +432,28 @@ class GatewayListener:
             return
 
         author = d.get("author", {})
+        channel_id = d.get("channel_id", "")
+        priv = self._private_channels.get(channel_id, {}) if is_dm else {}
+        private_type = priv.get("channel_type") or ("dm" if is_dm else None)
         notif = {
             "ts": d.get("timestamp", ""),
-            "type": "dm" if is_dm else "mention",
+            "type": private_type if is_dm else "mention",
+            "channel_type": private_type if is_dm else "guild_text",
+            "is_group_dm": bool(is_dm and private_type == "group_dm"),
             "author_id": author.get("id", ""),
             "author": author.get("username", ""),
             "display_name": author.get("global_name") or author.get("username", ""),
             "content": (d.get("content") or "")[:300],
-            "channel_id": d.get("channel_id", ""),
+            "channel_id": channel_id,
             "msg_id": d.get("id", ""),
         }
+
+        if is_dm:
+            if priv.get("channel_name"):
+                notif["channel_name"] = priv["channel_name"]
+            participants = priv.get("participants") or []
+            if participants:
+                notif["channel_participants"] = participants
 
         # Extract reply reference if present
         ref = d.get("referenced_message")
@@ -511,6 +532,8 @@ class GatewayListener:
 
     def _format_relay(self, batch):
         """Format notification batch into a human-readable message."""
+        from src.private_channels import summarize_participants
+
         try:
             from src.notify import get_labels
             labels = get_labels()  # user_id → {label, username, ...}
@@ -541,13 +564,26 @@ class GatewayListener:
                 ref_preview = reply_to.get("content", "")[:80]
                 reply_ctx = f' (replying to {ref_name}: "{ref_preview}")'
 
-            if n.get("type") == "dm":
+            if n.get("type") in {"dm", "group_dm"}:
                 ch_id = n.get("channel_id", "")
-                ch_name = self._dm_channel_names.get(ch_id, ch_id)
-                ch_tag = f" [ch:{ch_name}]" if ch_id else ""
-                parts.append(
-                    f'DM from {name} (@{username}){label_str}{ch_tag}{id_tag}{reply_ctx}: "{content}"'
-                )
+                channel_type = n.get("channel_type") or n.get("type") or "dm"
+                channel_name = n.get("channel_name") or ch_id
+                participants = n.get("channel_participants") or []
+
+                if channel_type == "group_dm":
+                    preview = summarize_participants(participants)
+                    summary = channel_name or preview or "Group DM"
+                    participant_suffix = f" [group: {preview}]" if preview and preview != summary else ""
+                    ch_tag = f" [ch:{ch_id}]" if ch_id else ""
+                    parts.append(
+                        f'Group DM [{summary}] from {name} (@{username}){label_str}{participant_suffix}{ch_tag}{id_tag}{reply_ctx}: "{content}"'
+                    )
+                else:
+                    ch_tag = f" [ch:{ch_id}]" if ch_id else ""
+                    conv_tag = f" [dm:{channel_name}]" if channel_name else ""
+                    parts.append(
+                        f'DM from {name} (@{username}){label_str}{conv_tag}{ch_tag}{id_tag}{reply_ctx}: "{content}"'
+                    )
             else:
                 guild = n.get("guild_name", "?")
                 channel = n.get("channel_name", "?")
@@ -691,6 +727,16 @@ class GatewayListener:
 
         return lines
 
+    def _remember_private_channel(self, ch):
+        """Cache private-channel metadata for DM / group-DM notifications."""
+        from src.private_channels import private_channel_meta
+
+        ch_id = ch.get("id", "")
+        meta = private_channel_meta(ch)
+        if not ch_id or meta is None:
+            return
+        self._private_channels[ch_id] = meta
+
     def _build_name_maps(self, ready_data):
         """Build guild/channel name mappings from the READY event."""
         self._guilds = {}
@@ -706,24 +752,10 @@ class GatewayListener:
                     "guild_name": gname,
                 }
 
-        # Build friendly names for DM channels
-        self._dm_channel_names = {}
+        # Build metadata for private channels
+        self._private_channels = {}
         for ch in ready_data.get("private_channels", []):
-            ch_id = ch.get("id", "")
-            recipients = ch.get("recipients", ch.get("recipient_ids", []))
-            if ch.get("type") == 1 and recipients:  # 1-on-1 DM
-                r = recipients[0]
-                if isinstance(r, dict):
-                    self._dm_channel_names[ch_id] = r.get("username", ch_id)
-            elif ch.get("type") == 3:  # Group DM
-                name = ch.get("name")
-                if name:
-                    self._dm_channel_names[ch_id] = name
-                elif isinstance(recipients, list) and recipients:
-                    names = [r.get("global_name") or r.get("username", "?")
-                             for r in recipients if isinstance(r, dict)]
-                    if names:
-                        self._dm_channel_names[ch_id] = "+".join(sorted(names))
+            self._remember_private_channel(ch)
 
     # ─── Output ──────────────────────────────────────────────────────────────
 

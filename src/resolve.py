@@ -2,6 +2,7 @@
 
 import re
 from src import api
+from src.private_channels import private_channel_name, private_channel_participants
 
 
 def _fuzzy_match(query, candidates, key):
@@ -107,20 +108,28 @@ def resolve_dm(target):
 
     dms = api.get_dm_channels()
 
+    query = target.lower()
+    username_query = target.lstrip("@").lower()
+
     # Search DM recipients by username or display name
     for dm in dms:
         if dm.get("type") == 1:  # Direct DM
             for r in dm.get("recipients", []):
-                name = r.get("global_name", "") or ""
+                name = (r.get("global_name", "") or r.get("display_name", "") or "")
                 uname = r.get("username", "") or ""
-                if (target.lower() in name.lower() or
-                    target.lower() in uname.lower() or
-                    target.lstrip("@").lower() == uname.lower()):
+                if (
+                    query in name.lower()
+                    or query in uname.lower()
+                    or username_query == uname.lower()
+                ):
                     return dm
         elif dm.get("type") == 3:  # Group DM
-            group_name = dm.get("name", "") or ""
-            if target.lower() in group_name.lower():
+            group_name = private_channel_name(dm)
+            if query in group_name.lower():
                 return dm
+            for participant in private_channel_participants(dm):
+                if query in participant.lower():
+                    return dm
 
     raise RuntimeError(
         f'Cannot resolve DM target "{target}". '

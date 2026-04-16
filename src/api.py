@@ -437,6 +437,11 @@ def create_dm(recipient_id):
     return post("/users/@me/channels", body={"recipients": [recipient_id]})
 
 
+def close_private_channel(channel_id):
+    """Close a 1:1 DM or leave a group DM by deleting the private channel."""
+    return delete(f"/channels/{channel_id}")
+
+
 # ─── Messages ────────────────────────────────────────────────────────────────
 
 def get_messages(channel_id, limit=50, before=None, after=None, around=None):
