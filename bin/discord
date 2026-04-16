@@ -62,7 +62,7 @@ usage: discord web <subcommand> [args]
 subcommands:
   setup               Open the dedicated Chromium profile for manual Discord login/bootstrap
   status              Show local profile + broker status
-  seed-accessibility  Copy hCaptcha accessibility cookies from the captcha profile
+  seed-accessibility  Copy hCaptcha accessibility cookies from the best available source
   broker-start        Start/reuse the persistent browser broker
   broker-status       Show persistent broker status
   broker-stop         Stop the persistent broker
@@ -72,7 +72,8 @@ subcommands:
 notes:
   - The broker keeps one dedicated Chromium session alive to avoid relaunching Chrome per command
   - Headless is the default; use --headed only for debugging
-  - `seed-accessibility` helps carry hCaptcha accessibility state into the web profile
+  - `seed-accessibility` imports hCaptcha accessibility state from the best available source
+    (captcha profile first if valid, otherwise live qutebrowser runtime cookies)
 EOF
 }
 

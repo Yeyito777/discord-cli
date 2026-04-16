@@ -71,7 +71,9 @@ def dm(argv):
         description=(
             "Read or send DMs. Raw API is used by default; use --browser to send "
             "through the dedicated browser-native path. Plain API sends may also "
-            "auto-fallback to the browser path on captcha-like failures."
+            "auto-fallback to the browser path on captcha-like failures, and "
+            "browser-backed sends surface prompts for `discord captcha solve` "
+            "when needed."
         ),
         epilog=(
             "examples:\n"
@@ -90,7 +92,7 @@ def dm(argv):
                    help="File(s) to attach (requires --send)")
     p.add_argument("--before", help="Get messages before this message ID")
     p.add_argument("--browser", action="store_true", help="Force browser-native sending instead of raw API")
-    p.add_argument("--seed-accessibility", action="store_true", help="Seed hCaptcha accessibility cookies into the dedicated browser profile first (mainly useful with --browser)")
+    p.add_argument("--seed-accessibility", action="store_true", help="Seed hCaptcha accessibility cookies from the best available browser source into the dedicated browser profile first (mainly useful with --browser)")
     args = p.parse_args(argv)
 
     if args.files and args.send_text is None:

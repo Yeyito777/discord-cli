@@ -115,7 +115,7 @@ def _run_one_shot(headed: bool, action):
 def seed_accessibility(argv):
     p = argparse.ArgumentParser(
         prog="discord web seed-accessibility",
-        description="Copy hCaptcha cookie state from the captcha profile into the dedicated web profile.",
+        description="Copy hCaptcha cookie state from the best available browser source into the dedicated web profile.",
     )
     p.parse_args(argv)
     try:
@@ -130,8 +130,8 @@ def broker_start(argv):
         prog="discord web broker-start",
         description="Start/reuse the persistent Discord web browser broker.",
     )
-    p.add_argument("--seed-accessibility", action="store_true", help="Copy hCaptcha cookies from captcha profile before starting the broker")
-    p.add_argument("--headed", action="store_true", help="Start the broker with a visible browser window")
+    p.add_argument("--seed-accessibility", action="store_true", help="Copy hCaptcha cookies from the best available browser source before starting the broker")
+    p.add_argument("--headed", action="store_true", help="When launching a new broker, start it with a visible browser window")
     args = p.parse_args(argv)
     try:
         print(json.dumps(broker_ensure_started(seed_accessibility=args.seed_accessibility, headed=args.headed), indent=2))
@@ -160,13 +160,13 @@ def broker_stop_cmd(argv):
 def send_dm(argv):
     p = argparse.ArgumentParser(
         prog="discord web send-dm",
-        description="Send a DM through the dedicated Discord web profile, auto-solving visible text hCaptcha if needed.",
+        description="Send a DM through the dedicated Discord web profile. If a visible text hCaptcha appears, the command prints a prompt for `discord captcha solve` and then resumes.",
     )
     p.add_argument("channel_id", help="DM channel ID")
     p.add_argument("text", help="Message text")
-    p.add_argument("--headed", action="store_true", help="Run with a visible browser window")
-    p.add_argument("--seed-accessibility", action="store_true", help="Copy hCaptcha cookies from captcha profile before launching the web profile")
-    p.add_argument("--one-shot", action="store_true", help="Do not use the persistent broker; launch a one-shot browser instead")
+    p.add_argument("--headed", action="store_true", help="Run with a visible browser window (one-shot mode only)")
+    p.add_argument("--seed-accessibility", action="store_true", help="Copy hCaptcha cookies from the best available browser source before launching the web profile")
+    p.add_argument("--one-shot", action="store_true", help="Do not use the persistent broker; launch a one-shot browser instead (required if you want --headed to apply here)")
     args = p.parse_args(argv)
 
     if not args.one_shot:
@@ -191,12 +191,12 @@ def send_dm(argv):
 def join_invite(argv):
     p = argparse.ArgumentParser(
         prog="discord web join-invite",
-        description="Join a server through the dedicated Discord web profile, auto-solving visible text hCaptcha if needed.",
+        description="Join a server through the dedicated Discord web profile. If a visible text hCaptcha appears, the command prints a prompt for `discord captcha solve` and then resumes.",
     )
     p.add_argument("invite", help="Invite URL or code")
-    p.add_argument("--headed", action="store_true", help="Run with a visible browser window")
-    p.add_argument("--seed-accessibility", action="store_true", help="Copy hCaptcha cookies from captcha profile before launching the web profile")
-    p.add_argument("--one-shot", action="store_true", help="Do not use the persistent broker; launch a one-shot browser instead")
+    p.add_argument("--headed", action="store_true", help="Run with a visible browser window (one-shot mode only)")
+    p.add_argument("--seed-accessibility", action="store_true", help="Copy hCaptcha cookies from the best available browser source before launching the web profile")
+    p.add_argument("--one-shot", action="store_true", help="Do not use the persistent broker; launch a one-shot browser instead (required if you want --headed to apply here)")
     args = p.parse_args(argv)
 
     if not args.one_shot:
