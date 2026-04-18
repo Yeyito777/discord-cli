@@ -42,7 +42,7 @@ commands:
   web          Manage dedicated Discord web profile   (setup, status, seed-accessibility,
                                                       broker-start, broker-status, broker-stop,
                                                       send-dm, join-invite)
-  login        Configure authentication               (alias: setup, auth)
+  login        Save and validate an auth token       (alias: setup, auth)
   logout       Remove saved credentials
 
 notes:
