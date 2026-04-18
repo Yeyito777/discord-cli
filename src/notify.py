@@ -22,6 +22,8 @@ import sys
 import time
 from pathlib import Path
 
+from src.exocortex import manage_external_tool_daemon
+
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 CONFIG_FILE = CONFIG_DIR / "notify.json"
 LISTENER_DIR = Path("/tmp/discord-listeners")
@@ -275,64 +277,8 @@ def start(argv):
         description="Start the notification listener.")
     p.parse_args(argv)
 
-    targets = get_relay_targets()
-    if not targets:
-        print("  No relay targets configured. Run: discord notify add <conv_id>")
-        return
-
-    LISTENER_DIR.mkdir(parents=True, exist_ok=True)
-    paths = _listener_paths()
-    pid_file = paths["pid"]
-    log_file = paths["log"]
-
-    # Check if ANY __notify__ gateway is already running — this catches both
-    # daemon-managed processes (started by exocortexd, no PID file written) and
-    # manually started ones. Without this check, calling 'notify start' while
-    # the daemon is already running the gateway causes a duplicate connection.
-    existing_pids = _collect_notify_pids()
-    if existing_pids:
-        existing_pid = existing_pids[0]
-        _write_pid_hint(existing_pid)
-        print(f"  Notify gateway already running (PID {existing_pid})")
-        if len(existing_pids) > 1:
-            extras = ", ".join(str(pid) for pid in existing_pids[1:])
-            print(f"  Warning: found {len(existing_pids)} notify gateways already running (extra PIDs: {extras})")
-            print(f"  Run 'discord notify stop' to clean up duplicates.")
-        print(f"  Relay targets read from config/notify.json at startup.")
-        print(f"  (Managed by exocortexd daemon — lifecycle is automatic)")
-        return
-
-    # Stale PID file cleanup
-    if pid_file.exists():
-        pid_file.unlink(missing_ok=True)
-
-    gateway_script = PROJECT_DIR / "src" / "gateway.py"
-    err_file = paths["err"]
-
-    # Pass relay targets as additional args after channel_id and output_file
-    cmd = [sys.executable, str(gateway_script), "__notify__", str(log_file)] + targets
-
-    proc = subprocess.Popen(
-        cmd,
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=open(err_file, "a"),
-    )
-
-    _write_pid_hint(proc.pid)
-    meta = {
-        "channel_id": "__notify__",
-        "channel_name": "Notifications",
-        "type": "notify",
-        "relay_targets": targets,
-        "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-    paths["meta"].write_text(json.dumps(meta))
-
-    print(f"  Notify listener started (PID {proc.pid})")
-    print(f"  Relaying to: {', '.join(targets)}")
-    print(f"  Output: {log_file}")
+    status = manage_external_tool_daemon("discord", "start")
+    print(f"  {status.get('message', 'Requested start for supervised Discord daemon')}")
 
 
 def stop(argv):
@@ -340,33 +286,8 @@ def stop(argv):
         description="Stop the notification listener.")
     p.parse_args(argv)
 
-    paths = _listener_paths()
-    pid_file = paths["pid"]
-    meta_file = paths["meta"]
-
-    pids = _collect_notify_pids()
-    if not pids:
-        print("  Notify listener not running")
-        return
-
-    stopped, alive = _stop_notify_pids(pids)
-
-    if stopped:
-        if len(stopped) == 1:
-            print(f"  Stopped notify listener (PID {stopped[0]})")
-        else:
-            stopped_str = ", ".join(str(pid) for pid in stopped)
-            print(f"  Stopped {len(stopped)} notify listener(s): {stopped_str}")
-        print(f"  Note: if managed by exocortexd daemon it will restart automatically.")
-    else:
-        print("  Notify listener already stopped")
-
-    if alive:
-        alive_str = ", ".join(str(pid) for pid in alive)
-        print(f"  Warning: {len(alive)} notify listener(s) still alive: {alive_str}")
-
-    pid_file.unlink(missing_ok=True)
-    meta_file.unlink(missing_ok=True)
+    status = manage_external_tool_daemon("discord", "stop")
+    print(f"  {status.get('message', 'Requested stop for supervised Discord daemon')}")
 
 
 def _run_daemon_mode(argv):
