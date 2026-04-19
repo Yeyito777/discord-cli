@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 import zlib
+from collections import defaultdict, deque
 from pathlib import Path
 
 import websocket
@@ -41,6 +42,7 @@ DEFAULT_CAPABILITIES = 30717
 NOTIFY_LISTENER_DIR = Path("/tmp/discord-listeners")
 NOTIFY_LOCK_PATH = NOTIFY_LISTENER_DIR / "__notify__.lock"
 NOTIFY_PID_PATH = NOTIFY_LISTENER_DIR / "__notify__.pid"
+RELAY_SEEN_LIMIT = 200
 
 # ─── Build number ────────────────────────────────────────────────────────────
 
@@ -97,6 +99,7 @@ class GatewayListener:
         self._relay_queue = []
         self._relay_lock = threading.Lock()
         self._relay_active = False
+        self._relay_seen = defaultdict(dict)  # relay_target -> channel_id -> {ids, order}
 
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
@@ -151,6 +154,32 @@ class GatewayListener:
             except OSError:
                 pass
             self._notify_lock_fd = None
+
+    def _get_relay_seen_ids(self, relay_target, channel_id):
+        bucket = self._relay_seen.get(relay_target, {}).get(channel_id)
+        if not bucket:
+            return set()
+        return set(bucket["ids"])
+
+    def _mark_relay_seen(self, relay_target, channel_id, msg_ids):
+        if not relay_target or not channel_id or not msg_ids:
+            return
+        buckets = self._relay_seen[relay_target]
+        bucket = buckets.get(channel_id)
+        if bucket is None:
+            bucket = {"ids": set(), "order": deque()}
+            buckets[channel_id] = bucket
+
+        seen_ids = bucket["ids"]
+        order = bucket["order"]
+        for msg_id in msg_ids:
+            if not msg_id or msg_id in seen_ids:
+                continue
+            seen_ids.add(msg_id)
+            order.append(msg_id)
+            while len(order) > RELAY_SEEN_LIMIT:
+                old = order.popleft()
+                seen_ids.discard(old)
 
     # ─── Main loop ───────────────────────────────────────────────────────────
 
@@ -505,10 +534,10 @@ class GatewayListener:
                 batch = list(self._relay_queue)
                 self._relay_queue.clear()
 
-            msg = self._format_relay(batch)
             self._log(f"Relaying {len(batch)} notification(s) to {len(self.relay_targets)} target(s)")
 
             for conv_id in self.relay_targets:
+                msg, seen_updates = self._format_relay(batch, relay_target=conv_id)
                 try:
                     result = subprocess.run(
                         ["exo", "send", msg, "-c", conv_id, "--timeout", "600"],
@@ -517,6 +546,8 @@ class GatewayListener:
                     if result.returncode != 0:
                         self._log(f"Relay to {conv_id} failed: {result.stderr[:200]}")
                     else:
+                        for channel_id, msg_ids in seen_updates.items():
+                            self._mark_relay_seen(conv_id, channel_id, msg_ids)
                         out = result.stdout.strip()
                         if "queued" in out.lower():
                             self._log(f"Relay to {conv_id}: auto-queued (conversation busy)")
@@ -530,8 +561,12 @@ class GatewayListener:
             # Brief pause before checking queue again (lets batching happen)
             time.sleep(2)
 
-    def _format_relay(self, batch):
-        """Format notification batch into a human-readable message."""
+    def _format_relay(self, batch, *, relay_target=None):
+        """Format notification batch into a human-readable message.
+
+        Returns (message_text, seen_updates) where seen_updates maps channel_id
+        to message IDs that were actually shown to this relay target.
+        """
         from src.private_channels import summarize_participants
 
         try:
@@ -541,7 +576,9 @@ class GatewayListener:
             labels = {}
 
         # Cache channel history fetches within this batch
-        history_cache = {}  # channel_id → list of formatted history lines (chronological)
+        history_cache = {}  # channel_id → raw message list (chronological)
+        seen_updates = defaultdict(set)
+        local_seen = {}
 
         parts = []
         for n in batch:
@@ -587,11 +624,19 @@ class GatewayListener:
             else:
                 guild = n.get("guild_name", "?")
                 channel = n.get("channel_name", "?")
+                channel_id = n.get("channel_id", "")
+                current_seen = local_seen.get(channel_id)
+                if current_seen is None:
+                    current_seen = self._get_relay_seen_ids(relay_target, channel_id)
+                    local_seen[channel_id] = current_seen
 
                 # Fetch recent channel history for server mentions
-                history_lines = self._fetch_channel_history(
-                    n.get("channel_id", ""), msg_id, history_cache, labels
+                history_lines, shown_history_ids = self._fetch_channel_history(
+                    channel_id, msg_id, history_cache, labels, seen_ids=current_seen
                 )
+                if shown_history_ids:
+                    current_seen.update(shown_history_ids)
+                    seen_updates[channel_id].update(shown_history_ids)
 
                 # Notification line — ⟶ prefix distinguishes from history
                 if history_lines:
@@ -610,26 +655,31 @@ class GatewayListener:
                         f' in #{channel} ({guild}){id_tag}{reply_ctx}: "{content}"'
                     )
 
+                if msg_id:
+                    current_seen.add(msg_id)
+                    seen_updates[channel_id].add(msg_id)
+
         if len(parts) == 1:
             # Server mentions with history are multiline; DMs stay on one line
             if "\n" in parts[0]:
-                return f"[Discord Notification]\n{parts[0]}"
+                return f"[Discord Notification]\n{parts[0]}", seen_updates
             else:
-                return f"[Discord Notification] {parts[0]}"
+                return f"[Discord Notification] {parts[0]}", seen_updates
         else:
             header = f"[Discord Notification] {len(parts)} new:"
             body = "\n".join(f"  \u2022 {p}" for p in parts)
-            return f"{header}\n{body}"
+            return f"{header}\n{body}", seen_updates
 
-    def _fetch_channel_history(self, channel_id, exclude_msg_id, cache, labels=None):
+    def _fetch_channel_history(self, channel_id, exclude_msg_id, cache, labels=None, seen_ids=None):
         """Fetch recent messages from a channel for context.
 
-        Returns a list of formatted history lines (chronological), or empty list.
-        Each line includes [msg:id] and reply context if applicable.
-        Resolves <@id> mentions to readable names and shows attachments/embeds.
+        Returns (history_lines, shown_message_ids), with history lines in
+        chronological order. Each line includes [msg:id] and reply context if
+        applicable. Resolves <@id> mentions to readable names and shows
+        attachments/embeds.
         """
         if not channel_id:
-            return []
+            return [], []
 
         if channel_id not in cache:
             try:
@@ -642,7 +692,7 @@ class GatewayListener:
 
         messages = cache[channel_id]
         if not messages:
-            return []
+            return [], []
 
         # Build user_id → display_name map for mention resolution
         user_names = {}
@@ -673,14 +723,16 @@ class GatewayListener:
             name = user_names.get(uid)
             return f"@{name}" if name else match.group(0)
 
+        seen_ids = seen_ids or set()
         lines = []
+        shown_message_ids = []
         for m in messages:
-            if m.get("id") == exclude_msg_id:
+            mid = m.get("id", "?")
+            if mid == exclude_msg_id or mid in seen_ids:
                 continue
             author = m.get("author", {})
             author_name = author.get("global_name") or author.get("username", "?")
             body = (m.get("content") or "")[:150]
-            mid = m.get("id", "?")
 
             # Resolve user mentions (<@id> and <@!id>) in body
             if body:
@@ -724,8 +776,9 @@ class GatewayListener:
                 lines.append(f"  [msg:{mid}] (reply to {ref_name}) {author_name}: {content}")
             else:
                 lines.append(f"  [msg:{mid}] {author_name}: {content}")
+            shown_message_ids.append(mid)
 
-        return lines
+        return lines, shown_message_ids
 
     def _remember_private_channel(self, ch):
         """Cache private-channel metadata for DM / group-DM notifications."""
