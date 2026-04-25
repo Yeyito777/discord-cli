@@ -17,6 +17,7 @@ commands:
   guild        Show server details                     (alias: server)
   channels     List channels in a server              (alias: chs)
   messages     Read messages from a channel           (alias: msgs)
+  download     Download message attachment(s)
   dms          List DM conversations
   dm           Read or send DMs                       (--browser for browser-native send)
   search       Search messages                        (alias: s)
@@ -87,6 +88,8 @@ cmd="$1"; shift
 case "$cmd" in
     guilds|servers|guild|server|channels|chs|messages|msgs|dms|dm|search|s|pins|threads|members|me)
         exec "$PYTHON" -c "import sys; from src.reading import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
+    download)
+        exec "$PYTHON" -c "import sys; from src.downloading import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     send|reply|edit|delete|del|react|unreact)
         exec "$PYTHON" -c "import sys; from src.writing import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     listen|unlisten|listeners)
