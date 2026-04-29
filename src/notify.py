@@ -9,8 +9,9 @@ Configuration is stored in PROJECT_ROOT/config/notify.json:
     }
 }
 
-The notify listener sends DM and @mention notifications to all
-configured relay targets via `exo send`.
+The notify listener relays DM and @mention notifications to configured targets
+via `exo send`. If the target conversation is currently busy, exo's send path
+falls back to next-turn queuing; otherwise delivery is immediate.
 """
 
 import argparse

@@ -31,6 +31,7 @@ commands:
   delete       Delete a message                       (alias: del)
   react        React to a message
   unreact      Remove a reaction
+  call         Start/join Discord calls without local audio (start/join detach by default; leave, list)
   listen       Start real-time channel listener
   unlisten     Stop a channel listener
   listeners    List active listeners
@@ -92,6 +93,8 @@ case "$cmd" in
         exec "$PYTHON" -c "import sys; from src.downloading import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     send|reply|edit|delete|del|react|unreact)
         exec "$PYTHON" -c "import sys; from src.writing import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
+    call|voice|join-call)
+        exec "$PYTHON" -c "import sys; from src.calling import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     listen|unlisten|listeners)
         exec "$PYTHON" -c "import sys; from src.listening import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     notify)

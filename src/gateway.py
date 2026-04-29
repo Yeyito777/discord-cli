@@ -42,6 +42,7 @@ DEFAULT_CAPABILITIES = 30717
 NOTIFY_LISTENER_DIR = Path("/tmp/discord-listeners")
 NOTIFY_LOCK_PATH = NOTIFY_LISTENER_DIR / "__notify__.lock"
 NOTIFY_PID_PATH = NOTIFY_LISTENER_DIR / "__notify__.pid"
+CALL_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "discord-cli" / "calls"
 RELAY_SEEN_LIMIT = 200
 
 # ─── Build number ────────────────────────────────────────────────────────────
@@ -93,6 +94,7 @@ class GatewayListener:
         self._guilds = {}      # guild_id → name (populated from READY, used in notify mode)
         self._channels = {}    # channel_id → {name, guild_name} (same)
         self._private_channels = {}  # channel_id → private-channel metadata for DMs / group DMs
+        self._notified_calls = set()  # channel IDs with an active incoming-call notification
         self._notify_lock_fd = None
 
         # Notification relay queue (notify mode with relay_conv)
@@ -446,6 +448,15 @@ class GatewayListener:
             ch_id = d.get("id", "")
             if ch_id:
                 self._private_channels.pop(ch_id, None)
+                self._notified_calls.discard(ch_id)
+            return
+        if event_type in {"CALL_CREATE", "CALL_UPDATE"}:
+            self._on_notify_call(event_type, d)
+            return
+        if event_type == "CALL_DELETE":
+            ch_id = d.get("channel_id", "")
+            if ch_id:
+                self._notified_calls.discard(ch_id)
             return
         if event_type != "MESSAGE_CREATE":
             return
@@ -453,6 +464,10 @@ class GatewayListener:
             return
 
         is_dm = d.get("guild_id") is None
+        if is_dm and self._is_call_message(d):
+            self._on_notify_call_message(d)
+            return
+
         mentions_me = any(
             m.get("id") == self.my_id for m in d.get("mentions", [])
         )
@@ -462,7 +477,7 @@ class GatewayListener:
 
         author = d.get("author", {})
         channel_id = d.get("channel_id", "")
-        priv = self._private_channels.get(channel_id, {}) if is_dm else {}
+        priv = self._ensure_private_channel_meta(channel_id) if is_dm else {}
         private_type = priv.get("channel_type") or ("dm" if is_dm else None)
         notif = {
             "ts": d.get("timestamp", ""),
@@ -509,6 +524,118 @@ class GatewayListener:
         if self.relay_targets:
             self._queue_relay(notif)
 
+    def _is_call_message(self, d):
+        """Return True for Discord's call system message in a DM/group DM."""
+        return d.get("type") == 3 or isinstance(d.get("call"), dict)
+
+    def _on_notify_call_message(self, d):
+        """Use the call system MESSAGE_CREATE as the incoming-call notification."""
+        channel_id = d.get("channel_id", "")
+        if not channel_id or channel_id in self._notified_calls:
+            return
+        if self._active_call_meta(channel_id):
+            return
+        author = d.get("author") if isinstance(d.get("author"), dict) else {}
+        caller = author.get("username") or author.get("global_name") or "someone"
+        priv = self._ensure_private_channel_meta(channel_id)
+        self._emit_call_notification(
+            channel_id,
+            priv,
+            caller,
+            ringing={str(self.my_id)} if self.my_id else set(),
+            voice_state_user_ids={str(author.get("id"))} if author.get("id") else set(),
+            region=(d.get("call") or {}).get("region") if isinstance(d.get("call"), dict) else None,
+            timestamp=d.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+
+    def _on_notify_call(self, event_type, d):
+        """Notify when someone rings the user in a DM/group DM call."""
+        channel_id = d.get("channel_id", "")
+        if not channel_id:
+            return
+        active_meta = self._active_call_meta(channel_id)
+        if active_meta:
+            # This process started/joined the call. The detached call worker has
+            # its own gateway and emits in-call joined/left notifications; the
+            # global DM notification relay must not reclassify our outbound call
+            # or participant changes as an incoming call.
+            return
+        ringing = {str(user_id) for user_id in (d.get("ringing") or []) if user_id}
+        voice_state_user_ids = set()
+        for state in d.get("voice_states") or []:
+            if isinstance(state, dict) and state.get("user_id"):
+                voice_state_user_ids.add(str(state.get("user_id")))
+
+        # CALL_UPDATE may repeat; only notify when this account is actually being
+        # rung, or when the call just appeared and we have no ringing list.
+        if self.my_id and ringing and str(self.my_id) not in ringing:
+            self._notified_calls.discard(channel_id)
+            return
+        if channel_id in self._notified_calls:
+            return
+
+        priv = self._ensure_private_channel_meta(channel_id)
+        caller = self._call_caller_name(ringing, voice_state_user_ids, priv)
+        self._emit_call_notification(
+            channel_id,
+            priv,
+            caller,
+            ringing=ringing,
+            voice_state_user_ids=voice_state_user_ids,
+            region=d.get("region"),
+        )
+
+    def _emit_call_notification(self, channel_id, priv, caller, *, ringing=None, voice_state_user_ids=None, region=None, timestamp=None):
+        participants = priv.get("participants") or []
+        private_type = priv.get("channel_type") or "dm"
+        channel_name = priv.get("channel_name") or channel_id
+        notif = {
+            "ts": timestamp or time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "type": "call",
+            "channel_type": private_type,
+            "is_group_dm": private_type == "group_dm",
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "channel_participants": participants,
+            "caller": caller,
+            "ringing_user_ids": sorted(ringing or []),
+            "voice_state_user_ids": sorted(voice_state_user_ids or []),
+            "region": region,
+        }
+        self._notified_calls.add(channel_id)
+        self._write(json.dumps(notif) + "\n")
+        if self.relay_targets:
+            self._queue_relay(notif)
+
+    def _active_call_meta(self, channel_id):
+        path = CALL_STATE_DIR / f"{re.sub(r'[^A-Za-z0-9_.-]+', '_', str(channel_id))}.json"
+        try:
+            meta = json.loads(path.read_text())
+            pid = int(meta.get("pid"))
+            os.kill(pid, 0)
+            try:
+                stat = Path(f"/proc/{pid}/stat").read_text()
+                if ") Z" in stat:
+                    return None
+            except Exception:
+                pass
+            return meta
+        except Exception:
+            return None
+
+    def _call_caller_name(self, ringing, voice_state_user_ids, priv):
+        # Prefer the non-self participant username/display name from channel metadata.
+        participants = priv.get("participants") or []
+        if participants:
+            return ", ".join(participants[:3])
+        for user_id in voice_state_user_ids:
+            if user_id != str(self.my_id):
+                return user_id
+        for user_id in ringing:
+            if user_id != str(self.my_id):
+                return user_id
+        return "someone"
+
     # ─── Instant relay ───────────────────────────────────────────────────────
 
     def _queue_relay(self, notif):
@@ -524,7 +651,9 @@ class GatewayListener:
     def _relay_sender(self):
         """Process the relay queue — sends batched notifications via exo.
 
-        Uses `exo send` which auto-queues if the conversation is busy.
+        Uses `exo send`, whose busy-conversation fallback queues for the next
+        turn. When the target conversation is idle, notifications send
+        immediately.
         """
         while self.running:
             with self._relay_lock:
@@ -550,7 +679,7 @@ class GatewayListener:
                             self._mark_relay_seen(conv_id, channel_id, msg_ids)
                         out = result.stdout.strip()
                         if "queued" in out.lower():
-                            self._log(f"Relay to {conv_id}: auto-queued (conversation busy)")
+                            self._log(f"Relay to {conv_id}: queued for next turn")
                         else:
                             self._log(f"Relay to {conv_id}: delivered")
                 except subprocess.TimeoutExpired:
@@ -582,6 +711,23 @@ class GatewayListener:
 
         parts = []
         for n in batch:
+            if n.get("type") == "call":
+                channel_type = n.get("channel_type") or "dm"
+                channel_name = n.get("channel_name") or n.get("channel_id", "")
+                participants = n.get("channel_participants") or []
+                caller = n.get("caller") or "someone"
+                ch_id = n.get("channel_id", "")
+                ch_tag = f" [ch:{ch_id}]" if ch_id else ""
+                if channel_type == "group_dm":
+                    preview = summarize_participants(participants)
+                    summary = channel_name or preview or "Group DM"
+                    participant_suffix = f" [group: {preview}]" if preview and preview != summary else ""
+                    parts.append(f"☎ Incoming group DM call [{summary}] from {caller}{participant_suffix}{ch_tag}")
+                else:
+                    conv_tag = f" [dm:{channel_name}]" if channel_name else ""
+                    parts.append(f"☎ Incoming DM call from {caller}{conv_tag}{ch_tag}")
+                continue
+
             name = n.get("display_name") or n.get("author", "?")
             username = n.get("author", "?")
             author_id = n.get("author_id", "")
@@ -788,7 +934,37 @@ class GatewayListener:
         meta = private_channel_meta(ch)
         if not ch_id or meta is None:
             return
+        recipients = ch.get("recipients") or []
+        meta["raw_recipients"] = recipients
+        meta["participants"] = self._participant_names_from_recipients(recipients) or meta.get("participants") or []
+        meta["participant_ids"] = [str(r.get("id")) for r in recipients if isinstance(r, dict) and r.get("id")]
+        if not meta.get("channel_name") and meta["participants"]:
+            meta["channel_name"] = ", ".join(meta["participants"][:3])
         self._private_channels[ch_id] = meta
+
+    def _participant_names_from_recipients(self, recipients):
+        names = []
+        for recipient in recipients or []:
+            if not isinstance(recipient, dict):
+                continue
+            if recipient.get("id") and str(recipient.get("id")) == str(self.my_id):
+                continue
+            name = recipient.get("username") or recipient.get("global_name") or recipient.get("display_name")
+            if name:
+                names.append(name)
+        return names
+
+    def _ensure_private_channel_meta(self, channel_id):
+        meta = self._private_channels.get(channel_id)
+        if meta and (meta.get("participants") or meta.get("channel_name") != channel_id):
+            return meta
+        try:
+            from src import api
+            ch = api.get_channel(channel_id)
+            self._remember_private_channel(ch)
+        except Exception as e:
+            self._log(f"Failed to fetch private channel {channel_id}: {e}")
+        return self._private_channels.get(channel_id, {})
 
     def _build_name_maps(self, ready_data):
         """Build guild/channel name mappings from the READY event."""
