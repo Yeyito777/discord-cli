@@ -95,6 +95,7 @@ class GatewayListener:
         self._channels = {}    # channel_id → {name, guild_name} (same)
         self._private_channels = {}  # channel_id → private-channel metadata for DMs / group DMs
         self._notified_calls = set()  # channel IDs with an active incoming-call notification
+        self._call_event_baseline_until = 0.0  # suppress call-state hydration after READY
         self._notify_lock_fd = None
 
         # Notification relay queue (notify mode with relay_conv)
@@ -410,6 +411,9 @@ class GatewayListener:
 
             if self.channel_id == "__notify__":
                 self._build_name_maps(d)
+                # Discord may hydrate existing DM call state immediately after a
+                # fresh identify. That is level state, not a new ringing edge.
+                self._call_event_baseline_until = time.time() + 15
                 self._write(f"--- Listening for DMs and @mentions as {name} ---\n\n")
             else:
                 self._write(f"--- Listening as {name} · channel {self.channel_id} ---\n\n")
@@ -549,9 +553,24 @@ class GatewayListener:
         )
 
     def _on_notify_call(self, event_type, d):
-        """Notify when someone rings the user in a DM/group DM call."""
+        """Notify on call-start edges, not ongoing call/ring state.
+
+        Discord CALL_UPDATE is level-triggered and can repeat while a call is
+        still ringing or while another client reconnects. Treating it as an
+        incoming-call edge causes stale notification spam. The call system
+        MESSAGE_CREATE handler above is the primary edge-triggered path; CALL_CREATE
+        remains only as a best-effort fallback and is suppressed during READY
+        hydration.
+        """
         channel_id = d.get("channel_id", "")
         if not channel_id:
+            return
+        if event_type == "CALL_UPDATE":
+            return
+        if event_type != "CALL_CREATE":
+            return
+        if time.time() < self._call_event_baseline_until:
+            self._log(f"Suppressing hydrated CALL_CREATE for {channel_id}")
             return
         active_meta = self._active_call_meta(channel_id)
         if active_meta:
@@ -566,10 +585,7 @@ class GatewayListener:
             if isinstance(state, dict) and state.get("user_id"):
                 voice_state_user_ids.add(str(state.get("user_id")))
 
-        # CALL_UPDATE may repeat; only notify when this account is actually being
-        # rung, or when the call just appeared and we have no ringing list.
         if self.my_id and ringing and str(self.my_id) not in ringing:
-            self._notified_calls.discard(channel_id)
             return
         if channel_id in self._notified_calls:
             return
@@ -667,6 +683,9 @@ class GatewayListener:
 
             for conv_id in self.relay_targets:
                 msg, seen_updates = self._format_relay(batch, relay_target=conv_id)
+                if not msg:
+                    self._log(f"Relay to {conv_id}: skipped stale notification batch")
+                    continue
                 try:
                     result = subprocess.run(
                         ["exo", "send", msg, "-c", conv_id, "--timeout", "600", "--no-notify"],
@@ -712,11 +731,14 @@ class GatewayListener:
         parts = []
         for n in batch:
             if n.get("type") == "call":
+                ch_id = n.get("channel_id", "")
+                if ch_id and self._active_call_meta(ch_id):
+                    self._log(f"Suppressing queued incoming-call relay for active call {ch_id}")
+                    continue
                 channel_type = n.get("channel_type") or "dm"
                 channel_name = n.get("channel_name") or n.get("channel_id", "")
                 participants = n.get("channel_participants") or []
                 caller = n.get("caller") or "someone"
-                ch_id = n.get("channel_id", "")
                 ch_tag = f" [ch:{ch_id}]" if ch_id else ""
                 if channel_type == "group_dm":
                     preview = summarize_participants(participants)
@@ -804,6 +826,9 @@ class GatewayListener:
                 if msg_id:
                     current_seen.add(msg_id)
                     seen_updates[channel_id].add(msg_id)
+
+        if not parts:
+            return "", seen_updates
 
         if len(parts) == 1:
             # Server mentions with history are multiline; DMs stay on one line
