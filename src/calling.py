@@ -28,6 +28,7 @@ import zlib
 import websocket
 
 from src import api
+from src.voice_receive import VoiceReceiveTranscription
 from src.auth import get_token
 from src.private_channels import private_channel_label_for_type, private_channel_name, private_channel_type
 
@@ -142,12 +143,13 @@ def _udp_discovery(host, port, ssrc):
 
 
 class NoAudioCallJoiner:
-    def __init__(self, channel_id, *, guild_id=None, label=None, self_mute=True, self_deaf=False, ring_recipient_ids=None):
+    def __init__(self, channel_id, *, guild_id=None, label=None, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True):
         self.channel_id = channel_id
         self.guild_id = guild_id
         self.label = label or channel_id
         self.self_mute = self_mute
         self.self_deaf = self_deaf
+        self.transcribe_enabled = bool(transcribe and not self_deaf)
         self.ring_recipient_ids = [str(user_id) for user_id in (ring_recipient_ids or []) if user_id]
         self.token = get_token()
 
@@ -177,6 +179,9 @@ class NoAudioCallJoiner:
         self._notified_leave_ids = set()
         self._participants_seeded = False
         self._control_seq = 0
+        self._voice_transcription = None
+        self._ssrc_cache = []
+        self._pending_voice_session_description = None
 
     def run(self):
         old_int = signal.getsignal(signal.SIGINT)
@@ -186,7 +191,11 @@ class NoAudioCallJoiner:
         try:
             self._connect_app_gateway()
             self._request_voice_state(self.channel_id)
-            print(f"Joining {self.label} {'muted' if self.self_mute else 'unmuted'}/{'deafened' if self.self_deaf else 'undeafened'} (no local audio)…", flush=True)
+            print(
+                f"Joining {self.label} {'muted' if self.self_mute else 'unmuted'}/{'deafened' if self.self_deaf else 'undeafened'} "
+                f"({'transcribing' if self.transcribe_enabled else 'not transcribing'})…",
+                flush=True,
+            )
 
             deadline = time.time() + VOICE_CONNECT_TIMEOUT
             while self.running and not self.voice_ready:
@@ -246,7 +255,14 @@ class NoAudioCallJoiner:
             next_deaf = bool(meta.get("self_deaf"))
             if self.self_deaf != next_deaf:
                 self.self_deaf = next_deaf
+                self.transcribe_enabled = not self.self_deaf and bool(meta.get("transcribe", True))
+                self._set_transcription_enabled(self.transcribe_enabled)
                 changed = True
+        if "transcribe" in meta:
+            next_transcribe = bool(meta.get("transcribe")) and not self.self_deaf
+            if self.transcribe_enabled != next_transcribe:
+                self.transcribe_enabled = next_transcribe
+                self._set_transcription_enabled(self.transcribe_enabled)
         if changed:
             self._request_voice_state(self.channel_id)
             _update_call_meta_env(status="joined" if self.voice_ready else "joining", updated_at=time.time())
@@ -377,6 +393,8 @@ class NoAudioCallJoiner:
                 if user_id not in self._notified_leave_ids:
                     self._notified_leave_ids.add(user_id)
                     self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} left {self.label}")
+                self._remove_transcription_user(user_id)
+            self._active_participant_ids.clear()
             self._participant_audio_states.clear()
             print("Call ended by Discord.", flush=True)
             self.running = False
@@ -467,6 +485,7 @@ class NoAudioCallJoiner:
         if user_id in self._active_participant_ids:
             self._active_participant_ids.discard(user_id)
             self._participant_audio_states.pop(user_id, None)
+            self._remove_transcription_user(user_id)
             if user_id not in self._notified_leave_ids:
                 self._notified_leave_ids.add(user_id)
                 self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} left {self.label}")
@@ -508,6 +527,7 @@ class NoAudioCallJoiner:
             self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} joined {self.label}")
         for user_id in sorted(removed):
             self._participant_audio_states.pop(user_id, None)
+            self._remove_transcription_user(user_id)
             if user_id not in self._notified_leave_ids:
                 self._notified_leave_ids.add(user_id)
                 self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} left {self.label}")
@@ -515,23 +535,40 @@ class NoAudioCallJoiner:
         self._notified_leave_ids.difference_update(current)
 
     def _notify_call_event(self, message):
+        self._notify_exo(message, prefix="Discord Call")
+
+    def _notify_voice_transcript(self, message, prefix="Discord Voice"):
+        self._notify_exo(message, prefix=prefix)
+
+    def _notify_exo(self, message, *, prefix):
         targets = [target for target in os.environ.get(CALL_NOTIFY_TARGETS_ENV, "").split(",") if target]
         if not targets:
             return
         print(message, flush=True)
         for target in targets:
-            threading.Thread(target=self._send_call_notification, args=(target, message), daemon=True).start()
+            threading.Thread(target=self._send_notification, args=(target, prefix, message), daemon=True).start()
 
-    def _send_call_notification(self, target, message):
+    def _send_notification(self, target, prefix, message):
         try:
             subprocess.run(
-                ["exo", "send", f"[Discord Call] {message}", "-c", target, "--timeout", "600", "--no-notify"],
+                ["exo", "send", f"[{prefix}] {message}", "-c", target, "--timeout", "600", "--no-notify"],
                 capture_output=True,
                 text=True,
                 timeout=660,
             )
         except Exception:
             pass
+
+    def _log_voice_transcription(self, message):
+        print(f"[voice-transcribe] {message}", flush=True)
+
+    def _set_transcription_enabled(self, enabled):
+        if self._voice_transcription:
+            self._voice_transcription.set_enabled(enabled)
+
+    def _remove_transcription_user(self, user_id):
+        if self._voice_transcription:
+            self._voice_transcription.remove_user(user_id)
 
     def _ring_recipients(self):
         try:
@@ -587,6 +624,7 @@ class NoAudioCallJoiner:
     # ─── Voice gateway ────────────────────────────────────────────────────────
 
     def _connect_voice_gateway(self):
+        self._ensure_voice_transcription_object()
         endpoint = re.sub(r"^wss?://", "", self.voice_endpoint or "")
         self.voice_ws = websocket.WebSocket()
         self.voice_ws.settimeout(1)
@@ -608,10 +646,16 @@ class NoAudioCallJoiner:
                 raise RuntimeError(f"Discord voice gateway closed ({code or 'unknown'}: {reason or 'unknown reason'})")
             return
         if isinstance(data, bytes):
+            if len(data) >= 3:
+                sequence = int.from_bytes(data[:2], "big")
+                self._voice_sequence = max(self._voice_sequence, sequence)
+                opcode = data[2]
+                if self._voice_transcription and self._voice_transcription.handle_binary_opcode(opcode, data[3:]):
+                    return
             try:
                 data = data.decode("utf-8")
             except UnicodeDecodeError:
-                return  # DAVE binary/control packet; no media is used by this joiner.
+                return
         payload = json.loads(data)
         seq = payload.get("seq")
         if isinstance(seq, int):
@@ -633,11 +677,24 @@ class NoAudioCallJoiner:
         elif op == 2:
             self._handle_voice_ready(payload.get("d") or {})
         elif op == 4:
+            self._handle_voice_session_description(payload.get("d") or {})
             self.voice_ready = True
+        elif op == 5:
+            self._handle_voice_speaking(payload.get("d") or {})
+        elif op == 11:
+            data = payload.get("d") or {}
+            if isinstance(data, dict):
+                user_ids = [str(user_id) for user_id in data.get("user_ids") or [] if user_id]
+                if self._voice_transcription:
+                    self._voice_transcription.dave.add_known_users(user_ids)
+        elif op == 13:
+            data = payload.get("d") or {}
+            if isinstance(data, dict) and data.get("user_id"):
+                self._remove_transcription_user(str(data.get("user_id")))
         elif op == 9:
             raise RuntimeError("Discord voice gateway invalidated the session")
-        # Other opcodes are speaking/client/DAVE lifecycle events. We keep the
-        # connection alive but intentionally do not participate in media.
+        elif self._voice_transcription:
+            self._voice_transcription.handle_json_opcode(op, payload.get("d"))
 
     def _start_voice_heartbeat(self):
         self._voice_heartbeat_acked = True
@@ -660,6 +717,11 @@ class NoAudioCallJoiner:
                 time.sleep(0.5)
 
     def _voice_identify(self):
+        advertised_dave = DAVE_PROTOCOL_VERSION
+        try:
+            advertised_dave = max(advertised_dave, int(VoiceReceiveTranscription.advertised_dave_protocol_version_static()))
+        except Exception:
+            pass
         self._send_voice({
             "op": 0,
             "d": {
@@ -669,7 +731,7 @@ class NoAudioCallJoiner:
                 "session_id": self.session_id,
                 "token": self.voice_token,
                 "video": False,
-                "max_dave_protocol_version": DAVE_PROTOCOL_VERSION,
+                "max_dave_protocol_version": advertised_dave,
             },
         })
 
@@ -682,7 +744,9 @@ class NoAudioCallJoiner:
         modes = [m for m in (data.get("modes") or []) if isinstance(m, str)]
         mode = _select_encryption_mode(modes)
         udp, address, discovered_port = _udp_discovery(ip, int(port), int(ssrc))
+        udp.settimeout(0.5)
         self.voice_udp = udp
+        self._ensure_voice_transcription()
         self._send_voice({
             "op": 1,
             "d": {
@@ -693,6 +757,60 @@ class NoAudioCallJoiner:
                 ],
             },
         })
+
+    def _handle_voice_session_description(self, data):
+        if not isinstance(data, dict):
+            return
+        self._pending_voice_session_description = data
+        self._ensure_voice_transcription()
+
+    def _ensure_voice_transcription_object(self):
+        if self._voice_transcription or not self.my_id:
+            return self._voice_transcription
+        self._voice_transcription = VoiceReceiveTranscription(
+            self_user_id=str(self.my_id),
+            channel_id=str(self.channel_id),
+            label=self.label,
+            send_json=self._send_voice,
+            send_binary=self._send_voice_binary,
+            notify=self._notify_voice_transcript,
+            name_for_user=self._display_name_for_user,
+            log=self._log_voice_transcription,
+        )
+        self._voice_transcription.set_enabled(self.transcribe_enabled)
+        for ssrc, user_id in self._ssrc_cache:
+            self._voice_transcription.add_ssrc_mapping(ssrc, user_id)
+        self._ssrc_cache.clear()
+        return self._voice_transcription
+
+    def _ensure_voice_transcription(self):
+        data = self._pending_voice_session_description
+        if not isinstance(data, dict) or not self.voice_udp:
+            return
+        secret_key = data.get("secret_key")
+        mode = data.get("mode")
+        if not secret_key or not mode:
+            return
+        transcription = self._ensure_voice_transcription_object()
+        if not transcription:
+            return
+        transcription.configure_media(udp=self.voice_udp, mode=str(mode), secret_key=bytes(secret_key))
+        transcription.handle_session_description(data)
+        transcription.set_enabled(self.transcribe_enabled)
+        transcription.start()
+
+    def _handle_voice_speaking(self, data):
+        if not isinstance(data, dict):
+            return
+        user_id = data.get("user_id")
+        ssrc = data.get("ssrc")
+        if user_id is None or ssrc is None:
+            return
+        item = (int(ssrc), str(user_id))
+        if self._voice_transcription:
+            self._voice_transcription.add_ssrc_mapping(*item)
+        else:
+            self._ssrc_cache.append(item)
 
     def _send_voice_heartbeat(self):
         self._send_voice({"op": 3, "d": {"t": int(time.time() * 1000), "seq_ack": self._voice_sequence}})
@@ -705,7 +823,22 @@ class NoAudioCallJoiner:
         except Exception:
             pass
 
+    def _send_voice_binary(self, opcode, payload):
+        if not self.voice_ws:
+            return
+        try:
+            self.voice_ws.send_binary(bytes([int(opcode) & 0xFF]) + bytes(payload))
+        except Exception:
+            pass
+
     def _close(self):
+        if self._voice_transcription:
+            try:
+                self._voice_transcription.stop()
+            except Exception:
+                pass
+            self._voice_transcription = None
+        self._pending_voice_session_description = None
         for ws in (self.voice_ws, self.app_ws):
             if ws:
                 try:
@@ -843,7 +976,7 @@ def _remove_call_meta_env():
         pass
 
 
-def _join_foreground_channel(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, ring_recipient_ids=None):
+def _join_foreground_channel(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True):
     joiner = NoAudioCallJoiner(
         channel_id,
         guild_id=guild_id,
@@ -851,6 +984,7 @@ def _join_foreground_channel(channel_id, guild_id, label, *, self_mute=True, sel
         self_mute=self_mute,
         self_deaf=self_deaf,
         ring_recipient_ids=ring_recipient_ids,
+        transcribe=transcribe,
     )
     try:
         _update_call_meta_env(status="joining", updated_at=time.time())
@@ -868,6 +1002,7 @@ def _join_child(argv):
     p.add_argument("--deafened", action="store_true")
     p.add_argument("--undeafened", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--ring", action="append", default=[], metavar="USER_ID")
+    p.add_argument("--no-transcribe", action="store_true")
     args = p.parse_args(argv)
     return _join_foreground_channel(
         args.channel_id,
@@ -876,6 +1011,7 @@ def _join_child(argv):
         self_mute=not args.unmuted,
         self_deaf=bool(args.deafened and not args.undeafened),
         ring_recipient_ids=args.ring,
+        transcribe=not args.no_transcribe,
     )
 
 
@@ -901,7 +1037,7 @@ def _normalize_notify_targets(targets):
     return result
 
 
-def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, notify_targets=None, ring_recipient_ids=None):
+def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, notify_targets=None, ring_recipient_ids=None, transcribe=True):
     paths = _call_paths(channel_id)
     existing = _read_call_meta(paths["meta"])
     if existing:
@@ -930,6 +1066,8 @@ def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_de
         cmd.append("--unmuted")
     if self_deaf:
         cmd.append("--deafened")
+    if not transcribe:
+        cmd.append("--no-transcribe")
     for user_id in ring_recipient_ids:
         cmd.extend(["--ring", user_id])
 
@@ -952,6 +1090,7 @@ def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_de
         "status": "starting",
         "self_mute": self_mute,
         "self_deaf": self_deaf,
+        "transcribe": bool(transcribe and not self_deaf),
         "control_seq": 0,
         "started_at": time.time(),
         "updated_at": time.time(),
@@ -992,6 +1131,7 @@ def join(argv):
     p.add_argument("--unmuted", action="store_true", help="Join with Discord self-mute off (no audio is still sent)")
     p.add_argument("--deafened", action="store_true", help="Join with Discord self-deaf on")
     p.add_argument("--undeafened", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--no-transcribe", action="store_true", help="Join without receiving/transcribing call audio")
     p.add_argument("--foreground", action="store_true", help="Run in the foreground until Ctrl+C instead of detaching")
     p.add_argument("--detach", "--background", action="store_true", help="Detach and return immediately (default)")
     p.add_argument("--notify-parent", metavar="CONV_ID", action="append", help="Relay call activity to an Exocortex conversation; defaults to EXOCORTEX_PARENT_CONV_ID")
@@ -1002,11 +1142,12 @@ def join(argv):
     self_mute = not args.unmuted
     self_deaf = bool(args.deafened and not args.undeafened)
     notify_targets = [] if args.no_notify else _normalize_notify_targets(args.notify_parent or _configured_notify_targets())
+    transcribe = not args.no_transcribe
     if args.foreground:
         if notify_targets:
             os.environ[CALL_NOTIFY_TARGETS_ENV] = ",".join(notify_targets)
-        return _join_foreground_channel(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf)
-    return _spawn_detached_call(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, notify_targets=notify_targets)
+        return _join_foreground_channel(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, transcribe=transcribe)
+    return _spawn_detached_call(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, notify_targets=notify_targets, transcribe=transcribe)
 
 
 def start(argv):
@@ -1019,6 +1160,7 @@ def start(argv):
     p.add_argument("--unmuted", action="store_true", help="Join with Discord self-mute off (no audio is still sent)")
     p.add_argument("--deafened", action="store_true", help="Join with Discord self-deaf on")
     p.add_argument("--undeafened", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--no-transcribe", action="store_true", help="Join without receiving/transcribing call audio")
     p.add_argument("--foreground", action="store_true", help="Run in the foreground until Ctrl+C instead of detaching")
     p.add_argument("--detach", "--background", action="store_true", help="Detach and return immediately (default)")
     p.add_argument("--notify-parent", metavar="CONV_ID", action="append", help="Relay call activity to an Exocortex conversation; defaults to EXOCORTEX_PARENT_CONV_ID")
@@ -1035,11 +1177,12 @@ def start(argv):
     self_mute = not args.unmuted
     self_deaf = bool(args.deafened and not args.undeafened)
     notify_targets = [] if args.no_notify else _normalize_notify_targets(args.notify_parent or _configured_notify_targets())
+    transcribe = not args.no_transcribe
     if args.foreground:
         if notify_targets:
             os.environ[CALL_NOTIFY_TARGETS_ENV] = ",".join(notify_targets)
-        return _join_foreground_channel(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, ring_recipient_ids=recipient_ids)
-    return _spawn_detached_call(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, notify_targets=notify_targets, ring_recipient_ids=recipient_ids)
+        return _join_foreground_channel(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, ring_recipient_ids=recipient_ids, transcribe=transcribe)
+    return _spawn_detached_call(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, notify_targets=notify_targets, ring_recipient_ids=recipient_ids, transcribe=transcribe)
 
 
 def list_calls(argv):
@@ -1055,7 +1198,8 @@ def list_calls(argv):
         deaf = "deafened" if meta.get("self_deaf", True) else "undeafened"
         notify = meta.get("notify_targets") or []
         notify_text = f"  notify: {', '.join(notify)}" if notify else "  notify: off"
-        print(f"{meta.get('channel_id')}  pid {meta.get('pid')}  {status}  {mute}/{deaf}  {meta.get('label')}")
+        transcribe = "transcribe:on" if meta.get("transcribe", True) and not meta.get("self_deaf", False) else "transcribe:off"
+        print(f"{meta.get('channel_id')}  pid {meta.get('pid')}  {status}  {mute}/{deaf}  {transcribe}  {meta.get('label')}")
         print(f"  log: {meta.get('log')}")
         print(notify_text)
 
@@ -1110,6 +1254,14 @@ def _target_call_metas(args):
     return [m for m in metas if str(m.get("channel_id")) == str(channel_id)]
 
 
+def _bump_control_seq(current):
+    try:
+        current["control_seq"] = int(current.get("control_seq") or 0) + 1
+    except (TypeError, ValueError):
+        current["control_seq"] = 1
+    current["updated_at"] = time.time()
+
+
 def _control_call_voice_state(argv, *, field, label, default_value=None):
     args = _parse_call_voice_state_args(f"discord call {label}", argv, default_value=default_value)
     targets = _target_call_metas(args)
@@ -1124,15 +1276,40 @@ def _control_call_voice_state(argv, *, field, label, default_value=None):
         old_value = bool(current.get(field, True))
         next_value = (not old_value) if args.value is None else bool(args.value)
         current[field] = next_value
-        try:
-            current["control_seq"] = int(current.get("control_seq") or 0) + 1
-        except (TypeError, ValueError):
-            current["control_seq"] = 1
-        current["updated_at"] = time.time()
+        if field == "self_deaf" and next_value:
+            current["transcribe"] = False
+        elif field == "self_deaf" and not next_value:
+            current["transcribe"] = True
+        _bump_control_seq(current)
         _write_call_meta(paths["meta"], current)
         mute = "muted" if current.get("self_mute", True) else "unmuted"
         deaf = "deafened" if current.get("self_deaf", True) else "undeafened"
-        print(f"Set {current.get('label') or channel_id} to {mute}/{deaf} (pid {current.get('pid')}).")
+        transcribe = "transcribe:on" if current.get("transcribe", True) and not current.get("self_deaf", False) else "transcribe:off"
+        print(f"Set {current.get('label') or channel_id} to {mute}/{deaf} {transcribe} (pid {current.get('pid')}).")
+
+
+def _control_call_transcription(argv, *, default_value=None):
+    args = _parse_call_voice_state_args("discord call transcribe", argv, default_value=default_value)
+    targets = _target_call_metas(args)
+    if not targets:
+        print("No matching detached Discord call sessions.")
+        return
+
+    for meta in targets:
+        channel_id = meta.get("channel_id")
+        paths = _call_paths(channel_id)
+        current = _read_call_meta(paths["meta"]) or meta
+        old_value = bool(current.get("transcribe", True)) and not bool(current.get("self_deaf", False))
+        next_value = (not old_value) if args.value is None else bool(args.value)
+        current["transcribe"] = bool(next_value)
+        if next_value:
+            current["self_deaf"] = False
+        _bump_control_seq(current)
+        _write_call_meta(paths["meta"], current)
+        mute = "muted" if current.get("self_mute", True) else "unmuted"
+        deaf = "deafened" if current.get("self_deaf", True) else "undeafened"
+        transcribe = "transcribe:on" if current.get("transcribe", True) and not current.get("self_deaf", False) else "transcribe:off"
+        print(f"Set {current.get('label') or channel_id} to {mute}/{deaf} {transcribe} (pid {current.get('pid')}).")
 
 
 def _terminate_call_meta(meta, *, timeout=5):
@@ -1186,13 +1363,14 @@ def leave(argv):
 def dispatch(cmd, argv):
     if cmd in {"call", "voice"}:
         if not argv or argv[0] in {"-h", "--help", "help"}:
-            print("usage: discord call <start|join|leave|mute|unmute|deafen|undeafen|list> ...")
-            print("  start <dm> [--dm] [--foreground] [--unmuted] [--deafened] [--notify-parent CONV_ID|--no-notify]")
-            print("  join <target> [--dm|-g SERVER] [--foreground] [--unmuted] [--deafened] [--notify-parent CONV_ID|--no-notify]")
+            print("usage: discord call <start|join|leave|mute|unmute|deafen|undeafen|transcribe|list> ...")
+            print("  start <dm> [--dm] [--foreground] [--unmuted] [--deafened] [--no-transcribe] [--notify-parent CONV_ID|--no-notify]")
+            print("  join <target> [--dm|-g SERVER] [--foreground] [--unmuted] [--deafened] [--no-transcribe] [--notify-parent CONV_ID|--no-notify]")
             print("  mute [target] [on|off|toggle] [--all]")
             print("  unmute [target] [--all]")
-            print("  deafen [target] [on|off|toggle] [--all]")
-            print("  undeafen [target] [--all]")
+            print("  deafen [target] [on|off|toggle] [--all]        # also disables transcription")
+            print("  undeafen [target] [--all]                      # also enables transcription")
+            print("  transcribe [target] [on|off|toggle] [--all]")
             print("  leave [target|--all]")
             print("  list")
             return
@@ -1211,6 +1389,10 @@ def dispatch(cmd, argv):
             return _control_call_voice_state(rest, field="self_deaf", label="deafen")
         if subcmd in {"undeafen", "undeaf", "undeafened"}:
             return _control_call_voice_state(rest, field="self_deaf", label="undeafen", default_value=False)
+        if subcmd in {"transcribe", "listen", "listening"}:
+            return _control_call_transcription(rest)
+        if subcmd in {"no-transcribe", "unlisten"}:
+            return _control_call_transcription(rest, default_value=False)
         if subcmd in {"list", "ls", "status"}:
             return list_calls(rest)
         raise SystemExit(f"discord call: unknown subcommand '{subcmd}'")

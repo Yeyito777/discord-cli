@@ -1,1 +1,4 @@
 playwright>=1.52,<2
+PyNaCl>=1.5,<2
+av>=14,<16
+davey>=0.1.5,<0.2
