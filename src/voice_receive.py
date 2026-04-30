@@ -1,9 +1,9 @@
 """Receive Discord voice audio and asynchronously transcribe speaker segments.
 
 This module deliberately does not implement speech-to-text itself.  It receives
-Discord RTP/Opus media, segments decoded PCM by speaker using RMS threshold
-hysteresis, writes finalized WAV files, and delegates ASR to the external
-`transcribe` CLI.
+Discord RTP/Opus media, segments decoded PCM by speaker using the same RMS
+speaking gate as Record's call widget, writes finalized WAV files, and
+delegates ASR to the external `transcribe` CLI.
 """
 
 from __future__ import annotations
@@ -40,9 +40,9 @@ except Exception:  # pragma: no cover - depends on deployment venv
 OPUS_PAYLOAD_TYPE = 120
 RTP_HEADER_LENGTH = 12
 TRANSCRIBE_WORKERS = 2
-DEFAULT_SPEECH_START_THRESHOLD_DB = -42.0
-DEFAULT_SPEECH_STOP_THRESHOLD_DB = -48.0
-DEFAULT_SILENCE_MS = 1_000
+DEFAULT_SPEECH_START_THRESHOLD_DB = -40.0
+DEFAULT_SPEECH_STOP_THRESHOLD_DB = -40.0
+DEFAULT_SILENCE_MS = 450
 DEFAULT_MIN_SPEECH_MS = 450
 DEFAULT_MAX_SEGMENT_MS = 0
 DEFAULT_PRE_ROLL_MS = 250
@@ -404,8 +404,9 @@ class SpeakerSegmenter:
         self.sample_rate = sample_rate
         self.channels = channels
         legacy_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_THRESHOLD_DB", DEFAULT_SPEECH_START_THRESHOLD_DB)
-        self.start_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_START_THRESHOLD_DB", legacy_threshold_db)
-        self.stop_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_STOP_THRESHOLD_DB", DEFAULT_SPEECH_STOP_THRESHOLD_DB)
+        record_threshold_db = env_float("RECORD_VOICE_SPEAKING_THRESHOLD_DB", legacy_threshold_db)
+        self.start_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_START_THRESHOLD_DB", record_threshold_db)
+        self.stop_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_STOP_THRESHOLD_DB", self.start_threshold_db)
         if self.stop_threshold_db > self.start_threshold_db:
             self.stop_threshold_db = self.start_threshold_db
         self.start_threshold = db_to_linear(self.start_threshold_db)
