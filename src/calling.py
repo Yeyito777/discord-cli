@@ -1,9 +1,10 @@
 """Voice call helpers for Discord CLI.
 
 This intentionally joins voice/call sessions without local audio capture or
-playback. It is meant as a lightweight test peer for Record's call flow: keep a
-Discord voice gateway session alive, appear in the call, and leave cleanly when
-interrupted.
+playback yet. It is meant as a lightweight test peer for Record's call flow: keep
+a Discord voice gateway session alive, appear in the call, and leave cleanly when
+interrupted. Detached calls are muted but undeafened by default so receive-side
+features can be layered on; use `discord call deafen` to opt out of listening.
 """
 
 from __future__ import annotations
@@ -141,7 +142,7 @@ def _udp_discovery(host, port, ssrc):
 
 
 class NoAudioCallJoiner:
-    def __init__(self, channel_id, *, guild_id=None, label=None, self_mute=True, self_deaf=True, ring_recipient_ids=None):
+    def __init__(self, channel_id, *, guild_id=None, label=None, self_mute=True, self_deaf=False, ring_recipient_ids=None):
         self.channel_id = channel_id
         self.guild_id = guild_id
         self.label = label or channel_id
@@ -175,6 +176,7 @@ class NoAudioCallJoiner:
         self._participant_audio_states = {}
         self._notified_leave_ids = set()
         self._participants_seeded = False
+        self._control_seq = 0
 
     def run(self):
         old_int = signal.getsignal(signal.SIGINT)
@@ -184,11 +186,12 @@ class NoAudioCallJoiner:
         try:
             self._connect_app_gateway()
             self._request_voice_state(self.channel_id)
-            print(f"Joining {self.label} muted/deafened (no local audio)…", flush=True)
+            print(f"Joining {self.label} {'muted' if self.self_mute else 'unmuted'}/{'deafened' if self.self_deaf else 'undeafened'} (no local audio)…", flush=True)
 
             deadline = time.time() + VOICE_CONNECT_TIMEOUT
             while self.running and not self.voice_ready:
                 self._pump_app_gateway_once()
+                self._poll_control()
                 if self.session_id and self.voice_token and self.voice_endpoint and not self.voice_ws:
                     self._connect_voice_gateway()
                 if self.voice_ws and not self.voice_ready:
@@ -205,6 +208,7 @@ class NoAudioCallJoiner:
 
             while self.running:
                 self._pump_app_gateway_once()
+                self._poll_control()
                 if self.voice_ws:
                     self._pump_voice_gateway_once()
         finally:
@@ -216,6 +220,37 @@ class NoAudioCallJoiner:
 
     def _signal_shutdown(self, signum=None, frame=None):
         self.running = False
+
+    def _poll_control(self):
+        meta_path = os.environ.get(CALL_META_ENV)
+        if not meta_path:
+            return
+        try:
+            meta = json.loads(Path(meta_path).read_text())
+        except Exception:
+            return
+        try:
+            seq = int(meta.get("control_seq") or 0)
+        except (TypeError, ValueError):
+            return
+        if seq <= self._control_seq:
+            return
+        self._control_seq = seq
+        changed = False
+        if "self_mute" in meta:
+            next_mute = bool(meta.get("self_mute"))
+            if self.self_mute != next_mute:
+                self.self_mute = next_mute
+                changed = True
+        if "self_deaf" in meta:
+            next_deaf = bool(meta.get("self_deaf"))
+            if self.self_deaf != next_deaf:
+                self.self_deaf = next_deaf
+                changed = True
+        if changed:
+            self._request_voice_state(self.channel_id)
+            _update_call_meta_env(status="joined" if self.voice_ready else "joining", updated_at=time.time())
+            print(f"Voice state: {'muted' if self.self_mute else 'unmuted'}/{'deafened' if self.self_deaf else 'undeafened'}", flush=True)
 
     # ─── App gateway ──────────────────────────────────────────────────────────
 
@@ -808,7 +843,7 @@ def _remove_call_meta_env():
         pass
 
 
-def _join_foreground_channel(channel_id, guild_id, label, *, self_mute=True, self_deaf=True, ring_recipient_ids=None):
+def _join_foreground_channel(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, ring_recipient_ids=None):
     joiner = NoAudioCallJoiner(
         channel_id,
         guild_id=guild_id,
@@ -830,7 +865,8 @@ def _join_child(argv):
     p.add_argument("guild_id")
     p.add_argument("label")
     p.add_argument("--unmuted", action="store_true")
-    p.add_argument("--undeafened", action="store_true")
+    p.add_argument("--deafened", action="store_true")
+    p.add_argument("--undeafened", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--ring", action="append", default=[], metavar="USER_ID")
     args = p.parse_args(argv)
     return _join_foreground_channel(
@@ -838,7 +874,7 @@ def _join_child(argv):
         args.guild_id or None,
         args.label,
         self_mute=not args.unmuted,
-        self_deaf=not args.undeafened,
+        self_deaf=bool(args.deafened and not args.undeafened),
         ring_recipient_ids=args.ring,
     )
 
@@ -865,7 +901,7 @@ def _normalize_notify_targets(targets):
     return result
 
 
-def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_deaf=True, notify_targets=None, ring_recipient_ids=None):
+def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, notify_targets=None, ring_recipient_ids=None):
     paths = _call_paths(channel_id)
     existing = _read_call_meta(paths["meta"])
     if existing:
@@ -892,8 +928,8 @@ def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_de
     ]
     if not self_mute:
         cmd.append("--unmuted")
-    if not self_deaf:
-        cmd.append("--undeafened")
+    if self_deaf:
+        cmd.append("--deafened")
     for user_id in ring_recipient_ids:
         cmd.extend(["--ring", user_id])
 
@@ -916,6 +952,7 @@ def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_de
         "status": "starting",
         "self_mute": self_mute,
         "self_deaf": self_deaf,
+        "control_seq": 0,
         "started_at": time.time(),
         "updated_at": time.time(),
         "log": str(log_file),
@@ -947,13 +984,14 @@ def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_de
 def join(argv):
     p = argparse.ArgumentParser(
         prog="discord call join",
-        description="Join a DM/group/server voice call without local audio. Detaches by default; use --foreground to block.",
+        description="Join a DM/group/server voice call muted and undeafened by default. Detaches by default; use --foreground to block.",
     )
     p.add_argument("target", help="DM/group name, channel ID, or voice channel name with --guild")
     p.add_argument("-g", "--guild", "--server", dest="guild", help="Server name/ID for a voice channel")
     p.add_argument("--dm", action="store_true", help="Resolve target as a DM/group DM")
     p.add_argument("--unmuted", action="store_true", help="Join with Discord self-mute off (no audio is still sent)")
-    p.add_argument("--undeafened", action="store_true", help="Join with Discord self-deaf off (incoming audio is still ignored)")
+    p.add_argument("--deafened", action="store_true", help="Join with Discord self-deaf on")
+    p.add_argument("--undeafened", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--foreground", action="store_true", help="Run in the foreground until Ctrl+C instead of detaching")
     p.add_argument("--detach", "--background", action="store_true", help="Detach and return immediately (default)")
     p.add_argument("--notify-parent", metavar="CONV_ID", action="append", help="Relay call activity to an Exocortex conversation; defaults to EXOCORTEX_PARENT_CONV_ID")
@@ -962,7 +1000,7 @@ def join(argv):
 
     channel_id, guild_id, label = _resolve_call_target(args)
     self_mute = not args.unmuted
-    self_deaf = not args.undeafened
+    self_deaf = bool(args.deafened and not args.undeafened)
     notify_targets = [] if args.no_notify else _normalize_notify_targets(args.notify_parent or _configured_notify_targets())
     if args.foreground:
         if notify_targets:
@@ -974,12 +1012,13 @@ def join(argv):
 def start(argv):
     p = argparse.ArgumentParser(
         prog="discord call start",
-        description="Start/ring a DM or group DM call without local audio. Detaches by default; use --foreground to block.",
+        description="Start/ring a DM or group DM call muted and undeafened by default. Detaches by default; use --foreground to block.",
     )
     p.add_argument("target", help="DM/group name or channel ID")
     p.add_argument("--dm", action="store_true", help="Resolve target as a DM/group DM")
     p.add_argument("--unmuted", action="store_true", help="Join with Discord self-mute off (no audio is still sent)")
-    p.add_argument("--undeafened", action="store_true", help="Join with Discord self-deaf off (incoming audio is still ignored)")
+    p.add_argument("--deafened", action="store_true", help="Join with Discord self-deaf on")
+    p.add_argument("--undeafened", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--foreground", action="store_true", help="Run in the foreground until Ctrl+C instead of detaching")
     p.add_argument("--detach", "--background", action="store_true", help="Detach and return immediately (default)")
     p.add_argument("--notify-parent", metavar="CONV_ID", action="append", help="Relay call activity to an Exocortex conversation; defaults to EXOCORTEX_PARENT_CONV_ID")
@@ -994,7 +1033,7 @@ def start(argv):
     guild_id = None
     label = private_channel_label_for_type(private_channel_type(channel), private_channel_name(channel))
     self_mute = not args.unmuted
-    self_deaf = not args.undeafened
+    self_deaf = bool(args.deafened and not args.undeafened)
     notify_targets = [] if args.no_notify else _normalize_notify_targets(args.notify_parent or _configured_notify_targets())
     if args.foreground:
         if notify_targets:
@@ -1019,6 +1058,81 @@ def list_calls(argv):
         print(f"{meta.get('channel_id')}  pid {meta.get('pid')}  {status}  {mute}/{deaf}  {meta.get('label')}")
         print(f"  log: {meta.get('log')}")
         print(notify_text)
+
+
+_STATE_WORDS = {
+    "on": True,
+    "true": True,
+    "yes": True,
+    "1": True,
+    "off": False,
+    "false": False,
+    "no": False,
+    "0": False,
+    "toggle": None,
+}
+
+
+def _parse_call_voice_state_args(prog, argv, *, default_value=None):
+    p = argparse.ArgumentParser(prog=prog)
+    p.add_argument("args", nargs="*", help="optional target and on/off/toggle state")
+    p.add_argument("-g", "--guild", "--server", dest="guild", help="Server name/ID for resolving a voice channel target")
+    p.add_argument("--dm", action="store_true", help="Resolve target as a DM/group DM")
+    p.add_argument("--all", action="store_true", help="Apply to all detached calls")
+    parsed = p.parse_args(argv)
+
+    target = None
+    value = default_value
+    for token in parsed.args:
+        lower = token.lower()
+        if lower in _STATE_WORDS and value == default_value:
+            value = _STATE_WORDS[lower]
+        elif target is None:
+            target = token
+        elif lower in _STATE_WORDS:
+            value = _STATE_WORDS[lower]
+        else:
+            p.error(f"unexpected argument: {token}")
+    parsed.target = target
+    parsed.value = value
+    return parsed
+
+
+def _target_call_metas(args):
+    metas = _running_call_metas()
+    if args.all or not args.target:
+        return metas
+    target = str(args.target)
+    direct = [m for m in metas if str(m.get("channel_id")) == target or str(m.get("label") or "") == target]
+    if direct:
+        return direct
+    channel_id, _guild_id, _label = _resolve_call_target(args)
+    return [m for m in metas if str(m.get("channel_id")) == str(channel_id)]
+
+
+def _control_call_voice_state(argv, *, field, label, default_value=None):
+    args = _parse_call_voice_state_args(f"discord call {label}", argv, default_value=default_value)
+    targets = _target_call_metas(args)
+    if not targets:
+        print("No matching detached Discord call sessions.")
+        return
+
+    for meta in targets:
+        channel_id = meta.get("channel_id")
+        paths = _call_paths(channel_id)
+        current = _read_call_meta(paths["meta"]) or meta
+        old_value = bool(current.get(field, True))
+        next_value = (not old_value) if args.value is None else bool(args.value)
+        current[field] = next_value
+        try:
+            current["control_seq"] = int(current.get("control_seq") or 0) + 1
+        except (TypeError, ValueError):
+            current["control_seq"] = 1
+        current["updated_at"] = time.time()
+        _write_call_meta(paths["meta"], current)
+        mute = "muted" if current.get("self_mute", True) else "unmuted"
+        deaf = "deafened" if current.get("self_deaf", True) else "undeafened"
+        print(f"Set {current.get('label') or channel_id} to {mute}/{deaf} (pid {current.get('pid')}).")
 
 
 def _terminate_call_meta(meta, *, timeout=5):
@@ -1072,9 +1186,13 @@ def leave(argv):
 def dispatch(cmd, argv):
     if cmd in {"call", "voice"}:
         if not argv or argv[0] in {"-h", "--help", "help"}:
-            print("usage: discord call <start|join|leave|list> ...")
-            print("  start <dm> [--dm] [--foreground] [--unmuted] [--undeafened] [--notify-parent CONV_ID|--no-notify]")
-            print("  join <target> [--dm|-g SERVER] [--foreground] [--unmuted] [--undeafened] [--notify-parent CONV_ID|--no-notify]")
+            print("usage: discord call <start|join|leave|mute|unmute|deafen|undeafen|list> ...")
+            print("  start <dm> [--dm] [--foreground] [--unmuted] [--deafened] [--notify-parent CONV_ID|--no-notify]")
+            print("  join <target> [--dm|-g SERVER] [--foreground] [--unmuted] [--deafened] [--notify-parent CONV_ID|--no-notify]")
+            print("  mute [target] [on|off|toggle] [--all]")
+            print("  unmute [target] [--all]")
+            print("  deafen [target] [on|off|toggle] [--all]")
+            print("  undeafen [target] [--all]")
             print("  leave [target|--all]")
             print("  list")
             return
@@ -1085,6 +1203,14 @@ def dispatch(cmd, argv):
             return start(rest)
         if subcmd in {"leave", "stop", "hangup"}:
             return leave(rest)
+        if subcmd in {"mute", "muted"}:
+            return _control_call_voice_state(rest, field="self_mute", label="mute")
+        if subcmd in {"unmute", "unmuted"}:
+            return _control_call_voice_state(rest, field="self_mute", label="unmute", default_value=False)
+        if subcmd in {"deafen", "deaf", "deafened"}:
+            return _control_call_voice_state(rest, field="self_deaf", label="deafen")
+        if subcmd in {"undeafen", "undeaf", "undeafened"}:
+            return _control_call_voice_state(rest, field="self_deaf", label="undeafen", default_value=False)
         if subcmd in {"list", "ls", "status"}:
             return list_calls(rest)
         raise SystemExit(f"discord call: unknown subcommand '{subcmd}'")

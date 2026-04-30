@@ -31,7 +31,7 @@ commands:
   delete       Delete a message                       (alias: del)
   react        React to a message
   unreact      Remove a reaction
-  call         Start/join Discord calls without local audio (start/join detach by default; leave, list)
+  call         Start/join/manage Discord calls (start/join detach by default; mute/deafen/leave/list)
   listen       Start real-time channel listener
   unlisten     Stop a channel listener
   listeners    List active listeners
