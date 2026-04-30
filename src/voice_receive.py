@@ -585,6 +585,7 @@ class VoiceReceiveTranscription:
         self.ssrc_to_user_id = {}
         self.segmenters = {}
         self.decoders = {}
+        self.resamplers = {}
         self.packet_count = 0
         self.decrypt_count = 0
         self.decode_frame_count = 0
@@ -740,23 +741,35 @@ class VoiceReceiveTranscription:
             return
         for frame in frames:
             self.decode_frame_count += 1
-            pcm, sample_rate, channels = self._frame_to_pcm16_mono_16k(frame)
-            if not pcm:
-                continue
-            duration = len(pcm) / (sample_rate * channels * 2)
-            segmenter = self.segmenters.get(user_id)
-            if segmenter is None:
-                segmenter = SpeakerSegmenter(user_id, self.name_for_user, self.transcriber.submit, sample_rate=sample_rate, channels=channels)
-                self.segmenters[user_id] = segmenter
-            segmenter.add_pcm(pcm, duration)
+            for pcm, sample_rate, channels in self._frame_to_pcm16_mono_16k(user_id, frame):
+                if not pcm:
+                    continue
+                duration = len(pcm) / (sample_rate * channels * 2)
+                segmenter = self.segmenters.get(user_id)
+                if segmenter is None:
+                    segmenter = SpeakerSegmenter(user_id, self.name_for_user, self.transcriber.submit, sample_rate=sample_rate, channels=channels)
+                    self.segmenters[user_id] = segmenter
+                segmenter.add_pcm(pcm, duration)
 
-    def _frame_to_pcm16_mono_16k(self, frame):
+    def _frame_to_pcm16_mono_16k(self, user_id: str, frame):
+        resampler = self.resamplers.get(user_id)
+        if resampler is None:
+            resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=16000)
+            self.resamplers[user_id] = resampler
         try:
-            frame = frame.reformat(format="s16", layout="mono", rate=16000)
-        except Exception:
-            pass
-        pcm = bytes(frame.planes[0])
-        return pcm, int(frame.sample_rate or 16000), 1
+            frames = resampler.resample(frame)
+        except Exception as exc:
+            self.log(f"Audio resample failed for {self.name_for_user(user_id)}: {exc}")
+            frames = [frame]
+        result = []
+        for out in frames:
+            sample_rate = int(getattr(out, "sample_rate", None) or getattr(out, "rate", None) or 16000)
+            channels = 1
+            valid_bytes = int(out.samples or 0) * channels * 2
+            plane = bytes(out.planes[0])
+            pcm = plane[:valid_bytes] if valid_bytes > 0 else plane
+            result.append((pcm, sample_rate, channels))
+        return result
 
 
 SOCKET_TIMEOUT_EXCEPTIONS = (socket.timeout, TimeoutError)
