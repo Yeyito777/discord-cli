@@ -154,13 +154,15 @@ def _udp_discovery(host, port, ssrc):
 
 
 class NoAudioCallJoiner:
-    def __init__(self, channel_id, *, guild_id=None, label=None, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True):
+    def __init__(self, channel_id, *, guild_id=None, label=None, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True, save_audio=False, audio_dir=None):
         self.channel_id = channel_id
         self.guild_id = guild_id
         self.label = label or channel_id
         self.self_mute = self_mute
         self.self_deaf = self_deaf
         self.transcribe_enabled = bool(transcribe and not self_deaf)
+        self.save_audio = bool(save_audio)
+        self.audio_dir = str(audio_dir) if audio_dir else None
         self.ring_recipient_ids = [str(user_id) for user_id in (ring_recipient_ids or []) if user_id]
         self.token = get_token()
 
@@ -204,7 +206,8 @@ class NoAudioCallJoiner:
             self._request_voice_state(self.channel_id)
             print(
                 f"Joining {self.label} {'muted' if self.self_mute else 'unmuted'}/{'deafened' if self.self_deaf else 'undeafened'} "
-                f"({'transcribing' if self.transcribe_enabled else 'not transcribing'})…",
+                f"({'transcribing' if self.transcribe_enabled else 'not transcribing'}"
+                f"{', saving audio' if self.save_audio else ''})…",
                 flush=True,
             )
 
@@ -799,6 +802,8 @@ class NoAudioCallJoiner:
             notify=self._notify_voice_transcript,
             name_for_user=self._display_name_for_user,
             log=self._log_voice_transcription,
+            keep_audio=self.save_audio,
+            audio_dir=self.audio_dir,
         )
         self._voice_transcription.set_enabled(self.transcribe_enabled)
         for ssrc, user_id in self._ssrc_cache:
@@ -941,6 +946,7 @@ def _call_paths(channel_id):
     return {
         "meta": CALL_STATE_DIR / f"{safe}.json",
         "log": CALL_LOG_DIR / f"{safe}.log",
+        "segments": CALL_LOG_DIR / f"{safe}.segments",
     }
 
 
@@ -999,7 +1005,7 @@ def _remove_call_meta_env():
         pass
 
 
-def _join_foreground_channel(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True):
+def _join_foreground_channel(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True, save_audio=False, audio_dir=None):
     joiner = NoAudioCallJoiner(
         channel_id,
         guild_id=guild_id,
@@ -1008,6 +1014,8 @@ def _join_foreground_channel(channel_id, guild_id, label, *, self_mute=True, sel
         self_deaf=self_deaf,
         ring_recipient_ids=ring_recipient_ids,
         transcribe=transcribe,
+        save_audio=save_audio,
+        audio_dir=audio_dir,
     )
     try:
         _update_call_meta_env(status="joining", updated_at=time.time())
@@ -1026,6 +1034,8 @@ def _join_child(argv):
     p.add_argument("--undeafened", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--ring", action="append", default=[], metavar="USER_ID")
     p.add_argument("--no-transcribe", action="store_true")
+    p.add_argument("--save-audio", "--keep-audio", action="store_true")
+    p.add_argument("--audio-dir")
     args = p.parse_args(argv)
     return _join_foreground_channel(
         args.channel_id,
@@ -1035,6 +1045,8 @@ def _join_child(argv):
         self_deaf=bool(args.deafened and not args.undeafened),
         ring_recipient_ids=args.ring,
         transcribe=not args.no_transcribe,
+        save_audio=args.save_audio,
+        audio_dir=args.audio_dir,
     )
 
 
@@ -1060,7 +1072,7 @@ def _normalize_notify_targets(targets):
     return result
 
 
-def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, notify_targets=None, ring_recipient_ids=None, transcribe=True):
+def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, notify_targets=None, ring_recipient_ids=None, transcribe=True, save_audio=False):
     paths = _call_paths(channel_id)
     existing = _read_call_meta(paths["meta"])
     if existing:
@@ -1076,6 +1088,10 @@ def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_de
     env["PYTHONPATH"] = str(PROJECT_DIR) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env[CALL_META_ENV] = str(paths["meta"])
     env[CALL_NOTIFY_TARGETS_ENV] = ",".join(notify_targets)
+    if save_audio:
+        paths["segments"].mkdir(parents=True, exist_ok=True)
+        env["DISCORD_CALL_TRANSCRIBE_KEEP_AUDIO"] = "1"
+        env["DISCORD_CALL_TRANSCRIBE_AUDIO_DIR"] = str(paths["segments"])
 
     cmd = [
         sys.executable,
@@ -1091,6 +1107,8 @@ def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_de
         cmd.append("--deafened")
     if not transcribe:
         cmd.append("--no-transcribe")
+    if save_audio:
+        cmd.extend(["--save-audio", "--audio-dir", str(paths["segments"])])
     for user_id in ring_recipient_ids:
         cmd.extend(["--ring", user_id])
 
@@ -1114,6 +1132,8 @@ def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_de
         "self_mute": self_mute,
         "self_deaf": self_deaf,
         "transcribe": bool(transcribe and not self_deaf),
+        "save_audio": bool(save_audio),
+        "segments_dir": str(paths["segments"]) if save_audio else None,
         "control_seq": 0,
         "started_at": time.time(),
         "updated_at": time.time(),
@@ -1155,6 +1175,7 @@ def join(argv):
     p.add_argument("--deafened", action="store_true", help="Join with Discord self-deaf on")
     p.add_argument("--undeafened", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--no-transcribe", action="store_true", help="Join without receiving/transcribing call audio")
+    p.add_argument("--save-audio", "--keep-audio", action="store_true", help="Keep per-segment WAV files for transcription diagnostics")
     p.add_argument("--foreground", action="store_true", help="Run in the foreground until Ctrl+C instead of detaching")
     p.add_argument("--detach", "--background", action="store_true", help="Detach and return immediately (default)")
     p.add_argument("--notify-parent", metavar="CONV_ID", action="append", help="Relay call activity to an Exocortex conversation; defaults to EXOCORTEX_PARENT_CONV_ID")
@@ -1169,8 +1190,9 @@ def join(argv):
     if args.foreground:
         if notify_targets:
             os.environ[CALL_NOTIFY_TARGETS_ENV] = ",".join(notify_targets)
-        return _join_foreground_channel(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, transcribe=transcribe)
-    return _spawn_detached_call(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, notify_targets=notify_targets, transcribe=transcribe)
+        audio_dir = str(_call_paths(channel_id)["segments"]) if args.save_audio else None
+        return _join_foreground_channel(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, transcribe=transcribe, save_audio=args.save_audio, audio_dir=audio_dir)
+    return _spawn_detached_call(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, notify_targets=notify_targets, transcribe=transcribe, save_audio=args.save_audio)
 
 
 def start(argv):
@@ -1184,6 +1206,7 @@ def start(argv):
     p.add_argument("--deafened", action="store_true", help="Join with Discord self-deaf on")
     p.add_argument("--undeafened", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--no-transcribe", action="store_true", help="Join without receiving/transcribing call audio")
+    p.add_argument("--save-audio", "--keep-audio", action="store_true", help="Keep per-segment WAV files for transcription diagnostics")
     p.add_argument("--foreground", action="store_true", help="Run in the foreground until Ctrl+C instead of detaching")
     p.add_argument("--detach", "--background", action="store_true", help="Detach and return immediately (default)")
     p.add_argument("--notify-parent", metavar="CONV_ID", action="append", help="Relay call activity to an Exocortex conversation; defaults to EXOCORTEX_PARENT_CONV_ID")
@@ -1204,8 +1227,9 @@ def start(argv):
     if args.foreground:
         if notify_targets:
             os.environ[CALL_NOTIFY_TARGETS_ENV] = ",".join(notify_targets)
-        return _join_foreground_channel(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, ring_recipient_ids=recipient_ids, transcribe=transcribe)
-    return _spawn_detached_call(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, notify_targets=notify_targets, ring_recipient_ids=recipient_ids, transcribe=transcribe)
+        audio_dir = str(_call_paths(channel_id)["segments"]) if args.save_audio else None
+        return _join_foreground_channel(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, ring_recipient_ids=recipient_ids, transcribe=transcribe, save_audio=args.save_audio, audio_dir=audio_dir)
+    return _spawn_detached_call(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, notify_targets=notify_targets, ring_recipient_ids=recipient_ids, transcribe=transcribe, save_audio=args.save_audio)
 
 
 def list_calls(argv):
@@ -1222,9 +1246,55 @@ def list_calls(argv):
         notify = meta.get("notify_targets") or []
         notify_text = f"  notify: {', '.join(notify)}" if notify else "  notify: off"
         transcribe = "transcribe:on" if meta.get("transcribe", True) and not meta.get("self_deaf", False) else "transcribe:off"
-        print(f"{meta.get('channel_id')}  pid {meta.get('pid')}  {status}  {mute}/{deaf}  {transcribe}  {meta.get('label')}")
+        save_audio = "save-audio:on" if meta.get("save_audio") else "save-audio:off"
+        print(f"{meta.get('channel_id')}  pid {meta.get('pid')}  {status}  {mute}/{deaf}  {transcribe}  {save_audio}  {meta.get('label')}")
         print(f"  log: {meta.get('log')}")
+        if meta.get("segments_dir"):
+            print(f"  segments: {meta.get('segments_dir')}")
         print(notify_text)
+
+
+def list_segments(argv):
+    p = argparse.ArgumentParser(prog="discord call segments", description="List saved call transcription WAV segments.")
+    p.add_argument("target", nargs="?", help="Call channel ID/label; defaults to active call when unambiguous")
+    p.add_argument("-n", "--limit", type=int, default=20)
+    args = p.parse_args(argv)
+
+    metas = _target_call_metas(argparse.Namespace(target=args.target, all=False))
+    dirs = []
+    if metas:
+        for meta in metas:
+            if meta.get("segments_dir"):
+                dirs.append(Path(meta["segments_dir"]))
+            elif meta.get("channel_id"):
+                dirs.append(_call_paths(meta["channel_id"])["segments"])
+    elif args.target:
+        dirs.append(_call_paths(args.target)["segments"])
+    else:
+        dirs = sorted(CALL_LOG_DIR.glob("*.segments"))
+
+    files = []
+    for directory in dirs:
+        if directory.exists():
+            files.extend(directory.glob("*.wav"))
+    files = sorted(set(files), key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
+    if args.limit > 0:
+        files = files[:args.limit]
+    if not files:
+        print("No saved call transcription audio segments.")
+        return
+    for path in files:
+        sidecar = path.with_suffix(".json")
+        transcript = ""
+        if sidecar.exists():
+            try:
+                data = json.loads(sidecar.read_text(errors="replace"))
+                transcript = str(data.get("transcript") or "").replace("\n", " ")
+            except Exception:
+                pass
+        print(path)
+        if transcript:
+            print(f"  transcript: {transcript}")
 
 
 _STATE_WORDS = {
@@ -1386,14 +1456,15 @@ def leave(argv):
 def dispatch(cmd, argv):
     if cmd in {"call", "voice"}:
         if not argv or argv[0] in {"-h", "--help", "help"}:
-            print("usage: discord call <start|join|leave|mute|unmute|deafen|undeafen|transcribe|list> ...")
-            print("  start <dm> [--dm] [--foreground] [--unmuted] [--deafened] [--no-transcribe] [--notify-parent CONV_ID|--no-notify]")
-            print("  join <target> [--dm|-g SERVER] [--foreground] [--unmuted] [--deafened] [--no-transcribe] [--notify-parent CONV_ID|--no-notify]")
+            print("usage: discord call <start|join|leave|mute|unmute|deafen|undeafen|transcribe|segments|list> ...")
+            print("  start <dm> [--dm] [--foreground] [--unmuted] [--deafened] [--no-transcribe] [--save-audio] [--notify-parent CONV_ID|--no-notify]")
+            print("  join <target> [--dm|-g SERVER] [--foreground] [--unmuted] [--deafened] [--no-transcribe] [--save-audio] [--notify-parent CONV_ID|--no-notify]")
             print("  mute [target] [on|off|toggle] [--all]")
             print("  unmute [target] [--all]")
             print("  deafen [target] [on|off|toggle] [--all]        # also disables transcription")
             print("  undeafen [target] [--all]                      # also enables transcription")
             print("  transcribe [target] [on|off|toggle] [--all]")
+            print("  segments [target] [-n LIMIT]")
             print("  leave [target|--all]")
             print("  list")
             return
@@ -1416,6 +1487,8 @@ def dispatch(cmd, argv):
             return _control_call_transcription(rest)
         if subcmd in {"no-transcribe", "unlisten"}:
             return _control_call_transcription(rest, default_value=False)
+        if subcmd in {"segments", "clips", "audio", "recordings"}:
+            return list_segments(rest)
         if subcmd in {"list", "ls", "status"}:
             return list_calls(rest)
         raise SystemExit(f"discord call: unknown subcommand '{subcmd}'")

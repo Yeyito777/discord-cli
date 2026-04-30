@@ -492,15 +492,22 @@ class SpeakerSegmenter:
 
 
 class VoiceTranscriber:
-    def __init__(self, *, label: str, notify, log=print):
+    def __init__(self, *, label: str, notify, log=print, keep_audio: bool | None = None, audio_dir: str | os.PathLike | None = None):
         self.label = label
         self.notify = notify
         self.log = log
         self.enabled = True
         self.queue = queue.Queue(maxsize=env_int("DISCORD_CALL_TRANSCRIBE_QUEUE", DEFAULT_MAX_QUEUE))
         self.running = True
-        self.keep_audio = os.environ.get("DISCORD_CALL_TRANSCRIBE_KEEP_AUDIO") == "1"
-        self.tmpdir = Path(tempfile.mkdtemp(prefix="discord-call-transcribe-"))
+        self.keep_audio = (os.environ.get("DISCORD_CALL_TRANSCRIBE_KEEP_AUDIO") == "1") if keep_audio is None else bool(keep_audio)
+        configured_audio_dir = audio_dir or os.environ.get("DISCORD_CALL_TRANSCRIBE_AUDIO_DIR")
+        if configured_audio_dir:
+            self.tmpdir = Path(configured_audio_dir).expanduser()
+            self.tmpdir.mkdir(parents=True, exist_ok=True)
+        else:
+            self.tmpdir = Path(tempfile.mkdtemp(prefix="discord-call-transcribe-"))
+        if self.keep_audio:
+            self.log(f"keeping transcription audio segments in {self.tmpdir}")
         self.workers = []
         for index in range(TRANSCRIBE_WORKERS):
             thread = threading.Thread(target=self._worker, name=f"discord-transcribe-{index}", daemon=True)
@@ -578,6 +585,8 @@ class VoiceTranscriber:
             wf.setsampwidth(2)
             wf.setframerate(int(item["sample_rate"]))
             wf.writeframes(item["pcm"])
+        if self.keep_audio:
+            self.log(f"saved transcription audio segment for {name}: {wav_path}")
         transcribe_started_at = time.time()
         try:
             proc = subprocess.run(
@@ -597,6 +606,8 @@ class VoiceTranscriber:
                 self.log(f"transcribe empty for {name}; {self._format_timing(timing)}")
                 return
             self.log(f"transcribe ready for {name}; {self._format_timing(timing)}")
+            if self.keep_audio:
+                self._write_sidecar(wav_path, item, text, timing)
             self.notify(f"🎙 {name}: {text}", prefix="Discord Voice", timing=timing)
         except subprocess.TimeoutExpired:
             timed_out_at = time.time()
@@ -612,6 +623,24 @@ class VoiceTranscriber:
                     wav_path.unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    def _write_sidecar(self, wav_path: Path, item: dict, text: str, timing: dict):
+        sidecar = wav_path.with_suffix(".json")
+        try:
+            import json
+            payload = {
+                "wav": str(wav_path),
+                "user_id": item.get("user_id"),
+                "name": item.get("name"),
+                "sample_rate": item.get("sample_rate"),
+                "channels": item.get("channels"),
+                "stats": item.get("stats") or {},
+                "timing": timing,
+                "transcript": text,
+            }
+            sidecar.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception as exc:
+            self.log(f"failed to write transcription audio sidecar for {wav_path}: {exc}")
 
     def _build_timing(self, stats: dict, worker_started_at: float, transcribe_started_at: float, transcript_ready_at: float):
         speech_started_at = stats.get("speech_started_at")
@@ -659,7 +688,7 @@ class VoiceReceiveTranscription:
     def advertised_dave_protocol_version_static():
         return getattr(davey, "DAVE_PROTOCOL_VERSION", 1) if davey is not None else 0
 
-    def __init__(self, *, udp=None, mode: str | None = None, secret_key=None, self_user_id: str, channel_id: str, label: str, send_json, send_binary, notify, name_for_user, log=print):
+    def __init__(self, *, udp=None, mode: str | None = None, secret_key=None, self_user_id: str, channel_id: str, label: str, send_json, send_binary, notify, name_for_user, log=print, keep_audio: bool | None = None, audio_dir: str | os.PathLike | None = None):
         self.udp = udp
         self.mode = mode
         self.secret_key = bytes(secret_key or b"")
@@ -683,7 +712,7 @@ class VoiceReceiveTranscription:
         self.decode_error_count = 0
         self.last_decode_error_log_at = 0.0
         self.last_stats_at = time.time()
-        self.transcriber = VoiceTranscriber(label=label, notify=notify, log=log)
+        self.transcriber = VoiceTranscriber(label=label, notify=notify, log=log, keep_audio=keep_audio, audio_dir=audio_dir)
         self.dave = DavePassthroughDecryptor(
             user_id=self.self_user_id,
             channel_id=self.channel_id,
