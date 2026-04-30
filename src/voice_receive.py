@@ -1,8 +1,8 @@
 """Receive Discord voice audio and asynchronously transcribe speaker segments.
 
 This module deliberately does not implement speech-to-text itself.  It receives
-Discord RTP/Opus media, segments decoded PCM by speaker using a simple RMS
-threshold, writes finalized WAV files, and delegates ASR to the external
+Discord RTP/Opus media, segments decoded PCM by speaker using RMS threshold
+hysteresis, writes finalized WAV files, and delegates ASR to the external
 `transcribe` CLI.
 """
 
@@ -40,10 +40,11 @@ except Exception:  # pragma: no cover - depends on deployment venv
 OPUS_PAYLOAD_TYPE = 120
 RTP_HEADER_LENGTH = 12
 TRANSCRIBE_WORKERS = 2
-DEFAULT_SPEECH_THRESHOLD_DB = -42.0
-DEFAULT_SILENCE_MS = 900
+DEFAULT_SPEECH_START_THRESHOLD_DB = -42.0
+DEFAULT_SPEECH_STOP_THRESHOLD_DB = -48.0
+DEFAULT_SILENCE_MS = 1_000
 DEFAULT_MIN_SPEECH_MS = 450
-DEFAULT_MAX_SEGMENT_MS = 18_000
+DEFAULT_MAX_SEGMENT_MS = 0
 DEFAULT_PRE_ROLL_MS = 250
 DEFAULT_MAX_QUEUE = 24
 
@@ -402,10 +403,16 @@ class SpeakerSegmenter:
         self.submit_segment = submit_segment
         self.sample_rate = sample_rate
         self.channels = channels
-        self.threshold = db_to_linear(env_float("DISCORD_CALL_TRANSCRIBE_THRESHOLD_DB", DEFAULT_SPEECH_THRESHOLD_DB))
+        legacy_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_THRESHOLD_DB", DEFAULT_SPEECH_START_THRESHOLD_DB)
+        self.start_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_START_THRESHOLD_DB", legacy_threshold_db)
+        self.stop_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_STOP_THRESHOLD_DB", DEFAULT_SPEECH_STOP_THRESHOLD_DB)
+        if self.stop_threshold_db > self.start_threshold_db:
+            self.stop_threshold_db = self.start_threshold_db
+        self.start_threshold = db_to_linear(self.start_threshold_db)
+        self.stop_threshold = db_to_linear(self.stop_threshold_db)
         self.silence_seconds = env_int("DISCORD_CALL_TRANSCRIBE_SILENCE_MS", DEFAULT_SILENCE_MS) / 1000.0
         self.min_speech_seconds = env_int("DISCORD_CALL_TRANSCRIBE_MIN_SPEECH_MS", DEFAULT_MIN_SPEECH_MS) / 1000.0
-        self.max_segment_seconds = env_int("DISCORD_CALL_TRANSCRIBE_MAX_SEGMENT_MS", DEFAULT_MAX_SEGMENT_MS) / 1000.0
+        self.max_segment_seconds = max(0, env_int("DISCORD_CALL_TRANSCRIBE_MAX_SEGMENT_MS", DEFAULT_MAX_SEGMENT_MS)) / 1000.0
         pre_roll_frames = max(0, int((env_int("DISCORD_CALL_TRANSCRIBE_PRE_ROLL_MS", DEFAULT_PRE_ROLL_MS) / 1000.0) * sample_rate))
         self.pre_roll = deque(maxlen=pre_roll_frames * channels * 2)
         self.active = False
@@ -423,7 +430,7 @@ class SpeakerSegmenter:
         rms = pcm16_rms(pcm)
         if rms > self.max_rms:
             self.max_rms = rms
-        speaking = rms >= self.threshold
+        speaking = rms >= (self.stop_threshold if self.active else self.start_threshold)
         if speaking:
             if not self.active:
                 self.active = True
@@ -442,10 +449,9 @@ class SpeakerSegmenter:
         if self.active:
             self.frames.extend(pcm)
             current_len_seconds = len(self.frames) / (self.sample_rate * self.channels * 2)
-            if (
-                (self.silence_seconds_seen >= self.silence_seconds and self.speech_seconds >= self.min_speech_seconds)
-                or current_len_seconds >= self.max_segment_seconds
-            ):
+            if self.silence_seconds_seen >= self.silence_seconds and self.speech_seconds >= self.min_speech_seconds:
+                self.finalize()
+            elif self.max_segment_seconds > 0 and current_len_seconds >= self.max_segment_seconds:
                 self.finalize()
         else:
             self.pre_roll.extend(pcm)
