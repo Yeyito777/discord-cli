@@ -72,6 +72,22 @@ def db_to_linear(db: float) -> float:
     return 10 ** (db / 20.0)
 
 
+def format_ms(seconds: float | None) -> str:
+    if not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
+        return "n/a"
+    return f"{seconds * 1000:.0f}ms"
+
+
+def elapsed_since(start: float | None, end: float | None = None) -> float | None:
+    if not isinstance(start, (int, float)) or start <= 0:
+        return None
+    if end is None:
+        end = time.time()
+    if not isinstance(end, (int, float)) or end <= 0:
+        return None
+    return max(0.0, end - start)
+
+
 def pcm16_rms(samples: bytes) -> float:
     if len(samples) < 2:
         return 0.0
@@ -397,11 +413,13 @@ class SpeakerSegmenter:
         self.speech_seconds = 0.0
         self.silence_seconds_seen = 0.0
         self.segment_started_at = 0.0
+        self.last_speech_at = 0.0
         self.max_rms = 0.0
         self.last_audio_at = time.time()
 
     def add_pcm(self, pcm: bytes, duration: float):
-        self.last_audio_at = time.time()
+        now = time.time()
+        self.last_audio_at = now
         rms = pcm16_rms(pcm)
         if rms > self.max_rms:
             self.max_rms = rms
@@ -412,8 +430,10 @@ class SpeakerSegmenter:
                 self.frames = bytearray(self.pre_roll)
                 self.speech_seconds = 0.0
                 self.silence_seconds_seen = 0.0
-                self.segment_started_at = time.time()
+                self.segment_started_at = now
+                self.last_speech_at = now
                 self.max_rms = rms
+            self.last_speech_at = now
             self.speech_seconds += duration
             self.silence_seconds_seen = 0.0
         elif self.active:
@@ -437,14 +457,19 @@ class SpeakerSegmenter:
     def finalize(self):
         if not self.active:
             return
+        finalized_at = time.time()
         frames = bytes(self.frames)
         speech_seconds = self.speech_seconds
         max_rms = self.max_rms
+        speech_started_at = self.segment_started_at
+        speech_ended_at = self.last_speech_at or finalized_at
         duration_seconds = len(frames) / (self.sample_rate * self.channels * 2) if frames else 0.0
         self.active = False
         self.frames = bytearray()
         self.speech_seconds = 0.0
         self.silence_seconds_seen = 0.0
+        self.segment_started_at = 0.0
+        self.last_speech_at = 0.0
         self.max_rms = 0.0
         self.pre_roll.clear()
         if speech_seconds < self.min_speech_seconds:
@@ -452,6 +477,9 @@ class SpeakerSegmenter:
         self.submit_segment(self.user_id, self.name_for_user(self.user_id), frames, self.sample_rate, self.channels, {
             "duration_seconds": duration_seconds,
             "speech_seconds": speech_seconds,
+            "speech_started_at": speech_started_at,
+            "speech_ended_at": speech_ended_at,
+            "finalized_at": finalized_at,
             "max_db": 20 * math.log10(max_rms) if max_rms > 0 else -math.inf,
         })
 
@@ -479,13 +507,18 @@ class VoiceTranscriber:
         if not self.enabled or not pcm:
             return
         stats = stats or {}
+        queued_at = time.time()
+        stats["queued_at"] = queued_at
         max_db = stats.get("max_db")
         duration = stats.get("duration_seconds")
+        queue_wait = elapsed_since(stats.get("finalized_at"), queued_at)
+        speech_to_queue = elapsed_since(stats.get("speech_started_at"), queued_at)
         self.log(
             f"queue transcription for {name or user_id}: "
-            f"duration={duration:.2f}s max_db={max_db:.1f}"
+            f"duration={duration:.2f}s max_db={max_db:.1f} "
+            f"speech_to_queue={format_ms(speech_to_queue)} finalize_to_queue={format_ms(queue_wait)}"
             if isinstance(duration, (int, float)) and isinstance(max_db, (int, float)) and math.isfinite(max_db)
-            else f"queue transcription for {name or user_id}"
+            else f"queue transcription for {name or user_id}: speech_to_queue={format_ms(speech_to_queue)}"
         )
         try:
             self.queue.put_nowait({
@@ -495,7 +528,7 @@ class VoiceTranscriber:
                 "sample_rate": sample_rate,
                 "channels": channels,
                 "stats": stats,
-                "created_at": time.time(),
+                "created_at": queued_at,
             })
         except queue.Full:
             self.log("Transcription queue full; dropping voice segment")
@@ -530,12 +563,15 @@ class VoiceTranscriber:
 
     def _transcribe_item(self, item: dict):
         name = item["name"]
+        stats = dict(item.get("stats") or {})
+        worker_started_at = time.time()
         wav_path = self.tmpdir / f"segment-{int(time.time() * 1000)}-{os.getpid()}-{threading.get_ident()}.wav"
         with wave.open(str(wav_path), "wb") as wf:
             wf.setnchannels(int(item["channels"]))
             wf.setsampwidth(2)
             wf.setframerate(int(item["sample_rate"]))
             wf.writeframes(item["pcm"])
+        transcribe_started_at = time.time()
         try:
             proc = subprocess.run(
                 ["transcribe", str(wav_path), "--mime-type", "audio/wav"],
@@ -543,24 +579,72 @@ class VoiceTranscriber:
                 text=True,
                 timeout=120,
             )
+            transcript_ready_at = time.time()
+            timing = self._build_timing(stats, worker_started_at, transcribe_started_at, transcript_ready_at)
             if proc.returncode != 0:
                 err = (proc.stderr or proc.stdout or "transcribe failed").strip().splitlines()[-1:]
-                self.log(f"transcribe failed for {name}: {err[0] if err else proc.returncode}")
+                self.log(f"transcribe failed for {name}: {err[0] if err else proc.returncode}; {self._format_timing(timing)}")
                 return
             text = (proc.stdout or "").strip()
             if not text:
+                self.log(f"transcribe empty for {name}; {self._format_timing(timing)}")
                 return
-            self.notify(f"🎙 {name}: {text}", prefix="Discord Voice")
+            self.log(f"transcribe ready for {name}; {self._format_timing(timing)}")
+            self.notify(f"🎙 {name}: {text}", prefix="Discord Voice", timing=timing)
         except subprocess.TimeoutExpired:
-            self.log(f"transcribe timed out for {name}")
+            timed_out_at = time.time()
+            timing = self._build_timing(stats, worker_started_at, transcribe_started_at, timed_out_at)
+            self.log(f"transcribe timed out for {name}; {self._format_timing(timing)}")
         except Exception as exc:
-            self.log(f"transcribe failed for {name}: {exc}")
+            failed_at = time.time()
+            timing = self._build_timing(stats, worker_started_at, transcribe_started_at, failed_at)
+            self.log(f"transcribe failed for {name}: {exc}; {self._format_timing(timing)}")
         finally:
             if not self.keep_audio:
                 try:
                     wav_path.unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    def _build_timing(self, stats: dict, worker_started_at: float, transcribe_started_at: float, transcript_ready_at: float):
+        speech_started_at = stats.get("speech_started_at")
+        speech_ended_at = stats.get("speech_ended_at")
+        finalized_at = stats.get("finalized_at")
+        queued_at = stats.get("queued_at") or stats.get("created_at")
+        return {
+            "speech_started_at": speech_started_at,
+            "speech_ended_at": speech_ended_at,
+            "finalized_at": finalized_at,
+            "queued_at": queued_at,
+            "worker_started_at": worker_started_at,
+            "transcribe_started_at": transcribe_started_at,
+            "transcript_ready_at": transcript_ready_at,
+            "speech_start_to_ready_ms": self._elapsed_ms(speech_started_at, transcript_ready_at),
+            "speech_end_to_ready_ms": self._elapsed_ms(speech_ended_at, transcript_ready_at),
+            "finalize_to_ready_ms": self._elapsed_ms(finalized_at, transcript_ready_at),
+            "queue_wait_ms": self._elapsed_ms(queued_at, worker_started_at),
+            "asr_ms": self._elapsed_ms(transcribe_started_at, transcript_ready_at),
+        }
+
+    def _format_timing(self, timing: dict) -> str:
+        return (
+            f"speech_start_to_ready={self._format_timing_ms(timing.get('speech_start_to_ready_ms'))} "
+            f"speech_end_to_ready={self._format_timing_ms(timing.get('speech_end_to_ready_ms'))} "
+            f"finalize_to_ready={self._format_timing_ms(timing.get('finalize_to_ready_ms'))} "
+            f"queue_wait={self._format_timing_ms(timing.get('queue_wait_ms'))} "
+            f"asr={self._format_timing_ms(timing.get('asr_ms'))}"
+        )
+
+    @staticmethod
+    def _elapsed_ms(start, end) -> int | None:
+        seconds = elapsed_since(start, end)
+        return int(round(seconds * 1000)) if seconds is not None else None
+
+    @staticmethod
+    def _format_timing_ms(value) -> str:
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            return "n/a"
+        return f"{int(round(value))}ms"
 
 
 class VoiceReceiveTranscription:

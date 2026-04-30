@@ -114,6 +114,17 @@ def _snowflake(value):
     return text if re.match(r"^\d{17,20}$", text) else None
 
 
+def _timing_delta_ms(start, end=None):
+    try:
+        start = float(start)
+        end = time.time() if end is None else float(end)
+    except (TypeError, ValueError):
+        return "n/a"
+    if start <= 0 or end <= 0:
+        return "n/a"
+    return f"{max(0, int(round((end - start) * 1000)))}ms"
+
+
 def _select_encryption_mode(modes):
     if "aead_aes256_gcm_rtpsize" in modes:
         return "aead_aes256_gcm_rtpsize"
@@ -537,27 +548,39 @@ class NoAudioCallJoiner:
     def _notify_call_event(self, message):
         self._notify_exo(message, prefix="Discord Call")
 
-    def _notify_voice_transcript(self, message, prefix="Discord Voice"):
-        self._notify_exo(message, prefix=prefix)
+    def _notify_voice_transcript(self, message, prefix="Discord Voice", timing=None):
+        self._notify_exo(message, prefix=prefix, timing=timing)
 
-    def _notify_exo(self, message, *, prefix):
+    def _notify_exo(self, message, *, prefix, timing=None):
         targets = [target for target in os.environ.get(CALL_NOTIFY_TARGETS_ENV, "").split(",") if target]
         if not targets:
             return
         print(message, flush=True)
         for target in targets:
-            threading.Thread(target=self._send_notification, args=(target, prefix, message), daemon=True).start()
+            threading.Thread(target=self._send_notification, args=(target, prefix, message, timing), daemon=True).start()
 
-    def _send_notification(self, target, prefix, message):
+    def _send_notification(self, target, prefix, message, timing=None):
+        send_started_at = time.time()
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 ["exo", "send", f"[{prefix}] {message}", "-c", target, "--timeout", "600", "--no-notify"],
                 capture_output=True,
                 text=True,
                 timeout=660,
             )
-        except Exception:
-            pass
+            send_finished_at = time.time()
+            if timing and prefix == "Discord Voice":
+                self._log_voice_transcription(
+                    "notification timing: "
+                    f"target={target} returncode={proc.returncode} "
+                    f"speech_start_to_exo_return={_timing_delta_ms(timing.get('speech_started_at'), send_finished_at)} "
+                    f"speech_end_to_exo_return={_timing_delta_ms(timing.get('speech_ended_at'), send_finished_at)} "
+                    f"transcript_ready_to_exo_return={_timing_delta_ms(timing.get('transcript_ready_at'), send_finished_at)} "
+                    f"exo_send={_timing_delta_ms(send_started_at, send_finished_at)}"
+                )
+        except Exception as exc:
+            if timing and prefix == "Discord Voice":
+                self._log_voice_transcription(f"notification timing failed: target={target} error={exc}")
 
     def _log_voice_transcription(self, message):
         print(f"[voice-transcribe] {message}", flush=True)
