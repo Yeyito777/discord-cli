@@ -172,6 +172,7 @@ class NoAudioCallJoiner:
         self._requested_leave = False
         self._participant_names = {}
         self._active_participant_ids = set()
+        self._participant_audio_states = {}
         self._notified_leave_ids = set()
         self._participants_seeded = False
 
@@ -341,6 +342,7 @@ class NoAudioCallJoiner:
                 if user_id not in self._notified_leave_ids:
                     self._notified_leave_ids.add(user_id)
                     self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} left {self.label}")
+            self._participant_audio_states.clear()
             print("Call ended by Discord.", flush=True)
             self.running = False
 
@@ -379,6 +381,36 @@ class NoAudioCallJoiner:
             self._participant_names[user_id] = name
         return user_id
 
+    def _voice_audio_state_from_state(self, state):
+        audio = {}
+        if "self_mute" in state or "mute" in state:
+            audio["muted"] = bool(state.get("self_mute") or state.get("mute"))
+        if "self_deaf" in state or "deaf" in state:
+            audio["deafened"] = bool(state.get("self_deaf") or state.get("deaf"))
+        return audio
+
+    def _remember_participant_audio_state(self, user_id, state):
+        if not user_id or user_id == str(self.my_id):
+            return
+        audio = self._voice_audio_state_from_state(state)
+        if not audio:
+            return
+        user_id = str(user_id)
+        previous = self._participant_audio_states.get(user_id, {})
+        current = dict(previous)
+        changes = []
+        for key, value in audio.items():
+            old_value = previous.get(key)
+            current[key] = value
+            if old_value is not None and old_value != value:
+                if key == "muted":
+                    changes.append("muted" if value else "unmuted")
+                elif key == "deafened":
+                    changes.append("deafened" if value else "undeafened")
+        self._participant_audio_states[user_id] = current
+        if changes:
+            self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} {' and '.join(changes)} in {self.label}")
+
     def _handle_voice_state_update(self, data):
         user_id = self._remember_voice_state_name(data)
         if not user_id:
@@ -391,6 +423,7 @@ class NoAudioCallJoiner:
             return
 
         if data.get("channel_id") == self.channel_id:
+            self._remember_participant_audio_state(user_id, data)
             current = set(self._active_participant_ids)
             current.add(user_id)
             self._sync_call_participants(current)
@@ -398,6 +431,7 @@ class NoAudioCallJoiner:
 
         if user_id in self._active_participant_ids:
             self._active_participant_ids.discard(user_id)
+            self._participant_audio_states.pop(user_id, None)
             if user_id not in self._notified_leave_ids:
                 self._notified_leave_ids.add(user_id)
                 self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} left {self.label}")
@@ -412,6 +446,7 @@ class NoAudioCallJoiner:
             user_id = self._remember_voice_state_name(state)
             if user_id and user_id != str(self.my_id):
                 current.add(user_id)
+                self._remember_participant_audio_state(user_id, state)
         if saw_voice_state:
             self._sync_call_participants(current)
 
@@ -437,6 +472,7 @@ class NoAudioCallJoiner:
             self._notified_leave_ids.discard(user_id)
             self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} joined {self.label}")
         for user_id in sorted(removed):
+            self._participant_audio_states.pop(user_id, None)
             if user_id not in self._notified_leave_ids:
                 self._notified_leave_ids.add(user_id)
                 self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} left {self.label}")
