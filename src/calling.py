@@ -28,7 +28,7 @@ import zlib
 import websocket
 
 from src import api
-from src.voice_receive import VoiceReceiveTranscription
+from src.voice_receive import VoiceReceiveTranscription, diagnose_saved_voice_segment
 from src.auth import get_token
 from src.private_channels import private_channel_label_for_type, private_channel_name, private_channel_type
 
@@ -285,7 +285,11 @@ class NoAudioCallJoiner:
     # ─── App gateway ──────────────────────────────────────────────────────────
 
     def _connect_app_gateway(self):
+        self._close_app_gateway()
         self._app_hb_gen += 1
+        self._app_inflator = zlib.decompressobj()
+        self._app_sequence = None
+        self.my_id = None
         url = _gateway_url()
         self.app_ws = websocket.WebSocket()
         self.app_ws.settimeout(1)
@@ -315,6 +319,34 @@ class NoAudioCallJoiner:
             self._pump_app_gateway_once()
             if time.time() > deadline:
                 raise RuntimeError("Timed out waiting for Discord gateway READY")
+
+    def _close_app_gateway(self):
+        self._app_hb_gen += 1
+        ws = self.app_ws
+        self.app_ws = None
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _reconnect_app_gateway(self, reason: str):
+        print(f"Discord gateway {reason}; reconnecting…", flush=True)
+        last_error = None
+        for attempt in range(1, 6):
+            if not self.running:
+                return
+            try:
+                self._connect_app_gateway()
+                if self.running and self.channel_id:
+                    self._request_voice_state(self.channel_id)
+                print("Discord gateway reconnected.", flush=True)
+                return
+            except Exception as exc:
+                last_error = exc
+                print(f"Discord gateway reconnect attempt {attempt} failed: {exc}", flush=True)
+                time.sleep(min(10, attempt * 2))
+        raise RuntimeError(f"Discord gateway reconnect failed: {last_error}")
 
     def _recv_app_json(self):
         data = self.app_ws.recv()
@@ -350,17 +382,20 @@ class NoAudioCallJoiner:
                 time.sleep(0.5)
 
     def _pump_app_gateway_once(self):
+        if not self.app_ws:
+            self._reconnect_app_gateway("was disconnected")
+            return
         try:
             ws_op, data = self.app_ws.recv_data()
         except websocket.WebSocketTimeoutException:
             return
         except Exception as exc:
             if self.running:
-                raise RuntimeError(f"Discord gateway disconnected: {exc}")
+                self._reconnect_app_gateway(f"disconnected ({exc})")
             return
         if ws_op == 8:
             if self.running:
-                raise RuntimeError("Discord gateway closed")
+                self._reconnect_app_gateway("closed")
             return
         data = self._decompress_app(data)
         if not data:
@@ -372,9 +407,9 @@ class NoAudioCallJoiner:
         if op == 11:
             self._app_heartbeat_acked = True
         elif op == 7:
-            raise RuntimeError("Discord gateway requested reconnect")
+            self._reconnect_app_gateway("requested reconnect")
         elif op == 9:
-            raise RuntimeError("Discord gateway invalidated the session")
+            self._reconnect_app_gateway("invalidated the session")
         elif op == 0:
             self._app_sequence = event.get("s")
             self._on_app_dispatch(event.get("t"), event.get("d") or {})
@@ -867,14 +902,13 @@ class NoAudioCallJoiner:
                 pass
             self._voice_transcription = None
         self._pending_voice_session_description = None
-        for ws in (self.voice_ws, self.app_ws):
-            if ws:
-                try:
-                    ws.close()
-                except Exception:
-                    pass
+        if self.voice_ws:
+            try:
+                self.voice_ws.close()
+            except Exception:
+                pass
         self.voice_ws = None
-        self.app_ws = None
+        self._close_app_gateway()
         if self.voice_udp:
             try:
                 self.voice_udp.close()
@@ -1254,6 +1288,14 @@ def list_calls(argv):
         print(notify_text)
 
 
+def diagnose_segment(argv):
+    p = argparse.ArgumentParser(prog="discord call diagnose-audio", description="Analyze a saved call transcription WAV/sidecar/packet trace and write decode variants.")
+    p.add_argument("segment", help="Path to a saved .wav, .json sidecar, or .packets.jsonl trace")
+    p.add_argument("--no-variants", action="store_true", help="Only print metrics; do not write libopus decode variant WAVs")
+    args = p.parse_args(argv)
+    print(diagnose_saved_voice_segment(args.segment, write_variants=not args.no_variants))
+
+
 def list_segments(argv):
     p = argparse.ArgumentParser(prog="discord call segments", description="List saved call transcription WAV segments.")
     p.add_argument("target", nargs="?", help="Call channel ID/label; defaults to active call when unambiguous")
@@ -1456,7 +1498,7 @@ def leave(argv):
 def dispatch(cmd, argv):
     if cmd in {"call", "voice"}:
         if not argv or argv[0] in {"-h", "--help", "help"}:
-            print("usage: discord call <start|join|leave|mute|unmute|deafen|undeafen|transcribe|segments|list> ...")
+            print("usage: discord call <start|join|leave|mute|unmute|deafen|undeafen|transcribe|segments|diagnose-audio|list> ...")
             print("  start <dm> [--dm] [--foreground] [--unmuted] [--deafened] [--no-transcribe] [--save-audio] [--notify-parent CONV_ID|--no-notify]")
             print("  join <target> [--dm|-g SERVER] [--foreground] [--unmuted] [--deafened] [--no-transcribe] [--save-audio] [--notify-parent CONV_ID|--no-notify]")
             print("  mute [target] [on|off|toggle] [--all]")
@@ -1465,6 +1507,7 @@ def dispatch(cmd, argv):
             print("  undeafen [target] [--all]                      # also enables transcription")
             print("  transcribe [target] [on|off|toggle] [--all]")
             print("  segments [target] [-n LIMIT]")
+            print("  diagnose-audio <segment.wav|segment.json|segment.packets.jsonl> [--no-variants]")
             print("  leave [target|--all]")
             print("  list")
             return
@@ -1489,6 +1532,8 @@ def dispatch(cmd, argv):
             return _control_call_transcription(rest, default_value=False)
         if subcmd in {"segments", "clips", "audio", "recordings"}:
             return list_segments(rest)
+        if subcmd in {"diagnose-audio", "diagnose", "analyze-audio", "analyse-audio"}:
+            return diagnose_segment(rest)
         if subcmd in {"list", "ls", "status"}:
             return list_calls(rest)
         raise SystemExit(f"discord call: unknown subcommand '{subcmd}'")
