@@ -199,6 +199,29 @@ def is_dave_encrypted_payload(payload: bytes | None) -> bool:
     return all(byte == suffix[0] for byte in suffix)
 
 
+def strip_dave_padding(payload: bytes | None) -> tuple[bytes | None, int]:
+    """Remove Discord/DAVE rtpsize padding that follows the FAFA marker.
+
+    @snazzah/davey emits media ending in FAFA. Discord can relay those packets
+    with repeated-byte padding after the marker for RTP-size obfuscation. dave-py
+    expects the DAVE frame to end at FAFA, so normalize before decrypting instead
+    of treating the packet as a missing audio frame.
+    """
+    if not payload or len(payload) < 2:
+        return payload, 0
+    marker = payload.rfind(b"\xfa\xfa")
+    if marker < 0:
+        return payload, 0
+    suffix = payload[marker + 2:]
+    if not suffix:
+        return payload, 0
+    if marker < len(payload) - 256:
+        return payload, 0
+    if not all(byte == suffix[0] for byte in suffix):
+        return payload, 0
+    return payload[:marker + 2], len(suffix)
+
+
 def parse_rtp_packet(packet: bytes):
     if len(packet) < RTP_HEADER_LENGTH or packet[0] >> 6 != 2:
         return None
@@ -276,6 +299,8 @@ class DavePassthroughDecryptor:
         self.passthrough_count = 0
         self.decrypt_failure_count = 0
         self.encrypted_drop_count = 0
+        self.padding_trim_count = 0
+        self.padding_trim_bytes = 0
         if self.session is not None:
             self._init_session(self.advertised_protocol_version)
 
@@ -355,6 +380,10 @@ class DavePassthroughDecryptor:
                 decryptor = self.ssrc_to_decryptor.get(int(ssrc))
         if decryptor is None:
             return None
+        payload, trimmed = strip_dave_padding(payload)
+        if trimmed:
+            self.padding_trim_count += 1
+            self.padding_trim_bytes += trimmed
         encrypted = is_dave_encrypted_payload(payload)
         try:
             decoded = decryptor.decrypt(dave.MediaType.audio, bytes(payload))
@@ -1141,7 +1170,7 @@ def _decode_packet_trace_to_wav(trace_path: Path, out_path: Path, *, channels: i
                 continue
             packet_count += 1
             payload = item.get("payload")
-            if item.get("missing") or payload is None:
+            if item.get("missing") or item.get("dave_drop") or payload is None:
                 missing += 1
                 decoded = decoder.decode_missing()
             elif drop_dave_encrypted and is_dave_encrypted_payload(payload):
@@ -1213,16 +1242,18 @@ def diagnose_saved_voice_segment(path: str | os.PathLike, *, write_variants: boo
                 header = item
             else:
                 packet_rows.append(item)
-        invalid_parser = sum(1 for item in packet_rows if int(item.get("opus_frames") or -1) <= 0)
+        dave_drops = sum(1 for item in packet_rows if item.get("dave_drop"))
+        missing_packets = sum(1 for item in packet_rows if item.get("missing"))
+        invalid_parser = sum(1 for item in packet_rows if not item.get("dave_drop") and not item.get("missing") and int(item.get("opus_frames") or -1) <= 0)
         sample_counts = {}
         lengths = {}
         for item in packet_rows:
-            sample_counts[item.get("opus_samples")] = sample_counts.get(item.get("opus_samples"), 0) + 1
-            lengths[item.get("payload_len")] = lengths.get(item.get("payload_len"), 0) + 1
+            sample_counts[item.get("opus_samples", item.get("pre_dave_opus_samples"))] = sample_counts.get(item.get("opus_samples", item.get("pre_dave_opus_samples")), 0) + 1
+            lengths[item.get("payload_len", item.get("pre_dave_payload_len"))] = lengths.get(item.get("payload_len", item.get("pre_dave_payload_len")), 0) + 1
         top_samples = ", ".join(f"{k}:{v}" for k, v in sorted(sample_counts.items(), key=lambda kv: (-kv[1], str(kv[0])))[:5])
         top_lengths = ", ".join(f"{k}:{v}" for k, v in sorted(lengths.items(), key=lambda kv: (-kv[1], str(kv[0])))[:5])
         lines.append(f"packet trace: {trace_path}")
-        lines.append(f"packets={len(packet_rows)} dropped={(header or {}).get('dropped', 0)} parser_invalid={invalid_parser} opus_samples={top_samples} payload_lens={top_lengths}")
+        lines.append(f"packets={len(packet_rows)} dropped={(header or {}).get('dropped', 0)} missing={missing_packets} dave_drop={dave_drops} parser_invalid={invalid_parser} opus_samples={top_samples} payload_lens={top_lengths}")
     except Exception as exc:
         lines.append(f"packet trace read failed: {exc}")
         return "\n".join(lines)
@@ -1412,9 +1443,11 @@ class VoiceReceiveTranscription:
                 for item in jitter.flush():
                     if item is None:
                         self.jitter_missing_count += 1
-                        self._decode_and_segment(user_id, None, packet_info={"missing": True})
+                        self._decode_and_segment(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter"})
                     else:
                         opus_payload, traced_packet = item
+                        if opus_payload is None:
+                            self.jitter_missing_count += 1
                         self._decode_and_segment(user_id, opus_payload, packet_info=traced_packet)
         for segmenter in list(self.segmenters.values()):
             segmenter.flush_if_stale()
@@ -1429,6 +1462,7 @@ class VoiceReceiveTranscription:
                     f"pre_dave_opus={self.pre_dave_opus_valid_count}/{self.pre_dave_opus_invalid_count} "
                     f"dave_drop={self.dave_drop_count} dave_passthrough={self.dave.passthrough_count} "
                     f"dave_decrypt_fail={self.dave.decrypt_failure_count} dave_encrypted_drop={self.dave.encrypted_drop_count} "
+                    f"dave_padding_trim={self.dave.padding_trim_count}/{self.dave.padding_trim_bytes}B "
                     f"post_dave_opus={self.post_dave_opus_valid_count}/{self.post_dave_opus_invalid_count} "
                     f"frames={self.decode_frame_count} decode_errors={self.decode_error_count} "
                     f"jitter_missing={self.jitter_missing_count} speakers={len(self.segmenters)} ssrcs={len(self.ssrc_to_user_id)}"
@@ -1473,30 +1507,53 @@ class VoiceReceiveTranscription:
     def _handle_ordered_pre_dave_item(self, user_id: str, item):
         if item is None:
             self.jitter_missing_count += 1
-            self._decode_and_segment(user_id, None, packet_info={"missing": True})
+            self._decode_and_segment(user_id, None, packet_info={"missing": True, "stage": "pre_dave_jitter"})
             return
         parsed, payload = item
+        pre_dave_payload = payload
         if opus_packet_is_valid(payload):
             self.pre_dave_opus_valid_count += 1
         else:
             self.pre_dave_opus_invalid_count += 1
         payload = self.dave.decode_incoming_opus(parsed["ssrc"], payload)
+        jitter = self.jitter_buffers.get(user_id)
+        if jitter is None:
+            jitter = RtpJitterBuffer(max_packets=env_int("DISCORD_CALL_TRANSCRIBE_JITTER_PACKETS", DEFAULT_JITTER_PACKETS))
+            self.jitter_buffers[user_id] = jitter
         if not payload:
             self.dave_drop_count += 1
+            packet_info = {
+                "sequence": parsed.get("sequence"),
+                "timestamp": parsed.get("timestamp"),
+                "ssrc": parsed.get("ssrc"),
+                "stage": "dave_drop",
+                "dave_drop": True,
+                "pre_dave_payload_len": len(pre_dave_payload),
+                "pre_dave_opus_frames": opus_packet_frame_count(pre_dave_payload),
+                "pre_dave_opus_samples": opus_packet_sample_count(pre_dave_payload),
+                "pre_dave_encrypted_marker": is_dave_encrypted_payload(pre_dave_payload),
+                "payload": pre_dave_payload,
+            }
+            for item in jitter.add(parsed["sequence"], (None, packet_info)):
+                if item is None:
+                    self.jitter_missing_count += 1
+                    self._decode_and_segment(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter"})
+                else:
+                    opus_payload, traced_packet = item
+                    if opus_payload is None:
+                        self.jitter_missing_count += 1
+                    self._decode_and_segment(user_id, opus_payload, packet_info=traced_packet)
             return
         if opus_packet_is_valid(payload):
             self.post_dave_opus_valid_count += 1
         else:
             self.post_dave_opus_invalid_count += 1
             self._log_invalid_opus(user_id, parsed, payload)
-        jitter = self.jitter_buffers.get(user_id)
-        if jitter is None:
-            jitter = RtpJitterBuffer(max_packets=env_int("DISCORD_CALL_TRANSCRIBE_JITTER_PACKETS", DEFAULT_JITTER_PACKETS))
-            self.jitter_buffers[user_id] = jitter
         packet_info = {
             "sequence": parsed.get("sequence"),
             "timestamp": parsed.get("timestamp"),
             "ssrc": parsed.get("ssrc"),
+            "stage": "post_dave",
             "payload_len": len(payload),
             "opus_frames": opus_packet_frame_count(payload),
             "opus_samples": opus_packet_sample_count(payload),
@@ -1505,9 +1562,11 @@ class VoiceReceiveTranscription:
         for item in jitter.add(parsed["sequence"], (payload, packet_info)):
             if item is None:
                 self.jitter_missing_count += 1
-                self._decode_and_segment(user_id, None, packet_info={"missing": True})
+                self._decode_and_segment(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter"})
             else:
                 opus_payload, traced_packet = item
+                if opus_payload is None:
+                    self.jitter_missing_count += 1
                 self._decode_and_segment(user_id, opus_payload, packet_info=traced_packet)
 
     def _decode_and_segment(self, user_id: str, opus_payload: bytes | None, *, packet_info: dict | None = None):
