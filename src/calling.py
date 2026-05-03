@@ -39,6 +39,10 @@ VOICE_FLAGS = 3
 VOICE_GATEWAY_VERSION = 8
 VOICE_CONNECT_TIMEOUT = 20
 VOICE_UDP_TIMEOUT = 5
+VOICE_GATEWAY_RECONNECT_ATTEMPTS = 5
+VOICE_GATEWAY_RECONNECT_DELAY = 1.0
+VOICE_GATEWAY_RECOVERABLE_CLOSE_CODES = {4006, 4009, 4015}
+VOICE_GATEWAY_TERMINAL_CLOSE_CODES = {4014, 4022}
 OPUS_PAYLOAD_TYPE = 120
 DAVE_PROTOCOL_VERSION = 1
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -179,6 +183,7 @@ class NoAudioCallJoiner:
         self._voice_heartbeat_acked = True
         self._app_sequence = None
         self._voice_sequence = 0
+        self._voice_reconnect_attempts = 0
 
         self.my_id = None
         self.session_id = None
@@ -215,8 +220,7 @@ class NoAudioCallJoiner:
             while self.running and not self.voice_ready:
                 self._pump_app_gateway_once()
                 self._poll_control()
-                if self.session_id and self.voice_token and self.voice_endpoint and not self.voice_ws:
-                    self._connect_voice_gateway()
+                self._maybe_connect_voice_gateway()
                 if self.voice_ws and not self.voice_ready:
                     self._pump_voice_gateway_once()
                 if time.time() > deadline:
@@ -232,6 +236,7 @@ class NoAudioCallJoiner:
             while self.running:
                 self._pump_app_gateway_once()
                 self._poll_control()
+                self._maybe_connect_voice_gateway()
                 if self.voice_ws:
                     self._pump_voice_gateway_once()
         finally:
@@ -568,6 +573,7 @@ class NoAudioCallJoiner:
                     self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} joined {self.label}")
             self._active_participant_ids = current
             self._notified_leave_ids.difference_update(current)
+            self._sync_transcription_participants()
             return
         joined = current - self._active_participant_ids
         removed = self._active_participant_ids - current
@@ -582,6 +588,11 @@ class NoAudioCallJoiner:
                 self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} left {self.label}")
         self._active_participant_ids = current
         self._notified_leave_ids.difference_update(current)
+        self._sync_transcription_participants()
+
+    def _sync_transcription_participants(self):
+        if self._voice_transcription:
+            self._voice_transcription.set_active_remote_users(self._active_participant_ids)
 
     def _notify_call_event(self, message):
         self._notify_exo(message, prefix="Discord Call")
@@ -657,6 +668,9 @@ class NoAudioCallJoiner:
         if self._requested_leave:
             return
         self._requested_leave = True
+        self._request_voice_disconnect()
+
+    def _request_voice_disconnect(self):
         try:
             if self.app_ws:
                 self._send_app({
@@ -684,7 +698,14 @@ class NoAudioCallJoiner:
 
     # ─── Voice gateway ────────────────────────────────────────────────────────
 
+    def _maybe_connect_voice_gateway(self):
+        if self.voice_ws or not (self.session_id and self.voice_token and self.voice_endpoint):
+            return
+        self._connect_voice_gateway()
+
     def _connect_voice_gateway(self):
+        self.voice_ready = False
+        self._voice_sequence = 0
         self._ensure_voice_transcription_object()
         endpoint = re.sub(r"^wss?://", "", self.voice_endpoint or "")
         self.voice_ws = websocket.WebSocket()
@@ -698,12 +719,18 @@ class NoAudioCallJoiner:
             return
         except Exception as exc:
             if self.running:
-                raise RuntimeError(f"Discord voice gateway disconnected: {exc}")
+                self._recover_voice_gateway(f"disconnected ({exc})")
             return
         if ws_op == 8:
             if self.running:
-                code = getattr(self.voice_ws, "status", None)
-                reason = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data or "")
+                code, reason = self._parse_voice_gateway_close(data)
+                if self._is_terminal_voice_gateway_close(code, reason):
+                    print(f"Discord voice gateway closed ({code or 'unknown'}: {reason or 'unknown reason'}); call ended.", flush=True)
+                    self.running = False
+                    return
+                if self._is_recoverable_voice_gateway_close(code, reason):
+                    self._recover_voice_gateway(f"closed ({code or 'unknown'}: {reason or 'unknown reason'})")
+                    return
                 raise RuntimeError(f"Discord voice gateway closed ({code or 'unknown'}: {reason or 'unknown reason'})")
             return
         if isinstance(data, bytes):
@@ -740,6 +767,8 @@ class NoAudioCallJoiner:
         elif op == 4:
             self._handle_voice_session_description(payload.get("d") or {})
             self.voice_ready = True
+            self._voice_reconnect_attempts = 0
+            _update_call_meta_env(status="joined", updated_at=time.time())
         elif op == 5:
             self._handle_voice_speaking(payload.get("d") or {})
         elif op == 11:
@@ -753,9 +782,80 @@ class NoAudioCallJoiner:
             if isinstance(data, dict) and data.get("user_id"):
                 self._remove_transcription_user(str(data.get("user_id")))
         elif op == 9:
-            raise RuntimeError("Discord voice gateway invalidated the session")
+            self._recover_voice_gateway("invalidated the session")
         elif self._voice_transcription:
             self._voice_transcription.handle_json_opcode(op, payload.get("d"))
+
+    def _parse_voice_gateway_close(self, data):
+        code = getattr(self.voice_ws, "status", None)
+        reason = ""
+        if isinstance(data, bytes):
+            if len(data) >= 2:
+                try:
+                    code = struct.unpack("!H", data[:2])[0]
+                    reason = data[2:].decode("utf-8", errors="replace")
+                except Exception:
+                    reason = data.decode("utf-8", errors="replace")
+            else:
+                reason = data.decode("utf-8", errors="replace")
+        elif data:
+            reason = str(data)
+        return code, reason
+
+    def _is_recoverable_voice_gateway_close(self, code, reason):
+        reason = (reason or "").lower()
+        return (
+            code in VOICE_GATEWAY_RECOVERABLE_CLOSE_CODES
+            or "session is no longer valid" in reason
+            or "invalidated" in reason
+            or "server crashed" in reason
+        )
+
+    def _is_terminal_voice_gateway_close(self, code, reason):
+        reason = (reason or "").lower()
+        return code in VOICE_GATEWAY_TERMINAL_CLOSE_CODES or "call terminated" in reason
+
+    def _recover_voice_gateway(self, reason: str):
+        if not self.running:
+            return
+        self._voice_reconnect_attempts += 1
+        if self._voice_reconnect_attempts > VOICE_GATEWAY_RECONNECT_ATTEMPTS:
+            raise RuntimeError(f"Discord voice gateway reconnect exhausted after {reason}")
+        print(f"Discord voice gateway {reason}; reconnecting…", flush=True)
+        _update_call_meta_env(status="reconnecting", updated_at=time.time())
+        self._reset_voice_gateway_state(stop_transcription=True)
+        if self.app_ws and self.channel_id:
+            self._request_voice_disconnect()
+            self._request_voice_state(self.channel_id)
+        time.sleep(min(VOICE_GATEWAY_RECONNECT_DELAY * self._voice_reconnect_attempts, 5.0))
+
+    def _reset_voice_gateway_state(self, *, stop_transcription: bool):
+        self._voice_hb_gen += 1
+        ws = self.voice_ws
+        self.voice_ws = None
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        if self.voice_udp:
+            try:
+                self.voice_udp.close()
+            except Exception:
+                pass
+            self.voice_udp = None
+        if stop_transcription and self._voice_transcription:
+            try:
+                self._voice_transcription.stop()
+            except Exception:
+                pass
+            self._voice_transcription = None
+        self._pending_voice_session_description = None
+        self.voice_ready = False
+        self.voice_token = None
+        self.voice_endpoint = None
+        self.session_id = None
+        self._voice_sequence = 0
 
     def _start_voice_heartbeat(self):
         self._voice_heartbeat_acked = True
@@ -841,6 +941,7 @@ class NoAudioCallJoiner:
             audio_dir=self.audio_dir,
         )
         self._voice_transcription.set_enabled(self.transcribe_enabled)
+        self._sync_transcription_participants()
         for ssrc, user_id in self._ssrc_cache:
             self._voice_transcription.add_ssrc_mapping(ssrc, user_id)
         self._ssrc_cache.clear()

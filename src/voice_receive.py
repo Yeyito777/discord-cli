@@ -32,9 +32,9 @@ except Exception:  # pragma: no cover - depends on deployment venv
     av = None
 
 try:
-    import davey  # type: ignore
+    import dave  # type: ignore
 except Exception:  # pragma: no cover - depends on deployment venv
-    davey = None
+    dave = None
 
 try:
     import nacl.bindings  # type: ignore
@@ -251,7 +251,14 @@ def decrypt_transport(packet: bytes, parsed: dict, mode: str, secret_key: bytes)
 
 
 class DavePassthroughDecryptor:
-    """Small wrapper around davey.DaveSession matching Record's behavior."""
+    """Endcord-style DAVE handler using dave-py's per-SSRC key ratchets.
+
+    davey exposes a convenient session.decrypt(user_id, payload) API, but in
+    practice it leaves some encrypted/padded packets in the media path. Endcord
+    uses dave-py Session + one Decryptor per SSRC and transitions each decryptor
+    onto the sender's key ratchet; mirror that shape here so transcription sees
+    real Opus once instead of attempting heuristic recovery after decode damage.
+    """
 
     def __init__(self, *, user_id: str, channel_id: str, send_json, send_binary, on_error=None):
         self.user_id = str(user_id)
@@ -259,23 +266,25 @@ class DavePassthroughDecryptor:
         self.send_json = send_json
         self.send_binary = send_binary
         self.on_error = on_error
-        self.session = None
+        self.session = dave.Session() if dave is not None else None
         self.protocol_version = 0
-        self.pending_transitions = {}
+        self.pending_transition_id = None
         self.known_user_ids = {self.user_id}
+        self.ssrc_to_user_id = {}
+        self.ssrc_to_decryptor = {}
         self.external_sender = None
-        self.downgraded = False
-        self.reinitializing = False
-        self.last_transition_id = None
-        self.passthrough_recovery_enabled = False
+        self.passthrough_count = 0
+        self.decrypt_failure_count = 0
+        self.encrypted_drop_count = 0
+        if self.session is not None:
+            self._init_session(self.advertised_protocol_version)
 
     @property
     def advertised_protocol_version(self):
-        return getattr(davey, "DAVE_PROTOCOL_VERSION", 1) if davey is not None else 0
+        return int(dave.get_max_supported_protocol_version()) if dave is not None else 0
 
     def handle_session_description(self, data: dict):
         self.protocol_version = int(data.get("dave_protocol_version") or 0)
-        self.reinit()
 
     def add_known_users(self, user_ids):
         for user_id in user_ids or []:
@@ -283,16 +292,29 @@ class DavePassthroughDecryptor:
                 self.known_user_ids.add(str(user_id))
 
     def remove_known_user(self, user_id):
-        self.known_user_ids.discard(str(user_id))
+        user_id = str(user_id)
+        self.known_user_ids.discard(user_id)
+        for ssrc, mapped_user_id in list(self.ssrc_to_user_id.items()):
+            if mapped_user_id == user_id:
+                self.ssrc_to_user_id.pop(ssrc, None)
+                self.ssrc_to_decryptor.pop(ssrc, None)
+
+    def add_ssrc_mapping(self, ssrc, user_id):
+        if ssrc is None or user_id is None:
+            return
+        ssrc = int(ssrc)
+        user_id = str(user_id)
+        self.ssrc_to_user_id[ssrc] = user_id
+        self.add_known_users([user_id])
+        self._transition_decryptor(ssrc, user_id)
 
     def handle_json_opcode(self, opcode, data):
         if opcode == 21:
             self.handle_prepare_transition(data or {})
             return True
         if opcode == 22:
-            transition_id = (data or {}).get("transition_id") if isinstance(data, dict) else None
-            if transition_id is not None:
-                self.execute_pending_transition(int(transition_id))
+            if self.session is not None:
+                self.update_ratchets()
             return True
         if opcode == 24:
             self.handle_prepare_epoch(data or {})
@@ -303,6 +325,7 @@ class DavePassthroughDecryptor:
         if opcode == 25:
             self.external_sender = bytes(payload)
             self.apply_external_sender()
+            self.send_key_package()
             return True
         if opcode == 27:
             self.handle_proposals(payload)
@@ -315,147 +338,110 @@ class DavePassthroughDecryptor:
             return True
         return False
 
-    def decode_incoming_opus(self, user_id, payload: bytes):
-        if payload == b"\xf8\xff\xfe":
+    def decode_incoming_opus(self, ssrc, payload: bytes):
+        if payload == OPUS_SILENCE_FRAME:
             return payload
-        if self.protocol_version == 0:
+        if self.protocol_version <= 0:
             return payload
-        if self.session is None or user_id is None:
+        if self.session is None:
             return None
-        session_ready = bool(getattr(self.session, "ready", False))
-        try:
-            can_passthrough = session_ready and bool(self.session.can_passthrough(int(user_id)))
-        except Exception:
-            can_passthrough = False
-        if not (session_ready or can_passthrough):
+        if not self.session.has_established_group():
+            return None
+        decryptor = self.ssrc_to_decryptor.get(int(ssrc))
+        if decryptor is None:
+            user_id = self.ssrc_to_user_id.get(int(ssrc))
+            if user_id is not None:
+                self._transition_decryptor(int(ssrc), user_id)
+                decryptor = self.ssrc_to_decryptor.get(int(ssrc))
+        if decryptor is None:
             return None
         encrypted = is_dave_encrypted_payload(payload)
         try:
-            decoded = self.session.decrypt(int(user_id), davey.MediaType.audio, payload)
-            if is_dave_encrypted_payload(decoded):
-                self.report_error(f"DAVE decrypt returned encrypted-looking audio for {user_id}; dropping packet")
+            decoded = decryptor.decrypt(dave.MediaType.audio, bytes(payload))
+        except Exception:
+            decoded = None
+        if decoded is None:
+            if encrypted:
+                self.decrypt_failure_count += 1
                 return None
-            return decoded
-        except Exception as exc:
-            # Mixed encrypted/unencrypted transition windows are common during DAVE
-            # setup. Only passthrough packets that do not carry DAVE's encrypted
-            # media marker; passing encrypted bytes to Opus creates metallic noise.
-            if "UnencryptedWhenPassthroughDisabled" in repr(exc) and not encrypted:
-                self.enable_passthrough_recovery()
-                return payload
-            self.report_error(f"DAVE decrypt failed for {user_id}: {exc}")
+            self.passthrough_count += 1
+            return payload
+        if is_dave_encrypted_payload(decoded):
+            self.encrypted_drop_count += 1
+            self.report_error(f"DAVE decrypt returned encrypted-looking audio for SSRC {ssrc}; dropping packet")
             return None
+        return bytes(decoded)
 
     def handle_prepare_transition(self, data: dict):
         if not isinstance(data, dict):
             return
         transition_id = data.get("transition_id")
-        protocol_version = data.get("protocol_version", data.get("dave_protocol_version"))
-        if transition_id is None or protocol_version is None:
+        if transition_id is None:
             return
-        transition_id = int(transition_id)
-        protocol_version = int(protocol_version)
-        self.pending_transitions[transition_id] = protocol_version
-        if transition_id == 0:
-            self.execute_pending_transition(transition_id)
-            return
-        if protocol_version == 0 and self.session is not None:
-            self._set_passthrough(True, 30)
-        self.send_json({"op": 23, "d": {"transition_id": transition_id}})
+        self.pending_transition_id = int(transition_id)
+        self.send_json({"op": 23, "d": {"transition_id": self.pending_transition_id}})
 
     def handle_prepare_epoch(self, data: dict):
-        if not isinstance(data, dict):
+        if not isinstance(data, dict) or int(data.get("epoch") or 0) != 1:
             return
-        if int(data.get("epoch") or 0) != 1:
+        protocol_version = int(data.get("protocol_version", data.get("dave_protocol_version", 1)) or 1)
+        if self.session is None:
             return
-        protocol_version = data.get("protocol_version", data.get("dave_protocol_version"))
-        if protocol_version is None:
-            return
-        self.protocol_version = int(protocol_version)
-        self.reinit()
+        try:
+            self.session.reset()
+            self._init_session(protocol_version)
+            self.apply_external_sender()
+            self.send_key_package()
+        except Exception as exc:
+            self.report_error(f"DAVE epoch init failed: {exc}")
 
     def handle_proposals(self, payload: bytes):
         if self.session is None or not payload:
             return
         try:
-            op_byte = payload[0]
-            operation_type = davey.ProposalsOperationType.append if op_byte == 0 else davey.ProposalsOperationType.revoke
-            result = self.session.process_proposals(operation_type, payload[1:], [int(u) for u in self.known_user_ids])
-            commit = getattr(result, "commit", None) if result is not None else None
-            if not commit:
-                return
-            welcome = getattr(result, "welcome", None)
-            self.send_binary(28, bytes(commit) + (bytes(welcome) if welcome else b""))
+            result = self.session.process_proposals(bytes(payload), self.known_user_ids)
+            if result is not None:
+                self.send_commit_welcome(result)
         except Exception as exc:
             self.report_error(f"DAVE proposals failed: {exc}")
-            self.recover_from_invalid_transition(self.last_transition_id)
+            self.send_invalid_commit_welcome(self.pending_transition_id)
 
     def handle_announce_commit_transition(self, payload: bytes):
         if self.session is None or len(payload) < 2:
             return
         transition_id = int.from_bytes(payload[:2], "big")
         try:
-            self.session.process_commit(payload[2:])
-            self.finish_commit_or_welcome_transition(transition_id)
+            result = self.session.process_commit(bytes(payload[2:]))
+            if dave is not None and isinstance(result, dave.RejectType):
+                self.report_error(f"DAVE rejected commit: {result}")
+                self.send_invalid_commit_welcome(transition_id)
+                self.send_key_package()
+                return
+            self.update_ratchets()
+            if transition_id != 0:
+                self.send_json({"op": 23, "d": {"transition_id": transition_id}})
         except Exception as exc:
             self.report_error(f"DAVE commit failed: {exc}")
-            self.recover_from_invalid_transition(transition_id)
+            self.send_invalid_commit_welcome(transition_id)
+            self.send_key_package()
 
     def handle_welcome(self, payload: bytes):
         if self.session is None or len(payload) < 2:
             return
         transition_id = int.from_bytes(payload[:2], "big")
         try:
-            self.session.process_welcome(payload[2:])
-            self.finish_commit_or_welcome_transition(transition_id)
+            result = self.session.process_welcome(bytes(payload[2:]), self.known_user_ids)
+            if result is None:
+                self.report_error("DAVE welcome was invalid")
+                self.send_invalid_commit_welcome(transition_id)
+                self.send_key_package()
+                return
+            self.update_ratchets()
+            self.send_json({"op": 23, "d": {"transition_id": transition_id}})
         except Exception as exc:
             self.report_error(f"DAVE welcome failed: {exc}")
-            self.recover_from_invalid_transition(transition_id)
-
-    def finish_commit_or_welcome_transition(self, transition_id: int):
-        if transition_id == 0:
-            self.last_transition_id = 0
-            self.reinitializing = False
-            return
-        self.pending_transitions[transition_id] = self.protocol_version
-        self.send_json({"op": 23, "d": {"transition_id": transition_id}})
-
-    def execute_pending_transition(self, transition_id: int):
-        next_version = self.pending_transitions.pop(transition_id, None)
-        if next_version is None:
-            return False
-        self.protocol_version = int(next_version)
-        if self.session is not None:
-            if next_version == 0:
-                self.downgraded = True
-                self._set_passthrough(True, 10)
-            elif self.downgraded and transition_id > 0:
-                self.downgraded = False
-                self._set_passthrough(True, 10)
-        self.reinitializing = False
-        self.last_transition_id = transition_id
-        return True
-
-    def reinit(self):
-        if davey is None:
-            return
-        if self.protocol_version <= 0:
-            if self.session is not None:
-                self._set_passthrough(True, 10)
-                try:
-                    self.session.reset()
-                except Exception:
-                    pass
-            return
-        try:
-            if self.session is None:
-                self.session = davey.DaveSession(self.protocol_version, int(self.user_id), int(self.channel_id))
-            else:
-                self.session.reinit(self.protocol_version, int(self.user_id), int(self.channel_id))
-            self.apply_external_sender()
+            self.send_invalid_commit_welcome(transition_id)
             self.send_key_package()
-        except Exception as exc:
-            self.report_error(f"DAVE init failed: {exc}")
 
     def apply_external_sender(self):
         if self.session is None or self.external_sender is None:
@@ -469,30 +455,58 @@ class DavePassthroughDecryptor:
         if self.session is None or self.protocol_version <= 0:
             return
         try:
-            self.send_binary(26, self.session.get_serialized_key_package())
+            self.send_binary(26, self.session.get_marshalled_key_package())
         except Exception as exc:
             self.report_error(f"DAVE key package failed: {exc}")
 
-    def recover_from_invalid_transition(self, transition_id):
-        if transition_id is None or self.reinitializing:
+    def send_commit_welcome(self, result):
+        if result is None:
             return
-        self.reinitializing = True
+        commit = getattr(result, "commit", None)
+        if commit is not None:
+            welcome = getattr(result, "welcome", None)
+            self.send_binary(28, bytes(commit) + (bytes(welcome) if welcome is not None else b""))
+            return
+        self.send_binary(28, bytes(result))
+
+    def send_invalid_commit_welcome(self, transition_id):
+        if transition_id is None:
+            return
         self.send_json({"op": 31, "d": {"transition_id": int(transition_id)}})
-        self.reinit()
 
-    def enable_passthrough_recovery(self):
-        if self.passthrough_recovery_enabled:
-            return
-        self.passthrough_recovery_enabled = True
-        self._set_passthrough(True, 120)
+    def update_ratchets(self):
+        for ssrc, user_id in list(self.ssrc_to_user_id.items()):
+            self._transition_decryptor(ssrc, user_id)
 
-    def _set_passthrough(self, enabled: bool, expiry: int):
-        if self.session is None:
+    def _transition_decryptor(self, ssrc: int, user_id: str):
+        if self.session is None or dave is None:
             return
         try:
-            self.session.set_passthrough_mode(enabled, expiry)
+            ratchet = self.session.get_key_ratchet(str(user_id))
         except Exception:
-            pass
+            ratchet = None
+        if ratchet is None:
+            return
+        decryptor = self.ssrc_to_decryptor.get(ssrc)
+        if decryptor is None:
+            decryptor = dave.Decryptor()
+            self.ssrc_to_decryptor[ssrc] = decryptor
+        try:
+            decryptor.transition_to_key_ratchet(ratchet, transition_expiry=10.0)
+        except Exception as exc:
+            self.report_error(f"DAVE ratchet transition failed for {user_id}: {exc}")
+
+    def _init_session(self, protocol_version: int):
+        if self.session is None:
+            return
+        self.protocol_version = int(protocol_version or 0)
+        if self.protocol_version <= 0:
+            return
+        self.session.init(
+            version=self.protocol_version,
+            group_id=int(self.channel_id),
+            self_user_id=str(self.user_id),
+        )
 
     def report_error(self, message: str):
         if self.on_error:
@@ -1236,7 +1250,7 @@ def diagnose_saved_voice_segment(path: str | os.PathLike, *, write_variants: boo
 class VoiceReceiveTranscription:
     @staticmethod
     def advertised_dave_protocol_version_static():
-        return getattr(davey, "DAVE_PROTOCOL_VERSION", 1) if davey is not None else 0
+        return int(dave.get_max_supported_protocol_version()) if dave is not None else 0
 
     def __init__(self, *, udp=None, mode: str | None = None, secret_key=None, self_user_id: str, channel_id: str, label: str, send_json, send_binary, notify, name_for_user, log=print, keep_audio: bool | None = None, audio_dir: str | os.PathLike | None = None):
         self.udp = udp
@@ -1253,9 +1267,11 @@ class VoiceReceiveTranscription:
         self.running = False
         self.thread = None
         self.ssrc_to_user_id = {}
+        self.fallback_user_ids = set()
         self.segmenters = {}
         self.decoders = {}
         self.resamplers = {}
+        self.pre_dave_jitter_buffers = {}
         self.jitter_buffers = {}
         self.jitter_missing_count = 0
         self.packet_count = 0
@@ -1328,6 +1344,10 @@ class VoiceReceiveTranscription:
             for segmenter in list(self.segmenters.values()):
                 segmenter.finalize()
 
+    def set_active_remote_users(self, user_ids):
+        self.fallback_user_ids = {str(user_id) for user_id in (user_ids or []) if user_id is not None and str(user_id) != self.self_user_id}
+        self.dave.add_known_users(self.fallback_user_ids)
+
     def add_ssrc_mapping(self, ssrc, user_id):
         if ssrc is None or user_id is None:
             return
@@ -1335,12 +1355,14 @@ class VoiceReceiveTranscription:
         user_id = str(user_id)
         previous = self.ssrc_to_user_id.get(ssrc)
         self.ssrc_to_user_id[ssrc] = user_id
-        self.dave.add_known_users([user_id])
+        self.fallback_user_ids.add(user_id)
+        self.dave.add_ssrc_mapping(ssrc, user_id)
         if previous != user_id:
             self.log(f"Voice transcription mapped SSRC {ssrc} to {self.name_for_user(user_id)}")
 
     def remove_user(self, user_id):
         user_id = str(user_id)
+        self.fallback_user_ids.discard(user_id)
         self.dave.remove_known_user(user_id)
         for ssrc, mapped_user in list(self.ssrc_to_user_id.items()):
             if mapped_user == user_id:
@@ -1383,6 +1405,9 @@ class VoiceReceiveTranscription:
 
     def _flush_stale(self, *, flush_jitter: bool = False):
         if flush_jitter:
+            for user_id, jitter in list(self.pre_dave_jitter_buffers.items()):
+                for item in jitter.flush():
+                    self._handle_ordered_pre_dave_item(user_id, item)
             for user_id, jitter in list(self.jitter_buffers.items()):
                 for item in jitter.flush():
                     if item is None:
@@ -1402,7 +1427,9 @@ class VoiceReceiveTranscription:
                     f"self={self.self_packet_count} transport_fail={self.transport_decrypt_fail_count} "
                     f"ext={self.extension_packet_count}/{self.extension_bytes_total}B decrypted={self.decrypt_count} "
                     f"pre_dave_opus={self.pre_dave_opus_valid_count}/{self.pre_dave_opus_invalid_count} "
-                    f"dave_drop={self.dave_drop_count} post_dave_opus={self.post_dave_opus_valid_count}/{self.post_dave_opus_invalid_count} "
+                    f"dave_drop={self.dave_drop_count} dave_passthrough={self.dave.passthrough_count} "
+                    f"dave_decrypt_fail={self.dave.decrypt_failure_count} dave_encrypted_drop={self.dave.encrypted_drop_count} "
+                    f"post_dave_opus={self.post_dave_opus_valid_count}/{self.post_dave_opus_invalid_count} "
                     f"frames={self.decode_frame_count} decode_errors={self.decode_error_count} "
                     f"jitter_missing={self.jitter_missing_count} speakers={len(self.segmenters)} ssrcs={len(self.ssrc_to_user_id)}"
                 )
@@ -1413,6 +1440,10 @@ class VoiceReceiveTranscription:
             return
         self.packet_count += 1
         user_id = self.ssrc_to_user_id.get(parsed["ssrc"])
+        if not user_id and len(self.fallback_user_ids) == 1:
+            user_id = next(iter(self.fallback_user_ids))
+            self.add_ssrc_mapping(parsed["ssrc"], user_id)
+            self.log(f"Voice transcription inferred SSRC {parsed['ssrc']} for {self.name_for_user(user_id)}")
         if not user_id:
             self.unknown_ssrc_count += 1
             return
@@ -1432,11 +1463,24 @@ class VoiceReceiveTranscription:
             payload = payload[ext_len:]
         if not payload:
             return
+        jitter = self.pre_dave_jitter_buffers.get(user_id)
+        if jitter is None:
+            jitter = RtpJitterBuffer(max_packets=env_int("DISCORD_CALL_TRANSCRIBE_PRE_DAVE_JITTER_PACKETS", DEFAULT_JITTER_PACKETS))
+            self.pre_dave_jitter_buffers[user_id] = jitter
+        for item in jitter.add(parsed["sequence"], (dict(parsed), payload)):
+            self._handle_ordered_pre_dave_item(user_id, item)
+
+    def _handle_ordered_pre_dave_item(self, user_id: str, item):
+        if item is None:
+            self.jitter_missing_count += 1
+            self._decode_and_segment(user_id, None, packet_info={"missing": True})
+            return
+        parsed, payload = item
         if opus_packet_is_valid(payload):
             self.pre_dave_opus_valid_count += 1
         else:
             self.pre_dave_opus_invalid_count += 1
-        payload = self.dave.decode_incoming_opus(user_id, payload)
+        payload = self.dave.decode_incoming_opus(parsed["ssrc"], payload)
         if not payload:
             self.dave_drop_count += 1
             return
