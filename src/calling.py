@@ -39,8 +39,9 @@ VOICE_FLAGS = 3
 VOICE_GATEWAY_VERSION = 8
 VOICE_CONNECT_TIMEOUT = 20
 VOICE_UDP_TIMEOUT = 5
-VOICE_GATEWAY_RECONNECT_ATTEMPTS = 5
 VOICE_GATEWAY_RECONNECT_DELAY = 1.0
+VOICE_GATEWAY_RECONNECT_MAX_DELAY = 30.0
+VOICE_GATEWAY_APP_RECONNECT_EVERY = 3
 VOICE_GATEWAY_RECOVERABLE_CLOSE_CODES = {4006, 4009, 4015}
 VOICE_GATEWAY_TERMINAL_CLOSE_CODES = {4014, 4022}
 OPUS_PAYLOAD_TYPE = 120
@@ -819,15 +820,19 @@ class NoAudioCallJoiner:
         if not self.running:
             return
         self._voice_reconnect_attempts += 1
-        if self._voice_reconnect_attempts > VOICE_GATEWAY_RECONNECT_ATTEMPTS:
-            raise RuntimeError(f"Discord voice gateway reconnect exhausted after {reason}")
-        print(f"Discord voice gateway {reason}; reconnecting…", flush=True)
+        attempt = self._voice_reconnect_attempts
+        print(f"Discord voice gateway {reason}; reconnecting (attempt {attempt})…", flush=True)
         _update_call_meta_env(status="reconnecting", updated_at=time.time())
         self._reset_voice_gateway_state(stop_transcription=True)
-        if self.app_ws and self.channel_id:
+        if attempt % VOICE_GATEWAY_APP_RECONNECT_EVERY == 0:
+            try:
+                self._reconnect_app_gateway(f"refreshing after voice {reason}")
+            except Exception as exc:
+                print(f"Discord gateway refresh after voice reconnect failed: {exc}", flush=True)
+        elif self.app_ws and self.channel_id:
             self._request_voice_disconnect()
             self._request_voice_state(self.channel_id)
-        time.sleep(min(VOICE_GATEWAY_RECONNECT_DELAY * self._voice_reconnect_attempts, 5.0))
+        time.sleep(min(VOICE_GATEWAY_RECONNECT_DELAY * attempt, VOICE_GATEWAY_RECONNECT_MAX_DELAY))
 
     def _reset_voice_gateway_state(self, *, stop_transcription: bool):
         self._voice_hb_gen += 1
