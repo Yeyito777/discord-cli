@@ -3,7 +3,7 @@
 This module deliberately does not implement speech-to-text itself.  It receives
 Discord RTP/Opus media, segments decoded PCM by speaker using the same RMS
 speaking gate as Record's call widget, writes finalized WAV files, and
-delegates ASR to the external `transcribe` CLI.
+delegates ASR to `exo transcribe` so exocortexd owns OpenAI auth.
 """
 
 from __future__ import annotations
@@ -590,33 +590,33 @@ class VoiceTranscriber:
         transcribe_started_at = time.time()
         try:
             proc = subprocess.run(
-                ["transcribe", str(wav_path), "--mime-type", "audio/wav"],
+                ["exo", "transcribe", str(wav_path), "--mime-type", "audio/wav", "--timeout", "120"],
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=150,
             )
             transcript_ready_at = time.time()
             timing = self._build_timing(stats, worker_started_at, transcribe_started_at, transcript_ready_at)
             if proc.returncode != 0:
-                err = (proc.stderr or proc.stdout or "transcribe failed").strip().splitlines()[-1:]
-                self.log(f"transcribe failed for {name}: {err[0] if err else proc.returncode}; {self._format_timing(timing)}")
+                err = (proc.stderr or proc.stdout or "exo transcribe failed").strip().splitlines()[-1:]
+                self.log(f"exo transcribe failed for {name}: {err[0] if err else proc.returncode}; {self._format_timing(timing)}")
                 return
             text = (proc.stdout or "").strip()
             if not text:
-                self.log(f"transcribe empty for {name}; {self._format_timing(timing)}")
+                self.log(f"exo transcribe empty for {name}; {self._format_timing(timing)}")
                 return
-            self.log(f"transcribe ready for {name}; {self._format_timing(timing)}")
+            self.log(f"exo transcribe ready for {name}; {self._format_timing(timing)}")
             if self.keep_audio:
                 self._write_sidecar(wav_path, item, text, timing)
             self.notify(f"🎙 {name}: {text}", prefix="Discord Voice", timing=timing)
         except subprocess.TimeoutExpired:
             timed_out_at = time.time()
             timing = self._build_timing(stats, worker_started_at, transcribe_started_at, timed_out_at)
-            self.log(f"transcribe timed out for {name}; {self._format_timing(timing)}")
+            self.log(f"exo transcribe timed out for {name}; {self._format_timing(timing)}")
         except Exception as exc:
             failed_at = time.time()
             timing = self._build_timing(stats, worker_started_at, transcribe_started_at, failed_at)
-            self.log(f"transcribe failed for {name}: {exc}; {self._format_timing(timing)}")
+            self.log(f"exo transcribe failed for {name}: {exc}; {self._format_timing(timing)}")
         finally:
             if not self.keep_audio:
                 try:
@@ -742,8 +742,8 @@ class VoiceReceiveTranscription:
         if nacl is None:
             self.log("Voice transcription disabled: PyNaCl is not installed")
             return
-        if not shutil.which("transcribe"):
-            self.log("Voice transcription disabled: transcribe CLI is not in PATH")
+        if not shutil.which("exo"):
+            self.log("Voice transcription disabled: exo CLI is not in PATH")
             return
         self.running = True
         self.thread = threading.Thread(target=self._recv_loop, name="discord-voice-receive", daemon=True)
