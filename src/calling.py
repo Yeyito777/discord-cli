@@ -16,6 +16,7 @@ from pathlib import Path
 import random
 import re
 import signal
+import shutil
 import socket
 import struct
 import subprocess
@@ -26,6 +27,11 @@ import uuid
 import zlib
 
 import websocket
+
+try:
+    import nacl.bindings  # type: ignore
+except Exception:  # pragma: no cover - optional deployment dependency
+    nacl = None
 
 from src import api
 from src.voice_receive import VoiceReceiveTranscription, diagnose_saved_voice_segment
@@ -190,7 +196,15 @@ class NoAudioCallJoiner:
         self.session_id = None
         self.voice_token = None
         self.voice_endpoint = None
+        self.voice_ssrc = None
+        self.voice_mode = None
+        self.voice_secret_key = None
         self.voice_ready = False
+        self._send_sequence = random.randrange(0, 0x10000)
+        self._send_timestamp = random.randrange(0, 0x100000000)
+        self._send_counter = 0
+        self._say_ids_seen = set()
+        self._say_lock = threading.Lock()
         self._requested_leave = False
         self._participant_names = {}
         self._active_participant_ids = set()
@@ -283,10 +297,37 @@ class NoAudioCallJoiner:
             if self.transcribe_enabled != next_transcribe:
                 self.transcribe_enabled = next_transcribe
                 self._set_transcription_enabled(self.transcribe_enabled)
+        self._poll_say_queue(meta)
         if changed:
             self._request_voice_state(self.channel_id)
             _update_call_meta_env(status="joined" if self.voice_ready else "joining", updated_at=time.time())
             print(f"Voice state: {'muted' if self.self_mute else 'unmuted'}/{'deafened' if self.self_deaf else 'undeafened'}", flush=True)
+
+    def _poll_say_queue(self, meta):
+        queue_items = meta.get("say_queue")
+        if not isinstance(queue_items, list) or not queue_items:
+            return
+        meta_path = os.environ.get(CALL_META_ENV)
+        pending = []
+        for item in queue_items:
+            if not isinstance(item, dict):
+                continue
+            request_id = str(item.get("id") or "")
+            path = str(item.get("path") or "")
+            if not request_id or request_id in self._say_ids_seen or not path:
+                continue
+            self._say_ids_seen.add(request_id)
+            pending.append((request_id, path))
+        if meta_path:
+            try:
+                current = json.loads(Path(meta_path).read_text())
+                current["say_queue"] = []
+                current["updated_at"] = time.time()
+                _write_call_meta(Path(meta_path), current)
+            except Exception:
+                pass
+        for request_id, path in pending:
+            threading.Thread(target=self._send_audio_file, daemon=True, args=(request_id, path)).start()
 
     # ─── App gateway ──────────────────────────────────────────────────────────
 
@@ -849,6 +890,12 @@ class NoAudioCallJoiner:
             except Exception:
                 pass
             self.voice_udp = None
+        self.voice_ssrc = None
+        self.voice_mode = None
+        self.voice_secret_key = None
+        self._send_sequence = random.randrange(0, 0x10000)
+        self._send_timestamp = random.randrange(0, 0x100000000)
+        self._send_counter = 0
         if stop_transcription and self._voice_transcription:
             try:
                 self._voice_transcription.stop()
@@ -909,6 +956,7 @@ class NoAudioCallJoiner:
             raise RuntimeError("Discord voice gateway sent incomplete UDP details")
         modes = [m for m in (data.get("modes") or []) if isinstance(m, str)]
         mode = _select_encryption_mode(modes)
+        self.voice_ssrc = int(ssrc)
         udp, address, discovered_port = _udp_discovery(ip, int(port), int(ssrc))
         udp.settimeout(0.5)
         self.voice_udp = udp
@@ -960,10 +1008,13 @@ class NoAudioCallJoiner:
         mode = data.get("mode")
         if not secret_key or not mode:
             return
+        self.voice_secret_key = bytes(secret_key)
+        self.voice_mode = str(mode)
         transcription = self._ensure_voice_transcription_object()
         if not transcription:
             return
         transcription.configure_media(udp=self.voice_udp, mode=str(mode), secret_key=bytes(secret_key))
+        transcription.set_self_ssrc(self.voice_ssrc)
         transcription.handle_session_description(data)
         transcription.set_enabled(self.transcribe_enabled)
         transcription.start()
@@ -999,6 +1050,157 @@ class NoAudioCallJoiner:
             self.voice_ws.send_binary(bytes([int(opcode) & 0xFF]) + bytes(payload))
         except Exception:
             pass
+
+    # ─── Outgoing one-shot audio ────────────────────────────────────────────────
+
+    def _send_audio_file(self, request_id, path):
+        with self._say_lock:
+            path = str(path)
+            try:
+                self._send_audio_file_locked(path)
+                print(f"Finished call audio send: {path}", flush=True)
+            except Exception as exc:
+                print(f"Failed to send call audio {path}: {exc}", flush=True)
+
+    def _send_audio_file_locked(self, path):
+        audio_path = Path(path).expanduser()
+        if not audio_path.exists() or not audio_path.is_file():
+            raise RuntimeError(f"audio file not found: {audio_path}")
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError("ffmpeg is required for discord call say")
+        if not self.voice_ready or not self.voice_udp or self.voice_ssrc is None or not self.voice_secret_key or not self.voice_mode:
+            raise RuntimeError("call is not voice-ready yet")
+        transcription = self._voice_transcription
+        if not transcription:
+            raise RuntimeError("voice media state is not initialized")
+        deadline = time.time() + 10
+        while self.running and time.time() < deadline and not transcription.can_encode_outgoing():
+            time.sleep(0.1)
+        if not transcription.can_encode_outgoing():
+            raise RuntimeError("DAVE encryption is not ready yet")
+
+        previous_mute = self.self_mute
+        if previous_mute:
+            self.self_mute = False
+            self._request_voice_state(self.channel_id)
+            _update_call_meta_env(self_mute=False, updated_at=time.time())
+            time.sleep(0.35)
+
+        relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        relay.settimeout(0.5)
+        relay.bind(("127.0.0.1", 0))
+        relay_port = relay.getsockname()[1]
+        proc = None
+        sent = 0
+        dropped = 0
+        stderr_chunks = []
+        try:
+            self._send_speaking(True)
+            proc = subprocess.Popen([
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-re",
+                "-i", str(audio_path),
+                "-vn",
+                "-ac", "1",
+                "-ar", "48000",
+                "-c:a", "libopus",
+                "-application", "voip",
+                "-frame_duration", "20",
+                "-payload_type", str(OPUS_PAYLOAD_TYPE),
+                "-f", "rtp",
+                f"rtp://127.0.0.1:{relay_port}",
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+            while self.running:
+                try:
+                    packet, _addr = relay.recvfrom(4096)
+                    if self._forward_outgoing_rtp_packet(packet, transcription):
+                        sent += 1
+                    else:
+                        dropped += 1
+                except socket.timeout:
+                    if proc.poll() is not None:
+                        break
+                if proc.poll() is not None:
+                    # Drain any packet already queued by ffmpeg before exiting.
+                    relay.settimeout(0.05)
+            if proc.stderr:
+                try:
+                    stderr_chunks.append(proc.stderr.read().decode("utf-8", errors="replace"))
+                except Exception:
+                    pass
+            code = proc.wait(timeout=2)
+            if code != 0:
+                raise RuntimeError(f"ffmpeg exited with {code}: {''.join(stderr_chunks).strip()}")
+            print(f"Sent call audio {audio_path} ({sent} RTP packet(s), {dropped} dropped).", flush=True)
+        finally:
+            self._send_speaking(False)
+            try:
+                relay.close()
+            except Exception:
+                pass
+            if proc and proc.poll() is None:
+                proc.terminate()
+            if previous_mute and self.running:
+                self.self_mute = True
+                self._request_voice_state(self.channel_id)
+                _update_call_meta_env(self_mute=True, updated_at=time.time())
+
+    def _forward_outgoing_rtp_packet(self, packet, transcription):
+        if len(packet) < 12 or packet[0] >> 6 != 2:
+            return False
+        csrc_count = packet[0] & 0x0F
+        has_extension = bool(packet[0] & 0x10)
+        payload_type = packet[1] & 0x7F
+        offset = 12 + csrc_count * 4
+        if len(packet) < offset or payload_type != OPUS_PAYLOAD_TYPE:
+            return False
+        if has_extension:
+            if len(packet) < offset + 4:
+                return False
+            offset += 4 + int.from_bytes(packet[offset + 2:offset + 4], "big") * 4
+        if len(packet) <= offset:
+            return False
+        opus_payload = packet[offset:]
+        encoded = transcription.encode_outgoing_opus(opus_payload)
+        if not encoded:
+            return False
+        sequence = self._send_sequence & 0xFFFF
+        timestamp = self._send_timestamp & 0xFFFFFFFF
+        header = bytearray(12)
+        header[0] = 0x80
+        header[1] = OPUS_PAYLOAD_TYPE
+        struct.pack_into("!HII", header, 2, sequence, timestamp, int(self.voice_ssrc))
+        self._send_sequence = (self._send_sequence + 1) & 0xFFFF
+        self._send_timestamp = (self._send_timestamp + 960) & 0xFFFFFFFF
+        self.voice_udp.send(self._encrypt_voice_transport(bytes(header), encoded))
+        return True
+
+    def _encrypt_voice_transport(self, header, payload):
+        if nacl is None:
+            raise RuntimeError("PyNaCl is required for Discord voice transport encryption")
+        counter = self._next_send_counter()
+        if self.voice_mode == "aead_aes256_gcm_rtpsize":
+            nonce = counter + (b"\x00" * 8)
+            encrypted = nacl.bindings.crypto_aead_aes256gcm_encrypt(bytes(payload), header, nonce, self.voice_secret_key)
+        elif self.voice_mode == "aead_xchacha20_poly1305_rtpsize":
+            nonce = counter + (b"\x00" * 20)
+            encrypted = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_encrypt(bytes(payload), header, nonce, self.voice_secret_key)
+        else:
+            raise RuntimeError(f"unsupported Discord voice encryption mode: {self.voice_mode}")
+        return header + encrypted + counter
+
+    def _next_send_counter(self):
+        self._send_counter = (self._send_counter + 1) & 0xFFFFFFFF
+        return struct.pack("!I", self._send_counter)
+
+    def _send_speaking(self, speaking):
+        if self.voice_ssrc is None:
+            return
+        self._send_voice({"op": 5, "d": {"speaking": 1 if speaking else 0, "delay": 0, "ssrc": int(self.voice_ssrc)}})
 
     def _close(self):
         if self._voice_transcription:
@@ -1553,6 +1755,45 @@ def _control_call_transcription(argv, *, default_value=None):
         print(f"Set {current.get('label') or channel_id} to {mute}/{deaf} {transcribe} (pid {current.get('pid')}).")
 
 
+def say(argv):
+    p = argparse.ArgumentParser(
+        prog="discord call say",
+        description="Play an audio file into an already-running detached Discord call.",
+    )
+    p.add_argument("audio_file", help="audio file to send (mp3/ogg/wav/etc.; decoded by ffmpeg)")
+    p.add_argument("target", nargs="?", help="optional active call channel ID / DM label when more than one call is active")
+    p.add_argument("-g", "--guild", "--server", dest="guild", help="Server name/ID for resolving a voice channel target")
+    p.add_argument("--dm", action="store_true", help="Resolve target as a DM/group DM")
+    args = p.parse_args(argv)
+    args.all = False
+
+    audio_path = Path(args.audio_file).expanduser().resolve()
+    if not audio_path.exists() or not audio_path.is_file():
+        raise SystemExit(f"Audio file not found: {audio_path}")
+    if not shutil.which("ffmpeg"):
+        raise SystemExit("ffmpeg is required for discord call say")
+
+    metas = _target_call_metas(args)
+    if not metas:
+        raise SystemExit("No active detached Discord call session. Join a call first with `discord call join ...`.")
+    if len(metas) > 1:
+        raise SystemExit("More than one detached call is active; pass the target/channel ID as the second argument.")
+
+    meta = metas[0]
+    if str(meta.get("status") or "") != "joined":
+        raise SystemExit(f"Call is not joined yet (status: {meta.get('status') or 'unknown'}). Try again once `discord call list` shows joined.")
+    channel_id = meta.get("channel_id")
+    paths = _call_paths(channel_id)
+    current = _read_call_meta(paths["meta"]) or meta
+    queue_items = current.get("say_queue") if isinstance(current.get("say_queue"), list) else []
+    request_id = str(uuid.uuid4())
+    queue_items.append({"id": request_id, "path": str(audio_path), "requested_at": time.time()})
+    current["say_queue"] = queue_items
+    _bump_control_seq(current)
+    _write_call_meta(paths["meta"], current)
+    print(f"Queued audio for {current.get('label') or channel_id}: {audio_path}")
+
+
 def _terminate_call_meta(meta, *, timeout=5):
     pid = int(meta["pid"])
     try:
@@ -1604,7 +1845,7 @@ def leave(argv):
 def dispatch(cmd, argv):
     if cmd in {"call", "voice"}:
         if not argv or argv[0] in {"-h", "--help", "help"}:
-            print("usage: discord call <start|join|leave|mute|unmute|deafen|undeafen|transcribe|segments|diagnose-audio|list> ...")
+            print("usage: discord call <start|join|say|leave|mute|unmute|deafen|undeafen|transcribe|segments|diagnose-audio|list> ...")
             print("  start <dm> [--dm] [--foreground] [--unmuted] [--deafened] [--no-transcribe] [--save-audio] [--notify-parent CONV_ID|--no-notify]")
             print("  join <target> [--dm|-g SERVER] [--foreground] [--unmuted] [--deafened] [--no-transcribe] [--save-audio] [--notify-parent CONV_ID|--no-notify]")
             print("  mute [target] [on|off|toggle] [--all]")
@@ -1612,6 +1853,7 @@ def dispatch(cmd, argv):
             print("  deafen [target] [on|off|toggle] [--all]        # also disables transcription")
             print("  undeafen [target] [--all]                      # also enables transcription")
             print("  transcribe [target] [on|off|toggle] [--all]")
+            print("  say <audio-file> [target]                         # requires an already-joined detached call")
             print("  segments [target] [-n LIMIT]")
             print("  diagnose-audio <segment.wav|segment.json|segment.packets.jsonl> [--no-variants]")
             print("  leave [target|--all]")
@@ -1636,6 +1878,8 @@ def dispatch(cmd, argv):
             return _control_call_transcription(rest)
         if subcmd in {"no-transcribe", "unlisten"}:
             return _control_call_transcription(rest, default_value=False)
+        if subcmd in {"say", "play", "send-audio"}:
+            return say(rest)
         if subcmd in {"segments", "clips", "audio", "recordings"}:
             return list_segments(rest)
         if subcmd in {"diagnose-audio", "diagnose", "analyze-audio", "analyse-audio"}:

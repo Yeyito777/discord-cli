@@ -295,6 +295,8 @@ class DavePassthroughDecryptor:
         self.known_user_ids = {self.user_id}
         self.ssrc_to_user_id = {}
         self.ssrc_to_decryptor = {}
+        self.self_ssrc = None
+        self.encryptor = dave.Encryptor() if dave is not None else None
         self.external_sender = None
         self.passthrough_count = 0
         self.decrypt_failure_count = 0
@@ -332,6 +334,12 @@ class DavePassthroughDecryptor:
         self.ssrc_to_user_id[ssrc] = user_id
         self.add_known_users([user_id])
         self._transition_decryptor(ssrc, user_id)
+
+    def set_self_ssrc(self, ssrc):
+        if ssrc is None:
+            return
+        self.self_ssrc = int(ssrc)
+        self._transition_encryptor()
 
     def handle_json_opcode(self, opcode, data):
         if opcode == 21:
@@ -400,6 +408,36 @@ class DavePassthroughDecryptor:
             self.report_error(f"DAVE decrypt returned encrypted-looking audio for SSRC {ssrc}; dropping packet")
             return None
         return bytes(decoded)
+
+    def encode_outgoing_opus(self, payload: bytes):
+        if payload == OPUS_SILENCE_FRAME:
+            return payload
+        if self.protocol_version <= 0:
+            return payload
+        if self.session is None or self.encryptor is None or self.self_ssrc is None:
+            return None
+        if not self.session.has_established_group():
+            return None
+        self._transition_encryptor()
+        try:
+            encoded = self.encryptor.encrypt(dave.MediaType.audio, int(self.self_ssrc), bytes(payload))
+        except Exception as exc:
+            self.report_error(f"DAVE encrypt failed for SSRC {self.self_ssrc}: {exc}")
+            return None
+        return bytes(encoded) if encoded is not None else None
+
+    def can_encode_outgoing(self) -> bool:
+        if self.protocol_version <= 0:
+            return True
+        if self.session is None or self.encryptor is None or self.self_ssrc is None:
+            return False
+        if not self.session.has_established_group():
+            return False
+        self._transition_encryptor()
+        try:
+            return bool(self.encryptor.has_key_ratchet())
+        except Exception:
+            return False
 
     def handle_prepare_transition(self, data: dict):
         if not isinstance(data, dict):
@@ -506,6 +544,22 @@ class DavePassthroughDecryptor:
     def update_ratchets(self):
         for ssrc, user_id in list(self.ssrc_to_user_id.items()):
             self._transition_decryptor(ssrc, user_id)
+        self._transition_encryptor()
+
+    def _transition_encryptor(self):
+        if self.session is None or self.encryptor is None or dave is None or self.self_ssrc is None:
+            return
+        try:
+            ratchet = self.session.get_key_ratchet(str(self.user_id))
+        except Exception:
+            ratchet = None
+        if ratchet is None:
+            return
+        try:
+            self.encryptor.set_key_ratchet(ratchet)
+            self.encryptor.assign_ssrc_to_codec(int(self.self_ssrc), dave.Codec.opus)
+        except Exception as exc:
+            self.report_error(f"DAVE encryptor ratchet transition failed: {exc}")
 
     def _transition_decryptor(self, ssrc: int, user_id: str):
         if self.session is None or dave is None:
@@ -536,6 +590,7 @@ class DavePassthroughDecryptor:
             group_id=int(self.channel_id),
             self_user_id=str(self.user_id),
         )
+        self._transition_encryptor()
 
     def report_error(self, message: str):
         if self.on_error:
@@ -1378,6 +1433,15 @@ class VoiceReceiveTranscription:
     def set_active_remote_users(self, user_ids):
         self.fallback_user_ids = {str(user_id) for user_id in (user_ids or []) if user_id is not None and str(user_id) != self.self_user_id}
         self.dave.add_known_users(self.fallback_user_ids)
+
+    def set_self_ssrc(self, ssrc):
+        self.dave.set_self_ssrc(ssrc)
+
+    def encode_outgoing_opus(self, payload: bytes):
+        return self.dave.encode_outgoing_opus(payload)
+
+    def can_encode_outgoing(self) -> bool:
+        return self.dave.can_encode_outgoing()
 
     def add_ssrc_mapping(self, ssrc, user_id):
         if ssrc is None or user_id is None:
