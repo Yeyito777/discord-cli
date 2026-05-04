@@ -94,7 +94,7 @@ case "$cmd" in
     send|reply|edit|delete|del|react|unreact)
         exec "$PYTHON" -c "import sys; from src.writing import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     call|voice|join-call)
-        exec "$PYTHON" -c "import sys; from src.calling import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
+        exec "$PYTHON" -c "import sys; from src.calls.cli import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     listen|unlisten|listeners)
         exec "$PYTHON" -c "import sys; from src.listening import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     notify)

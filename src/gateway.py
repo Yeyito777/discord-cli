@@ -25,6 +25,8 @@ from pathlib import Path
 
 import websocket
 
+from src.calls.state import call_paths, read_call_meta
+
 # ─── Client fingerprint (matches api.py) ─────────────────────────────────────
 
 _CLIENT_VERSION = "0.0.115"
@@ -42,7 +44,6 @@ DEFAULT_CAPABILITIES = 30717
 NOTIFY_LISTENER_DIR = Path("/tmp/discord-listeners")
 NOTIFY_LOCK_PATH = NOTIFY_LISTENER_DIR / "__notify__.lock"
 NOTIFY_PID_PATH = NOTIFY_LISTENER_DIR / "__notify__.pid"
-CALL_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "discord-cli" / "calls"
 RELAY_SEEN_LIMIT = 200
 
 # ─── Build number ────────────────────────────────────────────────────────────
@@ -624,20 +625,7 @@ class GatewayListener:
             self._queue_relay(notif)
 
     def _active_call_meta(self, channel_id):
-        path = CALL_STATE_DIR / f"{re.sub(r'[^A-Za-z0-9_.-]+', '_', str(channel_id))}.json"
-        try:
-            meta = json.loads(path.read_text())
-            pid = int(meta.get("pid"))
-            os.kill(pid, 0)
-            try:
-                stat = Path(f"/proc/{pid}/stat").read_text()
-                if ") Z" in stat:
-                    return None
-            except Exception:
-                pass
-            return meta
-        except Exception:
-            return None
+        return read_call_meta(call_paths(channel_id)["meta"])
 
     def _call_caller_name(self, ringing, voice_state_user_ids, priv):
         # Prefer the non-self participant username/display name from channel metadata.
