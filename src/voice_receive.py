@@ -412,32 +412,14 @@ class DavePassthroughDecryptor:
     def encode_outgoing_opus(self, payload: bytes):
         if payload == OPUS_SILENCE_FRAME:
             return payload
-        if self.protocol_version <= 0:
-            return payload
-        if self.session is None or self.encryptor is None or self.self_ssrc is None:
-            return None
-        if not self.session.has_established_group():
-            return None
-        self._transition_encryptor()
-        try:
-            encoded = self.encryptor.encrypt(dave.MediaType.audio, int(self.self_ssrc), bytes(payload))
-        except Exception as exc:
-            self.report_error(f"DAVE encrypt failed for SSRC {self.self_ssrc}: {exc}")
-            return None
-        return bytes(encoded) if encoded is not None else None
+        # One-shot `discord call say` playback deliberately sends plaintext Opus
+        # inside Discord's normal transport encryption. Record currently uses
+        # davey and drops packets encrypted by dave-py's outgoing Encryptor; its
+        # receive path already supports passthrough recovery for plaintext Opus.
+        return payload
 
     def can_encode_outgoing(self) -> bool:
-        if self.protocol_version <= 0:
-            return True
-        if self.session is None or self.encryptor is None or self.self_ssrc is None:
-            return False
-        if not self.session.has_established_group():
-            return False
-        self._transition_encryptor()
-        try:
-            return bool(self.encryptor.has_key_ratchet())
-        except Exception:
-            return False
+        return True
 
     def handle_prepare_transition(self, data: dict):
         if not isinstance(data, dict):
