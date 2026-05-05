@@ -32,6 +32,8 @@ from src.calls.receive import diagnose_saved_voice_segment
 from src.calls.worker import NoAudioCallJoiner
 from src.private_channels import private_channel_label_for_type, private_channel_name, private_channel_type
 
+PROJECT_DIR = Path(__file__).resolve().parents[2]
+
 
 def _resolve_call_target(args):
     ch = _resolve_call_channel(args)
