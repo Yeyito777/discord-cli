@@ -109,7 +109,7 @@ def _timing_delta_ms(start, end=None):
 
 
 class NoAudioCallJoiner:
-    def __init__(self, channel_id, *, guild_id=None, label=None, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True, save_audio=False, audio_dir=None):
+    def __init__(self, channel_id, *, guild_id=None, label=None, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True, save_audio=False, audio_dir=None, notify_audio_state=False):
         self.channel_id = channel_id
         self.guild_id = guild_id
         self.label = label or channel_id
@@ -118,6 +118,7 @@ class NoAudioCallJoiner:
         self.transcribe_enabled = bool(transcribe and not self_deaf)
         self.save_audio = bool(save_audio)
         self.audio_dir = str(audio_dir) if audio_dir else None
+        self.notify_audio_state = bool(notify_audio_state)
         self.ring_recipient_ids = [str(user_id) for user_id in (ring_recipient_ids or []) if user_id]
         self.token = get_token()
 
@@ -501,7 +502,7 @@ class NoAudioCallJoiner:
                 elif key == "deafened":
                     changes.append("deafened" if value else "undeafened")
         self._participant_audio_states[user_id] = current
-        if changes:
+        if changes and self.notify_audio_state:
             self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} {' and '.join(changes)} in {self.label}")
 
     def _handle_voice_state_update(self, data):
