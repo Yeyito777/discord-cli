@@ -45,8 +45,8 @@ OPUS_PAYLOAD_TYPE = 120
 RTP_HEADER_LENGTH = 12
 TRANSCRIBE_WORKERS = 2
 DEFAULT_SPEECH_START_THRESHOLD_DB = -42.0
-DEFAULT_SPEECH_STOP_THRESHOLD_DB = -55.0
-DEFAULT_SILENCE_MS = 1500
+DEFAULT_SPEECH_STOP_THRESHOLD_DB = DEFAULT_SPEECH_START_THRESHOLD_DB
+DEFAULT_SILENCE_MS = 1000
 DEFAULT_MIN_SPEECH_MS = 450
 DEFAULT_MAX_SEGMENT_MS = 0
 DEFAULT_PRE_ROLL_MS = 250
@@ -784,7 +784,8 @@ class SpeakerSegmenter:
         legacy_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_THRESHOLD_DB", DEFAULT_SPEECH_START_THRESHOLD_DB)
         record_threshold_db = env_float("RECORD_VOICE_SPEAKING_THRESHOLD_DB", legacy_threshold_db)
         self.start_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_START_THRESHOLD_DB", record_threshold_db)
-        self.stop_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_STOP_THRESHOLD_DB", self.start_threshold_db)
+        default_stop_threshold_db = env_float("RECORD_VOICE_SPEAKING_STOP_THRESHOLD_DB", DEFAULT_SPEECH_STOP_THRESHOLD_DB)
+        self.stop_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_STOP_THRESHOLD_DB", default_stop_threshold_db)
         if self.stop_threshold_db > self.start_threshold_db:
             self.stop_threshold_db = self.start_threshold_db
         self.start_threshold = db_to_linear(self.start_threshold_db)
@@ -835,8 +836,8 @@ class SpeakerSegmenter:
             self.frames.extend(pcm)
             self.packet_trace.append(packet_info)
             current_len_seconds = len(self.frames) / (self.sample_rate * self.channels * 2)
-            if self.silence_seconds_seen >= self.silence_seconds and self.speech_seconds >= self.min_speech_seconds:
-                self.finalize()
+            if self.silence_seconds_seen >= self.silence_seconds:
+                self.finish_or_discard()
             elif self.max_segment_seconds > 0 and current_len_seconds >= self.max_segment_seconds:
                 self.finalize()
         else:
@@ -846,7 +847,15 @@ class SpeakerSegmenter:
 
     def flush_if_stale(self, stale_after=2.5):
         if self.active and time.time() - self.last_audio_at >= stale_after:
+            self.finish_or_discard()
+
+    def finish_or_discard(self):
+        if not self.active:
+            return
+        if self.speech_seconds >= self.min_speech_seconds:
             self.finalize()
+        else:
+            self._reset_segment()
 
     def finalize(self):
         if not self.active:
@@ -859,16 +868,7 @@ class SpeakerSegmenter:
         speech_ended_at = self.last_speech_at or finalized_at
         duration_seconds = len(frames) / (self.sample_rate * self.channels * 2) if frames else 0.0
         packet_trace = self.packet_trace.snapshot()
-        self.active = False
-        self.frames = bytearray()
-        self.speech_seconds = 0.0
-        self.silence_seconds_seen = 0.0
-        self.segment_started_at = 0.0
-        self.last_speech_at = 0.0
-        self.max_rms = 0.0
-        self.packet_trace.clear()
-        self.pre_roll.clear()
-        self.pre_roll_packet_trace.clear()
+        self._reset_segment()
         if speech_seconds < self.min_speech_seconds:
             return
         self.submit_segment(self.user_id, self.name_for_user(self.user_id), frames, self.sample_rate, self.channels, {
@@ -880,6 +880,18 @@ class SpeakerSegmenter:
             "max_db": 20 * math.log10(max_rms) if max_rms > 0 else -math.inf,
             "packet_trace": packet_trace,
         })
+
+    def _reset_segment(self):
+        self.active = False
+        self.frames = bytearray()
+        self.speech_seconds = 0.0
+        self.silence_seconds_seen = 0.0
+        self.segment_started_at = 0.0
+        self.last_speech_at = 0.0
+        self.max_rms = 0.0
+        self.packet_trace.clear()
+        self.pre_roll.clear()
+        self.pre_roll_packet_trace.clear()
 
 
 class VoiceTranscriber:
