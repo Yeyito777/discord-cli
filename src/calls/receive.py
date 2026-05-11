@@ -44,14 +44,15 @@ except Exception:  # pragma: no cover - depends on deployment venv
 OPUS_PAYLOAD_TYPE = 120
 RTP_HEADER_LENGTH = 12
 TRANSCRIBE_WORKERS = 2
-DEFAULT_SPEECH_START_THRESHOLD_DB = -40.0
-DEFAULT_SPEECH_STOP_THRESHOLD_DB = -40.0
-DEFAULT_SILENCE_MS = 700
+DEFAULT_SPEECH_START_THRESHOLD_DB = -42.0
+DEFAULT_SPEECH_STOP_THRESHOLD_DB = -48.0
+DEFAULT_SILENCE_MS = 1000
 DEFAULT_MIN_SPEECH_MS = 450
 DEFAULT_MAX_SEGMENT_MS = 0
 DEFAULT_PRE_ROLL_MS = 250
 DEFAULT_MAX_QUEUE = 24
 DEFAULT_JITTER_PACKETS = 12
+DEFAULT_JITTER_RESYNC_GAP = 120
 OPUS_SAMPLE_RATE = 48_000
 TRANSCRIBE_SAMPLE_RATE = 16_000
 OPUS_FRAME_SAMPLES = 960  # 20 ms at 48 kHz.
@@ -377,9 +378,15 @@ class DavePassthroughDecryptor:
         if self.protocol_version <= 0:
             return payload
         if self.session is None:
-            return None
+            if is_dave_encrypted_payload(payload):
+                return None
+            self.passthrough_count += 1
+            return payload
         if not self.session.has_established_group():
-            return None
+            if is_dave_encrypted_payload(payload):
+                return None
+            self.passthrough_count += 1
+            return payload
         decryptor = self.ssrc_to_decryptor.get(int(ssrc))
         if decryptor is None:
             user_id = self.ssrc_to_user_id.get(int(ssrc))
@@ -583,11 +590,17 @@ def sequence_distance(seq: int, expected: int) -> int:
     return ((int(seq) - int(expected) + 32768) & 0xFFFF) - 32768
 
 
+def sequence_forward_distance(seq: int, expected: int) -> int:
+    return (int(seq) - int(expected)) & 0xFFFF
+
+
 class RtpJitterBuffer:
-    def __init__(self, *, max_packets: int = DEFAULT_JITTER_PACKETS):
+    def __init__(self, *, max_packets: int = DEFAULT_JITTER_PACKETS, max_resync_gap: int = DEFAULT_JITTER_RESYNC_GAP):
         self.max_packets = max(0, int(max_packets))
+        self.max_resync_gap = max(0, int(max_resync_gap))
         self.expected = None
         self.buffer = {}
+        self.resync_count = 0
 
     def add(self, sequence: int, item):
         sequence = int(sequence) & 0xFFFF
@@ -607,6 +620,17 @@ class RtpJitterBuffer:
             if payload is None:
                 if self.max_packets <= 0 or len(self.buffer) <= self.max_packets:
                     break
+                next_sequence = min(self.buffer, key=lambda seq: sequence_forward_distance(seq, self.expected))
+                gap = sequence_forward_distance(next_sequence, self.expected)
+                if self.max_resync_gap > 0 and gap > self.max_resync_gap:
+                    # Large jumps happen at join/DAVE transition boundaries and
+                    # after Discord drops idle/DTX packets.  Backfilling the whole
+                    # gap with PLC creates seconds of synthetic silence, delaying
+                    # or suppressing the real speech segment.  Treat those jumps
+                    # as a stream boundary instead of as thousands of lost frames.
+                    self.expected = next_sequence
+                    self.resync_count += 1
+                    continue
                 # Give up on one missing packet and let the decoder perform PLC.
                 ready.append(None)
             else:
@@ -1511,8 +1535,16 @@ class VoiceReceiveTranscription:
                     f"dave_padding_trim={self.dave.padding_trim_count}/{self.dave.padding_trim_bytes}B "
                     f"post_dave_opus={self.post_dave_opus_valid_count}/{self.post_dave_opus_invalid_count} "
                     f"frames={self.decode_frame_count} decode_errors={self.decode_error_count} "
-                    f"jitter_missing={self.jitter_missing_count} speakers={len(self.segmenters)} ssrcs={len(self.ssrc_to_user_id)}"
+                    f"jitter_missing={self.jitter_missing_count} "
+                    f"jitter_resync={self._pre_dave_jitter_resync_count()}/{self._post_dave_jitter_resync_count()} "
+                    f"speakers={len(self.segmenters)} ssrcs={len(self.ssrc_to_user_id)}"
                 )
+
+    def _pre_dave_jitter_resync_count(self) -> int:
+        return sum(getattr(jitter, "resync_count", 0) for jitter in self.pre_dave_jitter_buffers.values())
+
+    def _post_dave_jitter_resync_count(self) -> int:
+        return sum(getattr(jitter, "resync_count", 0) for jitter in self.jitter_buffers.values())
 
     def _handle_packet(self, packet: bytes):
         parsed = parse_rtp_packet(packet)
@@ -1545,7 +1577,10 @@ class VoiceReceiveTranscription:
             return
         jitter = self.pre_dave_jitter_buffers.get(user_id)
         if jitter is None:
-            jitter = RtpJitterBuffer(max_packets=env_int("DISCORD_CALL_TRANSCRIBE_PRE_DAVE_JITTER_PACKETS", DEFAULT_JITTER_PACKETS))
+            jitter = RtpJitterBuffer(
+                max_packets=env_int("DISCORD_CALL_TRANSCRIBE_PRE_DAVE_JITTER_PACKETS", DEFAULT_JITTER_PACKETS),
+                max_resync_gap=env_int("DISCORD_CALL_TRANSCRIBE_JITTER_RESYNC_GAP", DEFAULT_JITTER_RESYNC_GAP),
+            )
             self.pre_dave_jitter_buffers[user_id] = jitter
         for item in jitter.add(parsed["sequence"], (dict(parsed), payload)):
             self._handle_ordered_pre_dave_item(user_id, item)
@@ -1564,7 +1599,10 @@ class VoiceReceiveTranscription:
         payload = self.dave.decode_incoming_opus(parsed["ssrc"], payload)
         jitter = self.jitter_buffers.get(user_id)
         if jitter is None:
-            jitter = RtpJitterBuffer(max_packets=env_int("DISCORD_CALL_TRANSCRIBE_JITTER_PACKETS", DEFAULT_JITTER_PACKETS))
+            jitter = RtpJitterBuffer(
+                max_packets=env_int("DISCORD_CALL_TRANSCRIBE_JITTER_PACKETS", DEFAULT_JITTER_PACKETS),
+                max_resync_gap=env_int("DISCORD_CALL_TRANSCRIBE_JITTER_RESYNC_GAP", DEFAULT_JITTER_RESYNC_GAP),
+            )
             self.jitter_buffers[user_id] = jitter
         if not payload:
             self.dave_drop_count += 1
