@@ -47,9 +47,9 @@ TRANSCRIBE_WORKERS = 2
 # Coupled with Record's call-widget speaking gate.  If this transcription
 # start/stop/idle logic changes, mirror the intent in:
 # /home/yeyito/Workspace/active-development/record/src/voice/audio-ffmpeg.ts
-DEFAULT_SPEECH_START_THRESHOLD_DB = -50.0
-DEFAULT_SPEECH_STOP_THRESHOLD_DB = DEFAULT_SPEECH_START_THRESHOLD_DB
-DEFAULT_SILENCE_MS = 1000
+DEFAULT_SPEECH_START_THRESHOLD_DB = -42.0
+DEFAULT_SPEECH_STOP_THRESHOLD_DB = -55.0
+DEFAULT_SILENCE_MS = 1500
 DEFAULT_MIN_SPEECH_MS = 450
 DEFAULT_MAX_SEGMENT_MS = 0
 DEFAULT_PRE_ROLL_MS = 250
@@ -809,6 +809,15 @@ class SpeakerSegmenter:
         self.last_speech_at = 0.0
         self.max_rms = 0.0
         self.last_audio_at = time.time()
+        self.external_speaking = False
+
+    def set_external_speaking(self, speaking: bool):
+        self.external_speaking = bool(speaking)
+        if not self.external_speaking:
+            # Remote Discord SPEAKING=false is emitted by Record only after its
+            # own idle hold has expired, so close immediately instead of adding
+            # another transcription-side hold and delaying the transcript.
+            self.finish_or_discard()
 
     def add_pcm(self, pcm: bytes, duration: float, packet_info: dict | None = None):
         now = time.time()
@@ -819,7 +828,7 @@ class SpeakerSegmenter:
         # Keep this start/stop hysteresis aligned with Record's
         # FfmpegRtpVoiceAudioBackend so Exo's transcription gate and Record's
         # green talking state behave similarly for the same audio.
-        speaking = rms >= (self.stop_threshold if self.active else self.start_threshold)
+        speaking = self.external_speaking or rms >= (self.stop_threshold if self.active else self.start_threshold)
         if speaking:
             if not self.active:
                 self.active = True
@@ -1383,6 +1392,7 @@ class VoiceReceiveTranscription:
         self.resamplers = {}
         self.pre_dave_jitter_buffers = {}
         self.jitter_buffers = {}
+        self.user_speaking_state = {}
         self.jitter_missing_count = 0
         self.packet_count = 0
         self.unknown_ssrc_count = 0
@@ -1457,6 +1467,17 @@ class VoiceReceiveTranscription:
     def set_active_remote_users(self, user_ids):
         self.fallback_user_ids = {str(user_id) for user_id in (user_ids or []) if user_id is not None and str(user_id) != self.self_user_id}
         self.dave.add_known_users(self.fallback_user_ids)
+
+    def set_user_speaking(self, user_id, speaking):
+        if user_id is None or str(user_id) == self.self_user_id:
+            return
+        user_id = str(user_id)
+        self.user_speaking_state[user_id] = bool(speaking)
+        self.fallback_user_ids.add(user_id)
+        self.dave.add_known_users([user_id])
+        segmenter = self.segmenters.get(user_id)
+        if segmenter:
+            segmenter.set_external_speaking(bool(speaking))
 
     def set_self_ssrc(self, ssrc):
         self.dave.set_self_ssrc(ssrc)
@@ -1555,7 +1576,8 @@ class VoiceReceiveTranscription:
                     f"frames={self.decode_frame_count} decode_errors={self.decode_error_count} "
                     f"jitter_missing={self.jitter_missing_count} "
                     f"jitter_resync={self._pre_dave_jitter_resync_count()}/{self._post_dave_jitter_resync_count()} "
-                    f"speakers={len(self.segmenters)} ssrcs={len(self.ssrc_to_user_id)}"
+                    f"speakers={len(self.segmenters)} remote_speaking={sum(1 for value in self.user_speaking_state.values() if value)} "
+                    f"ssrcs={len(self.ssrc_to_user_id)}"
                 )
 
     def _pre_dave_jitter_resync_count(self) -> int:
@@ -1734,6 +1756,7 @@ class VoiceReceiveTranscription:
         segmenter = self.segmenters.get(user_id)
         if segmenter is None:
             segmenter = SpeakerSegmenter(user_id, self.name_for_user, self.transcriber.submit, sample_rate=sample_rate, channels=channels)
+            segmenter.set_external_speaking(self.user_speaking_state.get(str(user_id), False))
             self.segmenters[user_id] = segmenter
         segmenter.add_pcm(pcm, duration, packet_info=packet_info)
 

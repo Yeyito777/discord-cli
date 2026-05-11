@@ -159,6 +159,7 @@ class NoAudioCallJoiner:
         self._control_seq = 0
         self._voice_transcription = None
         self._ssrc_cache = []
+        self._speaking_cache = {}
         self._pending_voice_session_description = None
 
     def run(self):
@@ -943,6 +944,8 @@ class NoAudioCallJoiner:
         for ssrc, user_id in self._ssrc_cache:
             self._voice_transcription.add_ssrc_mapping(ssrc, user_id)
         self._ssrc_cache.clear()
+        for user_id, speaking in self._speaking_cache.items():
+            self._voice_transcription.set_user_speaking(user_id, speaking)
         return self._voice_transcription
 
     def _ensure_voice_transcription(self):
@@ -969,11 +972,14 @@ class NoAudioCallJoiner:
             return
         user_id = data.get("user_id")
         ssrc = data.get("ssrc")
+        speaking = bool(int(data.get("speaking") or 0))
         if user_id is None or ssrc is None:
             return
         item = (int(ssrc), str(user_id))
+        self._speaking_cache[str(user_id)] = speaking
         if self._voice_transcription:
             self._voice_transcription.add_ssrc_mapping(*item)
+            self._voice_transcription.set_user_speaking(str(user_id), speaking)
         else:
             self._ssrc_cache.append(item)
 
