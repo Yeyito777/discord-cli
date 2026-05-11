@@ -44,6 +44,9 @@ except Exception:  # pragma: no cover - depends on deployment venv
 OPUS_PAYLOAD_TYPE = 120
 RTP_HEADER_LENGTH = 12
 TRANSCRIBE_WORKERS = 2
+# Coupled with Record's call-widget speaking gate.  If this transcription
+# start/stop/idle logic changes, mirror the intent in:
+# /home/yeyito/Workspace/active-development/record/src/voice/audio-ffmpeg.ts
 DEFAULT_SPEECH_START_THRESHOLD_DB = -42.0
 DEFAULT_SPEECH_STOP_THRESHOLD_DB = DEFAULT_SPEECH_START_THRESHOLD_DB
 DEFAULT_SILENCE_MS = 1000
@@ -813,6 +816,9 @@ class SpeakerSegmenter:
         rms = pcm16_rms(pcm)
         if rms > self.max_rms:
             self.max_rms = rms
+        # Keep this start/stop hysteresis aligned with Record's
+        # FfmpegRtpVoiceAudioBackend so Exo's transcription gate and Record's
+        # green talking state behave similarly for the same audio.
         speaking = rms >= (self.stop_threshold if self.active else self.start_threshold)
         if speaking:
             if not self.active:
