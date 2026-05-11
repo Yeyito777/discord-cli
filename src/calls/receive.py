@@ -809,11 +809,18 @@ class SpeakerSegmenter:
         self.last_speech_at = 0.0
         self.max_rms = 0.0
         self.last_audio_at = time.time()
-        self.external_speaking = False
+        self.external_speaking_start_pending = False
 
     def set_external_speaking(self, speaking: bool):
-        self.external_speaking = bool(speaking)
-        if not self.external_speaking:
+        if speaking:
+            # Discord/Record SPEAKING=true is a start hint, not a sticky gate.
+            # In practice Discord does not always relay SPEAKING=false, so if we
+            # treat true as persistent the segment can stay open forever.  Use it
+            # to force segment start, then let decoded audio hysteresis/silence
+            # close the segment; an explicit false still closes immediately.
+            self.external_speaking_start_pending = True
+        else:
+            self.external_speaking_start_pending = False
             # Remote Discord SPEAKING=false is emitted by Record only after its
             # own idle hold has expired, so close immediately instead of adding
             # another transcription-side hold and delaying the transcript.
@@ -828,7 +835,10 @@ class SpeakerSegmenter:
         # Keep this start/stop hysteresis aligned with Record's
         # FfmpegRtpVoiceAudioBackend so Exo's transcription gate and Record's
         # green talking state behave similarly for the same audio.
-        speaking = self.external_speaking or rms >= (self.stop_threshold if self.active else self.start_threshold)
+        external_start = self.external_speaking_start_pending and not self.active
+        if external_start:
+            self.external_speaking_start_pending = False
+        speaking = external_start or rms >= (self.stop_threshold if self.active else self.start_threshold)
         if speaking:
             if not self.active:
                 self.active = True
@@ -898,6 +908,7 @@ class SpeakerSegmenter:
 
     def _reset_segment(self):
         self.active = False
+        self.external_speaking_start_pending = False
         self.frames = bytearray()
         self.speech_seconds = 0.0
         self.silence_seconds_seen = 0.0
@@ -1576,7 +1587,8 @@ class VoiceReceiveTranscription:
                     f"frames={self.decode_frame_count} decode_errors={self.decode_error_count} "
                     f"jitter_missing={self.jitter_missing_count} "
                     f"jitter_resync={self._pre_dave_jitter_resync_count()}/{self._post_dave_jitter_resync_count()} "
-                    f"speakers={len(self.segmenters)} remote_speaking={sum(1 for value in self.user_speaking_state.values() if value)} "
+                    f"speakers={len(self.segmenters)} active_segments={sum(1 for segmenter in self.segmenters.values() if segmenter.active)} "
+                    f"remote_speaking={sum(1 for value in self.user_speaking_state.values() if value)} "
                     f"ssrcs={len(self.ssrc_to_user_id)}"
                 )
 
