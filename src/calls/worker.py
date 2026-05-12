@@ -33,7 +33,7 @@ VOICE_CONNECT_TIMEOUT = 20
 VOICE_GATEWAY_RECONNECT_DELAY = 1.0
 VOICE_GATEWAY_RECONNECT_MAX_DELAY = 30.0
 VOICE_GATEWAY_APP_RECONNECT_EVERY = 3
-VOICE_GATEWAY_RECOVERABLE_CLOSE_CODES = {4006, 4009, 4015}
+VOICE_GATEWAY_RECOVERABLE_CLOSE_CODES = {1006, 4006, 4009, 4015}
 VOICE_GATEWAY_TERMINAL_CLOSE_CODES = {4014, 4022}
 DAVE_PROTOCOL_VERSION = 1
 
@@ -230,6 +230,8 @@ class NoAudioCallJoiner:
             next_mute = bool(meta.get("self_mute"))
             if self.self_mute != next_mute:
                 self.self_mute = next_mute
+                if self.self_mute:
+                    self._send_speaking(False)
                 changed = True
         if "self_deaf" in meta:
             next_deaf = bool(meta.get("self_deaf"))
@@ -797,6 +799,8 @@ class NoAudioCallJoiner:
             or "session is no longer valid" in reason
             or "invalidated" in reason
             or "server crashed" in reason
+            or "connection ended" in reason
+            or "abnormal" in reason
         )
 
     def _is_terminal_voice_gateway_close(self, code, reason):

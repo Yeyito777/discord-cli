@@ -415,7 +415,10 @@ class DavePassthroughDecryptor:
             return payload
         if is_dave_encrypted_payload(decoded):
             self.encrypted_drop_count += 1
-            self.report_error(f"DAVE decrypt returned encrypted-looking audio for SSRC {ssrc}; dropping packet")
+            # This happens during Discord/DAVE transition windows when a packet
+            # is still encrypted/padded after the current decryptor ratchet. It
+            # is accounted for in periodic stats as dave_encrypted_drop; do not
+            # print one line per packet into the live call log.
             return None
         return bytes(decoded)
 
