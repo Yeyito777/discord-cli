@@ -982,8 +982,8 @@ class NoAudioCallJoiner:
         item = (int(ssrc), str(user_id))
         self._speaking_cache[str(user_id)] = speaking
         if self._voice_transcription:
-            self._voice_transcription.add_ssrc_mapping(*item)
             self._voice_transcription.set_user_speaking(str(user_id), speaking)
+            self._voice_transcription.add_ssrc_mapping(*item)
         else:
             self._ssrc_cache.append(item)
 
