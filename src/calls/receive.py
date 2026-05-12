@@ -56,6 +56,7 @@ DEFAULT_PRE_ROLL_MS = 250
 DEFAULT_MAX_QUEUE = 24
 DEFAULT_JITTER_PACKETS = 12
 DEFAULT_JITTER_RESYNC_GAP = 120
+DEFAULT_UNKNOWN_SSRC_BUFFER_PACKETS = 750
 OPUS_SAMPLE_RATE = 48_000
 TRANSCRIBE_SAMPLE_RATE = 16_000
 OPUS_FRAME_SAMPLES = 960  # 20 ms at 48 kHz.
@@ -1401,6 +1402,8 @@ class VoiceReceiveTranscription:
         self.thread = None
         self.ssrc_to_user_id = {}
         self.fallback_user_ids = set()
+        self.unknown_ssrc_buffers = {}
+        self.unknown_ssrc_buffer_limit = env_int("DISCORD_CALL_TRANSCRIBE_UNKNOWN_SSRC_BUFFER_PACKETS", DEFAULT_UNKNOWN_SSRC_BUFFER_PACKETS)
         self.segmenters = {}
         self.decoders = {}
         self.resamplers = {}
@@ -1410,6 +1413,9 @@ class VoiceReceiveTranscription:
         self.jitter_missing_count = 0
         self.packet_count = 0
         self.unknown_ssrc_count = 0
+        self.unknown_ssrc_buffered_count = 0
+        self.unknown_ssrc_replayed_count = 0
+        self.unknown_ssrc_dropped_count = 0
         self.self_packet_count = 0
         self.transport_decrypt_fail_count = 0
         self.extension_packet_count = 0
@@ -1519,6 +1525,8 @@ class VoiceReceiveTranscription:
         self.dave.add_ssrc_mapping(ssrc, user_id)
         if previous != user_id:
             self.log(f"Voice transcription mapped SSRC {ssrc} to {self.name_for_user(user_id)}")
+        if previous != user_id:
+            self._drain_unknown_ssrc_buffer(ssrc, user_id)
 
     def remove_user(self, user_id):
         user_id = str(user_id)
@@ -1587,6 +1595,7 @@ class VoiceReceiveTranscription:
             if self.packet_count or self.decrypt_count or self.decode_frame_count or self.ssrc_to_user_id:
                 self.log(
                     f"Voice transcription stats: packets={self.packet_count} unknown_ssrc={self.unknown_ssrc_count} "
+                    f"unknown_buffered={self.unknown_ssrc_buffered_count}/{self.unknown_ssrc_replayed_count}/{self.unknown_ssrc_dropped_count} "
                     f"self={self.self_packet_count} transport_fail={self.transport_decrypt_fail_count} "
                     f"ext={self.extension_packet_count}/{self.extension_bytes_total}B decrypted={self.decrypt_count} "
                     f"pre_dave_opus={self.pre_dave_opus_valid_count}/{self.pre_dave_opus_invalid_count} "
@@ -1620,7 +1629,35 @@ class VoiceReceiveTranscription:
             self.log(f"Voice transcription inferred SSRC {parsed['ssrc']} for {self.name_for_user(user_id)}")
         if not user_id:
             self.unknown_ssrc_count += 1
+            self._buffer_unknown_ssrc_packet(parsed, packet)
             return
+        self._handle_mapped_packet(parsed, packet, user_id)
+
+    def _buffer_unknown_ssrc_packet(self, parsed: dict, packet: bytes):
+        if self.unknown_ssrc_buffer_limit <= 0:
+            return
+        ssrc = int(parsed["ssrc"])
+        buffer = self.unknown_ssrc_buffers.get(ssrc)
+        if buffer is None:
+            buffer = deque(maxlen=self.unknown_ssrc_buffer_limit)
+            self.unknown_ssrc_buffers[ssrc] = buffer
+        before = len(buffer)
+        buffer.append((dict(parsed), bytes(packet)))
+        self.unknown_ssrc_buffered_count += 1
+        if len(buffer) == before:
+            self.unknown_ssrc_dropped_count += 1
+
+    def _drain_unknown_ssrc_buffer(self, ssrc: int, user_id: str):
+        buffer = self.unknown_ssrc_buffers.pop(int(ssrc), None)
+        if not buffer:
+            return
+        count = len(buffer)
+        self.unknown_ssrc_replayed_count += count
+        self.log(f"Voice transcription replaying {count} buffered packet(s) for {self.name_for_user(user_id)} after SSRC {ssrc} mapping")
+        for parsed, packet in buffer:
+            self._handle_mapped_packet(parsed, packet, user_id)
+
+    def _handle_mapped_packet(self, parsed: dict, packet: bytes, user_id: str):
         if user_id == self.self_user_id:
             self.self_packet_count += 1
             return
