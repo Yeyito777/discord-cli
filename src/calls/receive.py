@@ -1480,6 +1480,12 @@ class VoiceReceiveTranscription:
 
     def set_active_remote_users(self, user_ids):
         self.fallback_user_ids = {str(user_id) for user_id in (user_ids or []) if user_id is not None and str(user_id) != self.self_user_id}
+        for user_id in list(self.user_speaking_state.keys()):
+            if user_id not in self.fallback_user_ids:
+                self.user_speaking_state.pop(user_id, None)
+                segmenter = self.segmenters.get(user_id)
+                if segmenter:
+                    segmenter.set_external_speaking(False)
         self.dave.add_known_users(self.fallback_user_ids)
 
     def set_user_speaking(self, user_id, speaking):
@@ -1517,6 +1523,7 @@ class VoiceReceiveTranscription:
     def remove_user(self, user_id):
         user_id = str(user_id)
         self.fallback_user_ids.discard(user_id)
+        self.user_speaking_state.pop(user_id, None)
         self.dave.remove_known_user(user_id)
         for ssrc, mapped_user in list(self.ssrc_to_user_id.items()):
             if mapped_user == user_id:
