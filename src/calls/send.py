@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import shutil
 import socket
 import struct
@@ -10,6 +11,52 @@ import subprocess
 import time
 
 from src.calls.transport import OPUS_PAYLOAD_TYPE, OPUS_RTP_CLOCK_INCREMENT, encrypt_voice_transport, parse_plain_rtp_packet
+
+
+DEFAULT_VOICE_ENGINE = "discord-voice-engine"
+
+
+def find_voice_engine():
+    configured = os.environ.get("DISCORD_VOICE_ENGINE")
+    if configured:
+        expanded = Path(configured).expanduser()
+        if expanded.exists():
+            return str(expanded)
+        return configured
+    return shutil.which(DEFAULT_VOICE_ENGINE)
+
+
+def build_voice_engine_file_command(engine, audio_path, relay_port):
+    return [
+        engine,
+        "encode-file",
+        "--input", str(audio_path),
+        "--rtp", f"127.0.0.1:{relay_port}",
+        "--mode", "music",
+        "--channels", "2",
+        "--bitrate", "192000",
+        "--payload-type", str(OPUS_PAYLOAD_TYPE),
+    ]
+
+
+def build_ffmpeg_file_command(audio_path, relay_port):
+    return [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-re",
+        "-i", str(audio_path),
+        "-vn",
+        "-ac", "1",
+        "-ar", "48000",
+        "-c:a", "libopus",
+        "-application", "voip",
+        "-frame_duration", "20",
+        "-payload_type", str(OPUS_PAYLOAD_TYPE),
+        "-f", "rtp",
+        f"rtp://127.0.0.1:{relay_port}",
+    ]
 
 
 def send_audio_file(worker, path):
@@ -22,8 +69,9 @@ def send_audio_file(worker, path):
     audio_path = Path(path).expanduser()
     if not audio_path.exists() or not audio_path.is_file():
         raise RuntimeError(f"audio file not found: {audio_path}")
-    if not shutil.which("ffmpeg"):
-        raise RuntimeError("ffmpeg is required for discord call say")
+    voice_engine = find_voice_engine()
+    if not voice_engine and not shutil.which("ffmpeg"):
+        raise RuntimeError("discord-voice-engine or ffmpeg is required for discord call say")
     if not worker.voice_ready or not worker.voice_udp or worker.voice_ssrc is None or not worker.voice_secret_key or not worker.voice_mode:
         raise RuntimeError("call is not voice-ready yet")
     transcription = worker._voice_transcription
@@ -52,23 +100,8 @@ def send_audio_file(worker, path):
     stderr_chunks = []
     try:
         worker._send_speaking(True)
-        proc = subprocess.Popen([
-            "ffmpeg",
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-re",
-            "-i", str(audio_path),
-            "-vn",
-            "-ac", "1",
-            "-ar", "48000",
-            "-c:a", "libopus",
-            "-application", "voip",
-            "-frame_duration", "20",
-            "-payload_type", str(OPUS_PAYLOAD_TYPE),
-            "-f", "rtp",
-            f"rtp://127.0.0.1:{relay_port}",
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        command = build_voice_engine_file_command(voice_engine, audio_path, relay_port) if voice_engine else build_ffmpeg_file_command(audio_path, relay_port)
+        proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
         while worker.running:
             try:
@@ -90,7 +123,8 @@ def send_audio_file(worker, path):
                 pass
         code = proc.wait(timeout=2)
         if code != 0:
-            raise RuntimeError(f"ffmpeg exited with {code}: {''.join(stderr_chunks).strip()}")
+            backend = "discord-voice-engine" if voice_engine else "ffmpeg"
+            raise RuntimeError(f"{backend} exited with {code}: {''.join(stderr_chunks).strip()}")
         print(f"Sent call audio {audio_path} ({sent} RTP packet(s), {dropped} dropped).", flush=True)
     finally:
         worker._send_speaking(False)
