@@ -15,6 +15,9 @@ from src.calls.transport import OPUS_PAYLOAD_TYPE, OPUS_RTP_CLOCK_INCREMENT, enc
 
 DEFAULT_VOICE_ENGINE = "discord-voice-engine"
 SPEAKING_KEEPALIVE_SECONDS = 1.0
+OPUS_SILENCE_FRAME = b"\xf8\xff\xfe"
+CALL_SAY_PREROLL_MS = max(0, int(os.environ.get("DISCORD_CALL_SAY_PREROLL_MS", "1000") or "0"))
+CALL_SAY_PREROLL_PACKETS = CALL_SAY_PREROLL_MS // 20
 
 
 def find_voice_engine():
@@ -97,10 +100,13 @@ def send_audio_file(worker, path):
     relay_port = relay.getsockname()[1]
     proc = None
     sent = 0
+    preroll_sent = 0
     dropped = 0
     stderr_chunks = []
     try:
-        next_speaking_keepalive = 0.0
+        worker._send_speaking(True)
+        next_speaking_keepalive = time.monotonic() + SPEAKING_KEEPALIVE_SECONDS
+        preroll_sent = send_outgoing_silence_preroll(worker, transcription, CALL_SAY_PREROLL_PACKETS)
         command = build_voice_engine_file_command(voice_engine, audio_path, relay_port) if voice_engine else build_ffmpeg_file_command(audio_path, relay_port)
         proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
@@ -130,7 +136,7 @@ def send_audio_file(worker, path):
         if code != 0:
             backend = "discord-voice-engine" if voice_engine else "ffmpeg"
             raise RuntimeError(f"{backend} exited with {code}: {''.join(stderr_chunks).strip()}")
-        print(f"Sent call audio {audio_path} ({sent} RTP packet(s), {dropped} dropped).", flush=True)
+        print(f"Sent call audio {audio_path} ({sent} RTP packet(s), {dropped} dropped, {preroll_sent} preroll silence packet(s)).", flush=True)
     finally:
         worker._send_speaking(False)
         try:
@@ -152,6 +158,25 @@ def forward_outgoing_rtp_packet(worker, packet, transcription):
     opus_payload = parsed["payload"]
     if not opus_payload:
         return False
+    return send_outgoing_opus_payload(worker, opus_payload, transcription)
+
+
+def send_outgoing_silence_preroll(worker, transcription, packet_count):
+    sent = 0
+    start = time.monotonic()
+    for index in range(max(0, int(packet_count))):
+        if not worker.running:
+            break
+        if send_outgoing_opus_payload(worker, OPUS_SILENCE_FRAME, transcription):
+            sent += 1
+        target = start + ((index + 1) * OPUS_RTP_CLOCK_INCREMENT / 48_000)
+        delay = target - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+    return sent
+
+
+def send_outgoing_opus_payload(worker, opus_payload, transcription):
     encoded = transcription.encode_outgoing_opus(opus_payload)
     if not encoded:
         return False
