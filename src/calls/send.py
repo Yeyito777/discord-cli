@@ -14,6 +14,7 @@ from src.calls.transport import OPUS_PAYLOAD_TYPE, OPUS_RTP_CLOCK_INCREMENT, enc
 
 
 DEFAULT_VOICE_ENGINE = "discord-voice-engine"
+SPEAKING_KEEPALIVE_SECONDS = 1.0
 
 
 def find_voice_engine():
@@ -99,11 +100,15 @@ def send_audio_file(worker, path):
     dropped = 0
     stderr_chunks = []
     try:
-        worker._send_speaking(True)
+        next_speaking_keepalive = 0.0
         command = build_voice_engine_file_command(voice_engine, audio_path, relay_port) if voice_engine else build_ffmpeg_file_command(audio_path, relay_port)
         proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
         while worker.running:
+            now = time.monotonic()
+            if now >= next_speaking_keepalive:
+                worker._send_speaking(True)
+                next_speaking_keepalive = now + SPEAKING_KEEPALIVE_SECONDS
             try:
                 packet, _addr = relay.recvfrom(4096)
                 if forward_outgoing_rtp_packet(worker, packet, transcription):
