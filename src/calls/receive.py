@@ -309,6 +309,9 @@ class DavePassthroughDecryptor:
         self.encrypted_drop_count = 0
         self.padding_trim_count = 0
         self.padding_trim_bytes = 0
+        self.outgoing_encrypt_count = 0
+        self.outgoing_passthrough_count = 0
+        self.outgoing_encrypt_failure_count = 0
         if self.session is not None:
             self._init_session(self.advertised_protocol_version)
 
@@ -424,17 +427,56 @@ class DavePassthroughDecryptor:
             return None
         return bytes(decoded)
 
+    def _outgoing_dave_mode(self) -> str:
+        raw = (os.environ.get("DISCORD_CALL_SAY_DAVE_MODE") or "auto").strip().lower()
+        if raw in {"off", "plain", "plaintext", "passthrough"}:
+            return "plaintext"
+        if raw in {"on", "encrypt", "encrypted", "dave"}:
+            return "encrypt"
+        return "auto"
+
+    def _can_encrypt_outgoing(self) -> bool:
+        if self.protocol_version <= 0 or self.session is None or self.encryptor is None or dave is None or self.self_ssrc is None:
+            return False
+        try:
+            if not self.session.has_established_group():
+                return False
+            if not self.encryptor.has_key_ratchet():
+                self._transition_encryptor()
+            return bool(self.encryptor.has_key_ratchet())
+        except Exception:
+            return False
+
     def encode_outgoing_opus(self, payload: bytes):
-        if payload == OPUS_SILENCE_FRAME:
+        mode = self._outgoing_dave_mode()
+        if mode == "plaintext" or self.protocol_version <= 0:
+            self.outgoing_passthrough_count += 1
             return payload
-        # One-shot `discord call say` playback deliberately sends plaintext Opus
-        # inside Discord's normal transport encryption. Record currently uses
-        # davey and drops packets encrypted by dave-py's outgoing Encryptor; its
-        # receive path already supports passthrough recovery for plaintext Opus.
-        return payload
+        if not self._can_encrypt_outgoing():
+            if mode == "auto":
+                self.outgoing_passthrough_count += 1
+                return payload
+            self.outgoing_encrypt_failure_count += 1
+            return None
+        try:
+            encoded = self.encryptor.encrypt(dave.MediaType.audio, int(self.self_ssrc), bytes(payload))
+        except Exception as exc:
+            self.outgoing_encrypt_failure_count += 1
+            self.report_error(f"DAVE outgoing audio encryption failed: {exc}")
+            return None
+        if encoded is None:
+            self.outgoing_encrypt_failure_count += 1
+            return None
+        self.outgoing_encrypt_count += 1
+        return bytes(encoded)
 
     def can_encode_outgoing(self) -> bool:
-        return True
+        mode = self._outgoing_dave_mode()
+        if mode == "plaintext" or self.protocol_version <= 0:
+            return True
+        if mode == "encrypt":
+            return self._can_encrypt_outgoing()
+        return True if self.protocol_version <= 0 else self._can_encrypt_outgoing()
 
     def handle_prepare_transition(self, data: dict):
         if not isinstance(data, dict):
@@ -1628,6 +1670,7 @@ class VoiceReceiveTranscription:
                     f"dave_drop={self.dave_drop_count} dave_passthrough={self.dave.passthrough_count} "
                     f"dave_decrypt_fail={self.dave.decrypt_failure_count} dave_encrypted_drop={self.dave.encrypted_drop_count} "
                     f"dave_padding_trim={self.dave.padding_trim_count}/{self.dave.padding_trim_bytes}B "
+                    f"dave_out={self.dave.outgoing_encrypt_count}/{self.dave.outgoing_passthrough_count}/{self.dave.outgoing_encrypt_failure_count} "
                     f"post_dave_opus={self.post_dave_opus_valid_count}/{self.post_dave_opus_invalid_count} "
                     f"frames={self.decode_frame_count} decode_errors={self.decode_error_count} "
                     f"jitter_missing={self.jitter_missing_count} "

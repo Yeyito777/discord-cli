@@ -136,7 +136,15 @@ def send_audio_file(worker, path):
         if code != 0:
             backend = "discord-voice-engine" if voice_engine else "ffmpeg"
             raise RuntimeError(f"{backend} exited with {code}: {''.join(stderr_chunks).strip()}")
-        print(f"Sent call audio {audio_path} ({sent} RTP packet(s), {dropped} dropped, {preroll_sent} preroll silence packet(s)).", flush=True)
+        dave = getattr(transcription, "dave", None)
+        dave_suffix = ""
+        if dave is not None:
+            dave_suffix = (
+                f", dave_out={getattr(dave, 'outgoing_encrypt_count', 0)}/"
+                f"{getattr(dave, 'outgoing_passthrough_count', 0)}/"
+                f"{getattr(dave, 'outgoing_encrypt_failure_count', 0)}"
+            )
+        print(f"Sent call audio {audio_path} ({sent} RTP packet(s), {dropped} dropped, {preroll_sent} preroll silence packet(s){dave_suffix}).", flush=True)
     finally:
         worker._send_speaking(False)
         try:
