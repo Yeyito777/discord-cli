@@ -57,6 +57,7 @@ DEFAULT_MAX_QUEUE = 24
 DEFAULT_JITTER_PACKETS = 12
 DEFAULT_JITTER_RESYNC_GAP = 120
 DEFAULT_UNKNOWN_SSRC_BUFFER_PACKETS = 750
+DEFAULT_REMOTE_SPEAKING_IDLE_MS = 1500
 OPUS_SAMPLE_RATE = 48_000
 TRANSCRIBE_SAMPLE_RATE = 16_000
 OPUS_FRAME_SAMPLES = 960  # 20 ms at 48 kHz.
@@ -1410,6 +1411,8 @@ class VoiceReceiveTranscription:
         self.pre_dave_jitter_buffers = {}
         self.jitter_buffers = {}
         self.user_speaking_state = {}
+        self.user_speaking_last_at = {}
+        self.remote_speaking_idle_seconds = env_int("DISCORD_CALL_REMOTE_SPEAKING_IDLE_MS", DEFAULT_REMOTE_SPEAKING_IDLE_MS) / 1000.0
         self.jitter_missing_count = 0
         self.packet_count = 0
         self.unknown_ssrc_count = 0
@@ -1489,6 +1492,7 @@ class VoiceReceiveTranscription:
         for user_id in list(self.user_speaking_state.keys()):
             if user_id not in self.fallback_user_ids:
                 self.user_speaking_state.pop(user_id, None)
+                self.user_speaking_last_at.pop(user_id, None)
                 segmenter = self.segmenters.get(user_id)
                 if segmenter:
                     segmenter.set_external_speaking(False)
@@ -1498,12 +1502,17 @@ class VoiceReceiveTranscription:
         if user_id is None or str(user_id) == self.self_user_id:
             return
         user_id = str(user_id)
-        self.user_speaking_state[user_id] = bool(speaking)
+        speaking = bool(speaking)
+        self.user_speaking_state[user_id] = speaking
+        if speaking:
+            self.user_speaking_last_at[user_id] = time.time()
+        else:
+            self.user_speaking_last_at.pop(user_id, None)
         self.fallback_user_ids.add(user_id)
         self.dave.add_known_users([user_id])
         segmenter = self.segmenters.get(user_id)
         if segmenter:
-            segmenter.set_external_speaking(bool(speaking))
+            segmenter.set_external_speaking(speaking)
 
     def set_self_ssrc(self, ssrc):
         self.dave.set_self_ssrc(ssrc)
@@ -1520,6 +1529,13 @@ class VoiceReceiveTranscription:
         ssrc = int(ssrc)
         user_id = str(user_id)
         previous = self.ssrc_to_user_id.get(ssrc)
+        stale_user_ssrcs = [mapped_ssrc for mapped_ssrc, mapped_user in self.ssrc_to_user_id.items() if mapped_user == user_id and mapped_ssrc != ssrc]
+        if stale_user_ssrcs:
+            self._reset_user_media_state(user_id, finalize_segment=True)
+            for mapped_ssrc in stale_user_ssrcs:
+                self.ssrc_to_user_id.pop(mapped_ssrc, None)
+                self.dave.ssrc_to_user_id.pop(mapped_ssrc, None)
+                self.dave.ssrc_to_decryptor.pop(mapped_ssrc, None)
         self.ssrc_to_user_id[ssrc] = user_id
         self.fallback_user_ids.add(user_id)
         self.dave.add_ssrc_mapping(ssrc, user_id)
@@ -1532,13 +1548,21 @@ class VoiceReceiveTranscription:
         user_id = str(user_id)
         self.fallback_user_ids.discard(user_id)
         self.user_speaking_state.pop(user_id, None)
+        self.user_speaking_last_at.pop(user_id, None)
         self.dave.remove_known_user(user_id)
         for ssrc, mapped_user in list(self.ssrc_to_user_id.items()):
             if mapped_user == user_id:
                 del self.ssrc_to_user_id[ssrc]
+        self._reset_user_media_state(user_id, finalize_segment=True)
+
+    def _reset_user_media_state(self, user_id, *, finalize_segment=False):
+        user_id = str(user_id)
         segmenter = self.segmenters.pop(user_id, None)
         if segmenter:
-            segmenter.finalize()
+            if finalize_segment:
+                segmenter.finalize()
+            else:
+                segmenter.finish_or_discard()
         decoder = self.decoders.pop(user_id, None)
         if hasattr(decoder, "close"):
             try:
@@ -1546,6 +1570,7 @@ class VoiceReceiveTranscription:
             except Exception:
                 pass
         self.resamplers.pop(user_id, None)
+        self.pre_dave_jitter_buffers.pop(user_id, None)
         self.jitter_buffers.pop(user_id, None)
 
     def handle_session_description(self, data: dict):
@@ -1589,6 +1614,7 @@ class VoiceReceiveTranscription:
                         self._decode_and_segment(user_id, opus_payload, packet_info=traced_packet)
         for segmenter in list(self.segmenters.values()):
             segmenter.flush_if_stale()
+        self._expire_remote_speaking_state()
         now = time.time()
         if now - self.last_stats_at >= 10:
             self.last_stats_at = now
@@ -1610,6 +1636,22 @@ class VoiceReceiveTranscription:
                     f"remote_speaking={sum(1 for value in self.user_speaking_state.values() if value)} "
                     f"ssrcs={len(self.ssrc_to_user_id)}"
                 )
+
+    def _expire_remote_speaking_state(self):
+        now = time.time()
+        for user_id, speaking in list(self.user_speaking_state.items()):
+            if not speaking:
+                continue
+            segmenter = self.segmenters.get(user_id)
+            if segmenter and segmenter.active:
+                self.user_speaking_last_at[user_id] = now
+                continue
+            last_at = self.user_speaking_last_at.get(user_id, now)
+            if now - last_at >= self.remote_speaking_idle_seconds:
+                self.user_speaking_state[user_id] = False
+                self.user_speaking_last_at.pop(user_id, None)
+                if segmenter:
+                    segmenter.set_external_speaking(False)
 
     def _pre_dave_jitter_resync_count(self) -> int:
         return sum(getattr(jitter, "resync_count", 0) for jitter in self.pre_dave_jitter_buffers.values())
