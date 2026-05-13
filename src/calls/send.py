@@ -18,6 +18,27 @@ SPEAKING_KEEPALIVE_SECONDS = 1.0
 OPUS_SILENCE_FRAME = b"\xf8\xff\xfe"
 CALL_SAY_PREROLL_MS = max(0, int(os.environ.get("DISCORD_CALL_SAY_PREROLL_MS", "1000") or "0"))
 CALL_SAY_PREROLL_PACKETS = CALL_SAY_PREROLL_MS // 20
+CALL_SAY_VOLUME_PERCENT = None
+
+
+def parse_call_say_volume_percent():
+    raw = os.environ.get("DISCORD_CALL_SAY_VOLUME_PERCENT", os.environ.get("DISCORD_CALL_SAY_VOLUME", "50"))
+    try:
+        percent = float(str(raw).strip().rstrip("%"))
+    except Exception:
+        percent = 50.0
+    return max(0.0, min(200.0, percent))
+
+
+def call_say_volume_percent():
+    global CALL_SAY_VOLUME_PERCENT
+    if CALL_SAY_VOLUME_PERCENT is None:
+        CALL_SAY_VOLUME_PERCENT = parse_call_say_volume_percent()
+    return CALL_SAY_VOLUME_PERCENT
+
+
+def format_volume_gain(percent):
+    return f"{max(0.0, float(percent)) / 100.0:.6g}"
 
 
 def find_voice_engine():
@@ -43,8 +64,8 @@ def build_voice_engine_file_command(engine, audio_path, relay_port):
     ]
 
 
-def build_ffmpeg_file_command(audio_path, relay_port):
-    return [
+def build_ffmpeg_file_command(audio_path, relay_port, volume_percent=100.0):
+    command = [
         "ffmpeg",
         "-nostdin",
         "-hide_banner",
@@ -52,15 +73,32 @@ def build_ffmpeg_file_command(audio_path, relay_port):
         "-re",
         "-i", str(audio_path),
         "-vn",
-        "-ac", "1",
+        "-ac", "2",
         "-ar", "48000",
+    ]
+    if float(volume_percent) != 100.0:
+        command.extend(["-filter:a", f"volume={format_volume_gain(volume_percent)}"])
+    command.extend([
         "-c:a", "libopus",
-        "-application", "voip",
+        "-application", "audio",
+        "-b:a", "192000",
         "-frame_duration", "20",
         "-payload_type", str(OPUS_PAYLOAD_TYPE),
         "-f", "rtp",
         f"rtp://127.0.0.1:{relay_port}",
-    ]
+    ])
+    return command
+
+
+def build_file_command(voice_engine, audio_path, relay_port, volume_percent):
+    ffmpeg = shutil.which("ffmpeg")
+    if float(volume_percent) != 100.0:
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg is required for discord call say volume adjustment")
+        return "ffmpeg", build_ffmpeg_file_command(audio_path, relay_port, volume_percent)
+    if voice_engine:
+        return "discord-voice-engine", build_voice_engine_file_command(voice_engine, audio_path, relay_port)
+    return "ffmpeg", build_ffmpeg_file_command(audio_path, relay_port, volume_percent)
 
 
 def send_audio_file(worker, path):
@@ -74,6 +112,7 @@ def send_audio_file(worker, path):
     if not audio_path.exists() or not audio_path.is_file():
         raise RuntimeError(f"audio file not found: {audio_path}")
     voice_engine = find_voice_engine()
+    volume_percent = call_say_volume_percent()
     if not voice_engine and not shutil.which("ffmpeg"):
         raise RuntimeError("discord-voice-engine or ffmpeg is required for discord call say")
     if not worker.voice_ready or not worker.voice_udp or worker.voice_ssrc is None or not worker.voice_secret_key or not worker.voice_mode:
@@ -107,7 +146,7 @@ def send_audio_file(worker, path):
         worker._send_speaking(True)
         next_speaking_keepalive = time.monotonic() + SPEAKING_KEEPALIVE_SECONDS
         preroll_sent = send_outgoing_silence_preroll(worker, transcription, CALL_SAY_PREROLL_PACKETS)
-        command = build_voice_engine_file_command(voice_engine, audio_path, relay_port) if voice_engine else build_ffmpeg_file_command(audio_path, relay_port)
+        backend, command = build_file_command(voice_engine, audio_path, relay_port, volume_percent)
         proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
         while worker.running:
@@ -134,7 +173,6 @@ def send_audio_file(worker, path):
                 pass
         code = proc.wait(timeout=2)
         if code != 0:
-            backend = "discord-voice-engine" if voice_engine else "ffmpeg"
             raise RuntimeError(f"{backend} exited with {code}: {''.join(stderr_chunks).strip()}")
         dave = getattr(transcription, "dave", None)
         dave_suffix = ""
@@ -144,7 +182,7 @@ def send_audio_file(worker, path):
                 f"{getattr(dave, 'outgoing_passthrough_count', 0)}/"
                 f"{getattr(dave, 'outgoing_encrypt_failure_count', 0)}"
             )
-        print(f"Sent call audio {audio_path} ({sent} RTP packet(s), {dropped} dropped, {preroll_sent} preroll silence packet(s){dave_suffix}).", flush=True)
+        print(f"Sent call audio {audio_path} ({sent} RTP packet(s), {dropped} dropped, {preroll_sent} preroll silence packet(s), volume={volume_percent:g}%, backend={backend}{dave_suffix}).", flush=True)
     finally:
         worker._send_speaking(False)
         try:
