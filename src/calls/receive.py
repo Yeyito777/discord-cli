@@ -47,7 +47,7 @@ TRANSCRIBE_WORKERS = 2
 # Coupled with Record's call-widget speaking gate.  If this transcription
 # start/stop/idle logic changes, mirror the intent in:
 # /home/yeyito/Workspace/active-development/record/src/voice/audio-ffmpeg.ts
-DEFAULT_SPEECH_START_THRESHOLD_DB = -42.0
+DEFAULT_SPEECH_START_THRESHOLD_DB = -45.0
 DEFAULT_SPEECH_STOP_THRESHOLD_DB = -55.0
 DEFAULT_SILENCE_MS = 700
 DEFAULT_MIN_SPEECH_MS = 450
