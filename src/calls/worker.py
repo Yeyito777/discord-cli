@@ -108,6 +108,20 @@ def _timing_delta_ms(start, end=None):
     return f"{max(0, int(round((end - start) * 1000)))}ms"
 
 
+def _record_style_display_name(user):
+    """Return the same user-facing display name scheme Record uses.
+
+    Record intentionally ignores guild/server nicknames and formats Discord
+    users as global display name when present, falling back to username.  Keep
+    call transcript/call-state notifications aligned with that behavior so a
+    guild voice speaker is identified by their Discord display name rather than
+    a per-server nickname.
+    """
+    if not isinstance(user, dict):
+        return None
+    return user.get("global_name") or user.get("display_name") or user.get("username")
+
+
 class NoAudioCallJoiner:
     def __init__(self, channel_id, *, guild_id=None, label=None, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True, save_audio=False, audio_dir=None, notify_audio_state=False):
         self.channel_id = channel_id
@@ -452,7 +466,7 @@ class NoAudioCallJoiner:
             if not isinstance(recipient, dict) or not recipient.get("id"):
                 continue
             user_id = str(recipient.get("id"))
-            name = recipient.get("username") or recipient.get("global_name") or recipient.get("display_name")
+            name = _record_style_display_name(recipient)
             if name:
                 self._participant_names[user_id] = name
 
@@ -467,13 +481,7 @@ class NoAudioCallJoiner:
         member = state.get("member") if isinstance(state.get("member"), dict) else {}
         user = state.get("user") if isinstance(state.get("user"), dict) else {}
         member_user = member.get("user") if isinstance(member.get("user"), dict) else {}
-        name = (
-            member.get("nick")
-            or user.get("username")
-            or user.get("global_name")
-            or member_user.get("username")
-            or member_user.get("global_name")
-        )
+        name = _record_style_display_name(member_user) or _record_style_display_name(user)
         if name:
             self._participant_names[user_id] = name
         return user_id
