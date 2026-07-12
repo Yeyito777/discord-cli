@@ -1,7 +1,7 @@
 """Listening subcommands — listen, unlisten, listeners.
 
-Manages background gateway processes that stream real-time events
-from Discord channels to files in /tmp/discord-listeners/.
+Manages account-scoped background gateway processes that stream real-time
+events from Discord channels into a private per-user runtime directory.
 """
 
 import argparse
@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 
+from src.accounts import listener_dir
 from src.private_channels import (
     private_channel_label_for_type,
     private_channel_listener_label,
@@ -21,8 +22,16 @@ from src.private_channels import (
     private_channel_type,
 )
 
-LISTENER_DIR = Path("/tmp/discord-listeners")
+LISTENER_DIR = listener_dir()
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+
+
+def _is_our_gateway_pid(pid):
+    try:
+        cmdline = Path(f"/proc/{int(pid)}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+    except Exception:
+        return False
+    return "gateway.py" in cmdline and str(LISTENER_DIR) in cmdline
 
 
 def listen(argv):
@@ -238,6 +247,10 @@ def _stop_one(channel_id):
             pass
 
     pid = int(pid_file.read_text().strip())
+    if not _is_our_gateway_pid(pid):
+        pid_file.unlink(missing_ok=True)
+        meta_file.unlink(missing_ok=True)
+        raise RuntimeError(f"Refusing to signal PID {pid}: it is not this account's Discord gateway.")
     try:
         os.kill(pid, signal.SIGTERM)
         # Wait briefly for graceful shutdown, then force-kill
@@ -266,6 +279,10 @@ def _stop_all():
     count = 0
     for pid_file in LISTENER_DIR.glob("*.pid"):
         pid = int(pid_file.read_text().strip())
+        if not _is_our_gateway_pid(pid):
+            pid_file.unlink(missing_ok=True)
+            pid_file.with_suffix(".meta").unlink(missing_ok=True)
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
             count += 1

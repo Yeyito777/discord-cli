@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 
+from src.accounts import selected_account
 from src.auth import get_token
 from src.captcha_output import print_captcha_challenge
 from src.webbroker import (
@@ -29,11 +30,17 @@ from src.websession import (
 
 
 def _profile_status() -> dict:
+    account = selected_account()
     default_dir = WEB_PROFILE_DIR / "Default"
     local_storage = default_dir / "Local Storage" / "leveldb"
     cookies = default_dir / "Cookies"
     network_cookies = default_dir / "Network" / "Cookies"
     return {
+        "account": {
+            "alias": account["alias"],
+            "user_id": account.get("user_id"),
+            "username": account.get("username"),
+        },
         "profile_dir": str(WEB_PROFILE_DIR),
         "exists": WEB_PROFILE_DIR.exists(),
         "has_default_profile": default_dir.exists(),

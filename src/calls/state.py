@@ -8,8 +8,11 @@ from pathlib import Path
 import re
 import time
 
-CALL_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "discord-cli" / "calls"
-CALL_LOG_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "discord-cli" / "calls"
+from src.accounts import selected_alias
+
+_ACCOUNT_DIR = selected_alias(required=False) or "legacy"
+CALL_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "discord-cli" / "accounts" / _ACCOUNT_DIR / "calls"
+CALL_LOG_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "discord-cli" / "accounts" / _ACCOUNT_DIR / "calls"
 CALL_META_ENV = "DISCORD_CALL_META_PATH"
 CALL_NOTIFY_TARGETS_ENV = "DISCORD_CALL_NOTIFY_TARGETS"
 

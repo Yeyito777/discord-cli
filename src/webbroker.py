@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.accounts import selected_account
 from src.auth import get_token
 from src.webprofile import (
     WEB_DIR,
@@ -194,6 +195,7 @@ def _refresh_pending_action(pending: PendingAction, result: dict) -> None:
 
 
 def status() -> dict:
+    account = selected_account()
     pid = None
     if BROKER_PID.exists():
         try:
@@ -202,6 +204,7 @@ def status() -> dict:
             pid = None
     running = bool(pid and _pid_is_running(pid))
     return {
+        "account": {"alias": account["alias"], "user_id": account.get("user_id")},
         "socket": str(BROKER_SOCKET),
         "socket_exists": BROKER_SOCKET.exists(),
         "pid_file": str(BROKER_PID),
@@ -359,11 +362,15 @@ def send_dm(channel_id: str, text: str, *, seed_accessibility: bool = False,
     payload = {"op": "send_dm", "channel_id": channel_id, "text": text}
     if action_id:
         payload['action_id'] = action_id
-    return _request_with_broker_restart(
+    result = _request_with_broker_restart(
         payload,
         timeout=600,
         seed_accessibility=seed_accessibility,
     )
+    if result.get("status") == "sent":
+        from src.accounts import audit_event
+        audit_event("discord-browser:send-dm", target=channel_id, result_id=result.get("message_id"))
+    return result
 
 
 def join_invite(invite: str, *, seed_accessibility: bool = False,
@@ -371,11 +378,15 @@ def join_invite(invite: str, *, seed_accessibility: bool = False,
     payload = {"op": "join_invite", "invite": invite}
     if action_id:
         payload['action_id'] = action_id
-    return _request_with_broker_restart(
+    result = _request_with_broker_restart(
         payload,
         timeout=900,
         seed_accessibility=seed_accessibility,
     )
+    if result.get("status") == "joined":
+        from src.accounts import audit_event
+        audit_event("discord-browser:join-invite", target=invite)
+    return result
 
 
 def solve_captcha(answer: str, *, timeout: int = 900,
@@ -386,7 +397,11 @@ def solve_captcha(answer: str, *, timeout: int = 900,
         payload['challenge_id'] = challenge_id
     if action_id:
         payload['action_id'] = action_id
-    return _request(payload, timeout=timeout)
+    result = _request(payload, timeout=timeout)
+    if result.get("status") in {"sent", "joined"}:
+        from src.accounts import audit_event
+        audit_event(f"discord-browser:{result['status']}", target=result.get("action_id"))
+    return result
 
 
 def run_server(*, headed: bool = False) -> None:

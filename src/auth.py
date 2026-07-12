@@ -1,20 +1,17 @@
-"""Discord auth token management.
-
-Tokens are stored in PROJECT_ROOT/config/credentials.json.
-
-Use `discord login <token>` to save a token after validating it against
-Discord's `/users/@me` endpoint.
-"""
+"""Discord auth token validation and named-account credential management."""
 
 import json
-import os
 import sys
-from pathlib import Path
 from urllib import error, request
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_DIR = PROJECT_ROOT / "config"
-CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
+from src.accounts import (
+    credentials_file,
+    read_token,
+    selected_account,
+    verify_and_refresh_selected_identity,
+    write_token,
+)
+
 API_ME_URL = "https://discord.com/api/v9/users/@me"
 VALIDATION_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -28,56 +25,21 @@ class AuthError(RuntimeError):
 
 
 def get_token():
-    """Load the Discord auth token from credentials.json.
-
-    Returns the token string.
-    Raises RuntimeError if credentials are missing or the file doesn't exist.
-    """
-    if not CREDENTIALS_FILE.exists():
-        raise RuntimeError(
-            "Not authenticated. Run 'discord login <token>' to configure your token."
-        )
-
-    try:
-        data = json.loads(CREDENTIALS_FILE.read_text())
-    except (json.JSONDecodeError, OSError) as e:
-        raise RuntimeError(f"Failed to read credentials file {CREDENTIALS_FILE}: {e}")
-
-    token = data.get("token", "")
-    if not token:
-        raise RuntimeError(
-            "Credentials file is missing the token. "
-            "Run 'discord login <token>' to reconfigure."
-        )
-
-    return token
+    """Load the token for the invocation's selected account."""
+    return read_token()
 
 
 def save_token(token):
-    """Save the Discord token to credentials.json.
-
-    Creates the config directory if it doesn't exist.
-    Sets restrictive file permissions (600) since these are credentials.
-    """
-    CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    data = {"token": token}
-    CREDENTIALS_FILE.write_text(json.dumps(data, indent=2) + "\n")
-
-    try:
-        os.chmod(CREDENTIALS_FILE, 0o600)
-    except OSError:
-        pass
+    """Save a token for the invocation's selected account."""
+    return write_token(token)
 
 
 def delete_token():
-    """Delete credentials.json.
-
-    Returns True if the file was deleted, False if it didn't exist.
-    """
-    if not CREDENTIALS_FILE.exists():
+    """Delete credentials for the invocation's selected account."""
+    path = credentials_file()
+    if not path.exists():
         return False
-    CREDENTIALS_FILE.unlink()
+    path.unlink()
     return True
 
 
@@ -166,13 +128,18 @@ def _login_with_token(argv):
 
     try:
         user = validate_token(token)
+        verify_and_refresh_selected_identity(user)
     except AuthError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
 
     save_token(token)
-    print(f"Logged in as {_user_label(user)}.")
-    print(f"Token saved to {CREDENTIALS_FILE}")
+    account = selected_account()
+    print(f"Logged in as {_user_label(user)} using account '{account['alias']}'.")
+    print(f"Token saved to {credentials_file()}")
 
 
 def _logout(argv):
@@ -182,10 +149,11 @@ def _logout(argv):
     if argv:
         print("usage: discord logout", file=sys.stderr)
         raise SystemExit(2)
-    if delete_token():
-        print("Logged out.")
-    else:
-        print("Not logged in.")
+    try:
+        removed = delete_token()
+    except RuntimeError:
+        removed = False
+    print("Logged out." if removed else "Not logged in.")
 
 
 def dispatch(cmd, argv):

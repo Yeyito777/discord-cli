@@ -68,6 +68,7 @@ def dms(argv):
 def dm(argv):
     p = argparse.ArgumentParser(
         prog="discord dm",
+        allow_abbrev=False,
         description=(
             "Read or send DMs. Raw API is used by default; use --browser to send "
             "through the dedicated browser-native path. Plain API sends may also "

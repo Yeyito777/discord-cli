@@ -18,8 +18,10 @@ import time
 import urllib.request
 from pathlib import Path
 
+from src.accounts import account_root, selected_account
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_DIR = PROJECT_ROOT / "config"
+CONFIG_DIR = account_root()
 WEB_DIR = CONFIG_DIR / "web"
 WEB_PROFILE_DIR = WEB_DIR / "chromium-profile"
 CAPTCHA_PROFILE_DIR = CONFIG_DIR / "captcha" / "chromium-profile"
@@ -65,14 +67,14 @@ def authenticated_session_js() -> str:
             frame.remove();
         } catch (_) {}
         if (!rawToken || rawToken === 'null' || rawToken === 'undefined') {
-            return false;
+            return null;
         }
         let token = rawToken;
         try {
             token = JSON.parse(rawToken);
         } catch (_) {}
         if (!token) {
-            return false;
+            return null;
         }
         try {
             const resp = await fetch('/api/v9/users/@me', {
@@ -80,9 +82,11 @@ def authenticated_session_js() -> str:
                 cache: 'no-store',
                 headers: { Authorization: token },
             });
-            return resp.status === 200;
+            if (resp.status !== 200) return null;
+            const user = await resp.json();
+            return user && user.id ? String(user.id) : null;
         } catch (_) {
-            return false;
+            return null;
         }
     }"""
 
@@ -135,12 +139,6 @@ def _hcaptcha_cookie_source_candidates() -> list[Path]:
     primary = existing_cookie_db(CAPTCHA_PROFILE_DIR)
     if primary is not None:
         candidates.append(primary)
-    for extra in (
-        Path.home() / '.runtime' / 'qutebrowser-exocortex' / 'data' / 'webengine' / 'Cookies',
-        Path.home() / '.runtime' / 'qutebrowser-yeyito' / 'data' / 'webengine' / 'Cookies',
-    ):
-        if extra.exists() and extra not in candidates:
-            candidates.append(extra)
     return candidates
 
 
@@ -162,7 +160,7 @@ def seed_hcaptcha_cookies_from_captcha_profile() -> int:
     src = _pick_hcaptcha_cookie_source()
     if src is None:
         raise DiscordWebError(
-            f"No hCaptcha cookie source DB found under {CAPTCHA_PROFILE_DIR} or qutebrowser runtime profiles"
+            f"No account-scoped hCaptcha cookie source DB found under {CAPTCHA_PROFILE_DIR}"
         )
 
     dst = existing_cookie_db(WEB_PROFILE_DIR)
@@ -327,16 +325,21 @@ def inject_token(page, token: str, *, reload_delay_ms: int = 2500) -> None:
     )
 
 
-def is_logged_in(page, *, timeout_ms: int = 5_000) -> bool:
+def authenticated_user_id(page, *, timeout_ms: int = 5_000) -> str | None:
     deadline = time.time() + (timeout_ms / 1000.0)
     while time.time() < deadline:
         try:
-            if bool(page.evaluate(authenticated_session_js())):
-                return True
+            user_id = page.evaluate(authenticated_session_js())
+            if user_id:
+                return str(user_id)
         except Exception:
             pass
         time.sleep(0.25)
-    return False
+    return None
+
+
+def is_logged_in(page, *, timeout_ms: int = 5_000) -> bool:
+    return authenticated_user_id(page, timeout_ms=timeout_ms) is not None
 
 
 def ensure_logged_in(page, token: str, *, timeout_ms: int = 20_000) -> bool:
@@ -346,16 +349,24 @@ def ensure_logged_in(page, token: str, *, timeout_ms: int = 20_000) -> bool:
     authenticated. This intentionally recognizes logged-in invite pages too,
     so resume flows do not get bounced back to /channels/@me mid-captcha.
     """
-    if is_logged_in(page, timeout_ms=2_000):
+    expected_user_id = str(selected_account()["user_id"])
+    current_user_id = authenticated_user_id(page, timeout_ms=2_000)
+    if current_user_id == expected_user_id:
         return False
     inject_token(page, token)
-    wait_for_logged_in(page, timeout_ms=timeout_ms)
+    wait_for_logged_in(page, expected_user_id=expected_user_id, timeout_ms=timeout_ms)
     return True
 
 
-def wait_for_logged_in(page, *, timeout_ms: int = 20_000) -> None:
-    if is_logged_in(page, timeout_ms=timeout_ms):
+def wait_for_logged_in(page, *, expected_user_id: str | None = None, timeout_ms: int = 20_000) -> None:
+    user_id = authenticated_user_id(page, timeout_ms=timeout_ms)
+    if user_id and (expected_user_id is None or user_id == str(expected_user_id)):
         return
+    if user_id and expected_user_id:
+        raise DiscordWebError(
+            f"Discord web profile authenticated as user {user_id}, but selected account "
+            f"requires user {expected_user_id}."
+        )
     raise DiscordWebError(
         "Discord web session did not reach an authenticated state in time."
     )

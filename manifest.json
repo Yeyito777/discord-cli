@@ -1,7 +1,7 @@
 {
   "name": "discord",
   "bin": "./bin/discord",
-  "systemHint": "You have access to the user's Discord through the `discord` CLI tool (source at ~/Workspace/Exocortex/external-tools/discord-cli). Run `discord -h` for usage reference.",
+  "systemHint": "You have access to Discord through the `discord` CLI tool (source at ~/Workspace/Exocortex/external-tools/discord-cli). It supports named accounts; use `discord accounts` to list them and `discord <command> -a <alias> ...` to select one. Mutating commands require an explicit account when multiple logins exist. Run `discord -h` for usage reference.",
   "display": {
     "label": "Discord",
     "color": "#5865F2"
@@ -15,7 +15,7 @@
     ]
   },
   "daemon": {
-    "command": ".venv/bin/python3 -m src.notify __daemon__ /tmp/discord-listeners/__notify__.log",
+    "command": "env DISCORD_ACCOUNT=\"$(.venv/bin/python3 -c 'from src.accounts import supervised_notify_alias; print(supervised_notify_alias() or \"\")')\" .venv/bin/python3 -m src.notify __daemon__",
     "restart": "always"
   }
 }

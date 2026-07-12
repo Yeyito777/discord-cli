@@ -29,6 +29,7 @@ if str(PROJECT_DIR) not in sys.path:
 
 import websocket
 
+from src.accounts import account_config_path, listener_dir, selected_account
 from src.calls.state import call_paths, read_call_meta
 
 # ─── Client fingerprint (matches api.py) ─────────────────────────────────────
@@ -45,7 +46,7 @@ _USER_AGENT = (
 GATEWAY_HOST = "discord.com"
 ZLIB_SUFFIX = b"\x00\x00\xff\xff"
 DEFAULT_CAPABILITIES = 30717
-NOTIFY_LISTENER_DIR = Path("/tmp/discord-listeners")
+NOTIFY_LISTENER_DIR = listener_dir()
 NOTIFY_LOCK_PATH = NOTIFY_LISTENER_DIR / "__notify__.lock"
 NOTIFY_PID_PATH = NOTIFY_LISTENER_DIR / "__notify__.pid"
 RELAY_SEEN_LIMIT = 200
@@ -85,6 +86,7 @@ class GatewayListener:
 
         from src.auth import get_token
         self.token = get_token()
+        self.account = selected_account()
 
         self.running = True
         self.ws = None
@@ -825,11 +827,11 @@ class GatewayListener:
         if len(parts) == 1:
             # Server mentions with history are multiline; DMs stay on one line
             if "\n" in parts[0]:
-                return f"[Discord Notification]\n{parts[0]}", seen_updates
+                return f"[Discord/{self.account['alias']} Notification]\n{parts[0]}", seen_updates
             else:
-                return f"[Discord Notification] {parts[0]}", seen_updates
+                return f"[Discord/{self.account['alias']} Notification] {parts[0]}", seen_updates
         else:
-            header = f"[Discord Notification] {len(parts)} new:"
+            header = f"[Discord/{self.account['alias']} Notification] {len(parts)} new:"
             body = "\n".join(f"  \u2022 {p}" for p in parts)
             return f"{header}\n{body}", seen_updates
 
@@ -1049,7 +1051,7 @@ if __name__ == "__main__":
 
     # If no relay targets on CLI, try loading from config/notify.json
     if not targets:
-        config_path = Path(project_root) / "config" / "notify.json"
+        config_path = account_config_path("notify.json")
         try:
             with open(config_path) as f:
                 targets = json.load(f).get("relay_targets", [])

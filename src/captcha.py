@@ -32,8 +32,10 @@ import time
 import urllib.parse
 import uuid
 
+from src.accounts import account_root
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_DIR = PROJECT_ROOT / "config"
+CONFIG_DIR = account_root()
 CAPTCHA_DIR = CONFIG_DIR / "captcha"
 BROWSER_PROFILE_DIR = CAPTCHA_DIR / "chromium-profile"
 PENDING_DIR = CAPTCHA_DIR / "pending"

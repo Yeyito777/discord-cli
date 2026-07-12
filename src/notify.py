@@ -1,6 +1,6 @@
 """Notify subcommands — manage Discord notification relay.
 
-Configuration is stored in PROJECT_ROOT/config/notify.json:
+Configuration is stored in the selected account's notify.json:
 {
     "relay_targets": ["conv_id_1", "conv_id_2"],
     "labels": {
@@ -17,17 +17,19 @@ falls back to next-turn queuing; otherwise delivery is immediate.
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+from src.accounts import account_root, listener_dir, selected_alias, supervised_notify_alias
 from src.exocortex import manage_external_tool_daemon
 
-CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
+CONFIG_DIR = account_root()
 CONFIG_FILE = CONFIG_DIR / "notify.json"
-LISTENER_DIR = Path("/tmp/discord-listeners")
+LISTENER_DIR = listener_dir()
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -61,7 +63,7 @@ def _find_notify_gateway_pids():
     """
     try:
         result = subprocess.run(
-            ["pgrep", "-f", r"gateway\.py\s+__notify__"],
+            ["pgrep", "-f", rf"gateway\.py\s+__notify__\s+{re.escape(str(LISTENER_DIR / '__notify__.log'))}"],
             capture_output=True, text=True,
         )
         pids = []
@@ -96,6 +98,14 @@ def _pid_alive(pid):
         return False
 
 
+def _is_our_notify_pid(pid):
+    try:
+        cmdline = Path(f"/proc/{int(pid)}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+    except Exception:
+        return False
+    return "gateway.py" in cmdline and "__notify__" in cmdline and str(LISTENER_DIR) in cmdline
+
+
 def _listener_paths():
     return {
         "pid": LISTENER_DIR / "__notify__.pid",
@@ -120,6 +130,8 @@ def _collect_notify_pids():
         try:
             candidate = int(paths["pid"].read_text().strip())
             os.kill(candidate, 0)
+            if not _is_our_notify_pid(candidate):
+                raise ProcessLookupError
             pids.append(candidate)
             seen.add(candidate)
         except (ProcessLookupError, ValueError):
@@ -278,8 +290,13 @@ def start(argv):
         description="Start the notification listener.")
     p.parse_args(argv)
 
-    status = manage_external_tool_daemon("discord", "start")
-    print(f"  {status.get('message', 'Requested start for supervised Discord daemon')}")
+    alias = selected_alias()
+    if alias == supervised_notify_alias():
+        status = manage_external_tool_daemon("discord", "start")
+        print(f"  {status.get('message', 'Requested start for supervised Discord daemon')}")
+    else:
+        from src.listening import _start_notify_listener
+        _start_notify_listener()
 
 
 def stop(argv):
@@ -287,16 +304,21 @@ def stop(argv):
         description="Stop the notification listener.")
     p.parse_args(argv)
 
-    status = manage_external_tool_daemon("discord", "stop")
-    print(f"  {status.get('message', 'Requested stop for supervised Discord daemon')}")
+    alias = selected_alias()
+    if alias == supervised_notify_alias():
+        status = manage_external_tool_daemon("discord", "stop")
+        print(f"  {status.get('message', 'Requested stop for supervised Discord daemon')}")
+    else:
+        pids = _collect_notify_pids()
+        stopped, alive = _stop_notify_pids(pids)
+        if alive:
+            raise RuntimeError(f"Failed to stop notify listener PID(s): {', '.join(map(str, alive))}")
+        print(f"  Stopped {len(stopped)} notification listener(s)")
 
 
 def _run_daemon_mode(argv):
-    if not argv:
-        raise SystemExit("usage: python -m src.notify __daemon__ <log_file> [conv_id ...]")
-
-    log_file = argv[0]
-    explicit_targets = argv[1:]
+    log_file = argv[0] if argv else str(LISTENER_DIR / "__notify__.log")
+    explicit_targets = argv[1:] if argv else []
     gateway_script = PROJECT_DIR / "src" / "gateway.py"
 
     while True:

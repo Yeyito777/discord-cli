@@ -305,12 +305,23 @@ def _request(method, path, body=None, body_bytes=None, token=None, params=None,
         status = resp.status
 
         if status == 204:
+            if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+                from src.accounts import audit_event
+                audit_event(f"discord-api:{method.upper()}", target=path)
             return None
 
         if 200 <= status < 300:
             if not raw:
+                if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+                    from src.accounts import audit_event
+                    audit_event(f"discord-api:{method.upper()}", target=path)
                 return None
-            return json.loads(raw)
+            result = json.loads(raw)
+            if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+                from src.accounts import audit_event
+                result_id = result.get("id") if isinstance(result, dict) else None
+                audit_event(f"discord-api:{method.upper()}", target=path, result_id=result_id)
+            return result
 
         retried = _maybe_retry_with_captcha(
             method,

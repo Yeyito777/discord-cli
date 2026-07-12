@@ -10,7 +10,7 @@ export PYTHONPATH="$PROJECT_DIR"
 
 usage() {
     cat <<'EOF'
-usage: discord <command> [args]
+usage: discord [--account ALIAS] <command> [args]
 
 commands:
   guilds       List your servers                       (alias: servers)
@@ -44,11 +44,15 @@ commands:
   web          Manage dedicated Discord web profile   (setup, status, seed-accessibility,
                                                       broker-start, broker-status, broker-stop,
                                                       send-dm, join-invite)
-  login        Save and validate an auth token       (alias: setup, auth)
+  accounts     List configured Discord accounts
+  account      Manage named accounts                  (list, add, migrate, default, access, notify, remove)
+  login        Refresh a named account's auth token  (alias: setup, auth)
   logout       Remove saved credentials
 
 notes:
-  - Browser-native paths use a dedicated persistent Chromium profile under config/web/
+  - Use `discord -a NAME <command>` or `discord <command> -a NAME ...` to select an account
+  - With multiple accounts, sends and other mutations require an explicit account
+  - Each account has a dedicated browser/captcha profile under config/accounts/NAME/
   - `discord join` prefers the browser-native path because invite joins commonly trigger captcha
   - `discord dm --send` can use `--browser`, and may auto-fallback on captcha-like API failures
 
@@ -84,7 +88,54 @@ if [[ $# -eq 0 ]]; then
     exit 1
 fi
 
+# Account selection is process-local.  Accept it before or after the command so
+# literal-safe commands can retain their normal `discord send ...` shape.
+account=""
+account_explicit=0
+if [[ "${1:-}" == "-a" || "${1:-}" == "--account" ]]; then
+    [[ $# -ge 2 ]] || { echo "discord: ${1} requires an alias" >&2; exit 2; }
+    account="$2"; account_explicit=1; shift 2
+elif [[ "${1:-}" == --account=* ]]; then
+    account="${1#*=}"; account_explicit=1; shift
+fi
+
+[[ $# -gt 0 ]] || { usage; exit 1; }
 cmd="$1"; shift
+
+filtered=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --)
+            filtered+=("$@")
+            break ;;
+        -a|--account)
+            [[ $# -ge 2 ]] || { echo "discord: $1 requires an alias" >&2; exit 2; }
+            [[ $account_explicit -eq 0 ]] || { echo "discord: account may only be selected once" >&2; exit 2; }
+            account="$2"; account_explicit=1; shift 2 ;;
+        --account=*)
+            [[ $account_explicit -eq 0 ]] || { echo "discord: account may only be selected once" >&2; exit 2; }
+            account="${1#*=}"; account_explicit=1; shift ;;
+        *) filtered+=("$1"); shift ;;
+    esac
+done
+set -- "${filtered[@]}"
+
+if [[ $account_explicit -eq 1 ]]; then
+    export DISCORD_ACCOUNT="$account"
+    export DISCORD_ACCOUNT_EXPLICIT=1
+else
+    unset DISCORD_ACCOUNT_EXPLICIT
+    if [[ -z "${DISCORD_ACCOUNT:-}" ]]; then
+        resolved_account="$("$PYTHON" -c "from src.accounts import selected_alias; print(selected_alias(required=False) or '')")"
+        if [[ -n "$resolved_account" ]]; then
+            export DISCORD_ACCOUNT="$resolved_account"
+        fi
+    fi
+fi
+
+if [[ "$cmd" != "account" && "$cmd" != "accounts" ]]; then
+    "$PYTHON" -c "import sys; from src.accounts import cli_preflight; cli_preflight(sys.argv[1], sys.argv[2:])" "$cmd" "$@"
+fi
 
 case "$cmd" in
     guilds|servers|guild|server|channels|chs|messages|msgs|dms|dm|search|s|pins|threads|members|me)
@@ -115,6 +166,11 @@ case "$cmd" in
         fi
         subcmd="$1"; shift
         exec "$PYTHON" -c "import sys; from src.websession_cli import dispatch; dispatch('$subcmd', sys.argv[1:])" "$@" ;;
+    account|accounts)
+        if [[ "$cmd" == "accounts" ]]; then
+            exec "$PYTHON" -c "import sys; from src.accounts import cli_dispatch; cli_dispatch(['list'] + sys.argv[1:])" "$@"
+        fi
+        exec "$PYTHON" -c "import sys; from src.accounts import cli_dispatch; cli_dispatch(sys.argv[1:])" "$@" ;;
     login|setup|auth|logout)
         exec "$PYTHON" -c "import sys; from src.auth import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     help|--help|-h)

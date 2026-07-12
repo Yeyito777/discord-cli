@@ -18,6 +18,7 @@ import zlib
 import websocket
 
 from src import api
+from src.accounts import selected_account
 from src.auth import get_token
 from src.calls.receive import VoiceReceiveTranscription
 from src.calls.send import send_audio_file
@@ -135,6 +136,7 @@ class NoAudioCallJoiner:
         self.notify_audio_state = bool(notify_audio_state)
         self.ring_recipient_ids = [str(user_id) for user_id in (ring_recipient_ids or []) if user_id]
         self.token = get_token()
+        self.account_alias = selected_account()["alias"]
 
         self.running = True
         self.app_ws = None
@@ -593,9 +595,11 @@ class NoAudioCallJoiner:
             self._voice_transcription.set_active_remote_users(self._active_participant_ids)
 
     def _notify_call_event(self, message):
-        self._notify_exo(message, prefix="Discord Call")
+        self._notify_exo(message, prefix=f"Discord/{self.account_alias} Call")
 
     def _notify_voice_transcript(self, message, prefix="Discord Voice", timing=None):
+        if prefix.startswith("Discord"):
+            prefix = prefix.replace("Discord", f"Discord/{self.account_alias}", 1)
         self._notify_exo(message, prefix=prefix, timing=timing)
 
     def _notify_exo(self, message, *, prefix, timing=None):
@@ -616,7 +620,7 @@ class NoAudioCallJoiner:
                 timeout=660,
             )
             send_finished_at = time.time()
-            if timing and prefix == "Discord Voice":
+            if timing and prefix.endswith(" Voice"):
                 self._log_voice_transcription(
                     "notification timing: "
                     f"target={target} returncode={proc.returncode} "
@@ -626,7 +630,7 @@ class NoAudioCallJoiner:
                     f"exo_send={_timing_delta_ms(send_started_at, send_finished_at)}"
                 )
         except Exception as exc:
-            if timing and prefix == "Discord Voice":
+            if timing and prefix.endswith(" Voice"):
                 self._log_voice_transcription(f"notification timing failed: target={target} error={exc}")
 
     def _log_voice_transcription(self, message):
