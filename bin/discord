@@ -19,7 +19,7 @@ commands:
   messages     Read messages from a channel           (alias: msgs)
   download     Download message attachment(s)
   dms          List DM conversations
-  dm           Read or send DMs                       (--browser for browser-native send)
+  dm           Read or send DMs
   search       Search messages                        (alias: s)
   pins         Get pinned messages
   threads      List active threads in a server
@@ -36,14 +36,10 @@ commands:
   unlisten     Stop a channel listener
   listeners    List active listeners
   notify       Manage notification relay              (add, remove, label, list, start, stop)
-  join         Join a server via invite link          (browser-native default; --raw for legacy path)
+  join         Join a server via invite link
   leave        Leave a server
   typing       Trigger typing indicator
   read         Mark channel as read
-  captcha      Manage browser-backed captcha flow     (setup, status, solve)
-  web          Manage dedicated Discord web profile   (setup, status, seed-accessibility,
-                                                      broker-start, broker-status, broker-stop,
-                                                      send-dm, join-invite)
   accounts     List configured Discord accounts
   account      Manage named accounts                  (list, add, migrate, default, access, notify, remove)
   login        Refresh a named account's auth token  (alias: setup, auth)
@@ -52,34 +48,7 @@ commands:
 notes:
   - Use `discord -a NAME <command>` or `discord <command> -a NAME ...` to select an account
   - With multiple accounts, sends and other mutations require an explicit account
-  - Each account has a dedicated browser/captcha profile under config/accounts/NAME/
-  - `discord join` prefers the browser-native path because invite joins commonly trigger captcha
-  - `discord dm --send` can use `--browser`, and may auto-fallback on captcha-like API failures
-
 Run 'discord <command> --help' for command-specific usage.
-Run 'discord web --help' for browser-native subcommands.
-EOF
-}
-
-web_usage() {
-    cat <<'EOF'
-usage: discord web <subcommand> [args]
-
-subcommands:
-  setup               Open the dedicated Chromium profile for manual Discord login/bootstrap
-  status              Show local profile + broker status
-  seed-accessibility  Copy hCaptcha accessibility cookies from the best available source
-  broker-start        Start/reuse the persistent browser broker
-  broker-status       Show persistent broker status
-  broker-stop         Stop the persistent broker
-  send-dm             Send a DM through the browser-native path
-  join-invite         Join an invite through the browser-native path
-
-notes:
-  - The broker keeps one dedicated Chromium session alive to avoid relaunching Chrome per command
-  - Headless is the default; use --headed only for debugging
-  - `seed-accessibility` imports hCaptcha accessibility state from the best available source
-    (captcha profile first if valid, otherwise live qutebrowser runtime cookies)
 EOF
 }
 
@@ -152,20 +121,6 @@ case "$cmd" in
         exec "$PYTHON" -c "import sys; from src.notify import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     join|leave|typing|read)
         exec "$PYTHON" -c "import sys; from src.managing import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
-    captcha)
-        if [[ $# -eq 0 ]]; then
-            echo "usage: discord captcha <setup|status|solve>" >&2
-            exit 1
-        fi
-        subcmd="$1"; shift
-        exec "$PYTHON" -c "import sys; from src.captcha_cli import dispatch; dispatch('$subcmd', sys.argv[1:])" "$@" ;;
-    web)
-        if [[ $# -eq 0 || "$1" == "-h" || "$1" == "--help" || "$1" == "help" ]]; then
-            web_usage
-            exit 0
-        fi
-        subcmd="$1"; shift
-        exec "$PYTHON" -c "import sys; from src.websession_cli import dispatch; dispatch('$subcmd', sys.argv[1:])" "$@" ;;
     account|accounts)
         if [[ "$cmd" == "accounts" ]]; then
             exec "$PYTHON" -c "import sys; from src.accounts import cli_dispatch; cli_dispatch(['list'] + sys.argv[1:])" "$@"

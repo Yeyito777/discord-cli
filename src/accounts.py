@@ -273,10 +273,6 @@ def _is_mutating(cmd: str, argv: list[str]) -> bool:
         return any(value == "--send" or value.startswith("--send=") or value.startswith("--sen") for value in argv)
     if cmd == "notify":
         return bool(argv and argv[0] != "list")
-    if cmd == "web":
-        return bool(argv and argv[0] not in {"status", "broker-status"})
-    if cmd == "captcha":
-        return bool(argv and argv[0] != "status")
     return cmd in {
         "send", "reply", "edit", "delete", "del", "react", "unreact",
         "call", "voice", "join-call", "listen", "unlisten", "join", "leave",
@@ -395,11 +391,6 @@ def migrate_legacy(argv) -> None:
 
     target = account_root(alias)
     target.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for name in ("web", "captcha"):
-        source = CONFIG_ROOT / name
-        destination = target / name
-        if source.exists() and not destination.exists():
-            shutil.move(str(source), str(destination))
     legacy_notify = CONFIG_ROOT / "notify.json"
     if legacy_notify.exists() and not (target / "notify.json").exists():
         shutil.move(str(legacy_notify), str(target / "notify.json"))
@@ -495,9 +486,6 @@ def remove_account(argv) -> None:
     state_dir = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "discord-cli" / "accounts" / alias
     cache_dir = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "discord-cli" / "accounts" / alias
     pid_files = list(runtime.glob("*.pid")) + list(state_dir.rglob("*.json"))
-    broker_pid = ACCOUNTS_ROOT / alias / "web" / "broker.pid"
-    if broker_pid.exists():
-        pid_files.append(broker_pid)
     live = []
     for path in pid_files:
         pid = None
@@ -515,7 +503,7 @@ def remove_account(argv) -> None:
     if live:
         raise AccountError(
             f"Account '{alias}' still has live process(es): {', '.join(map(str, sorted(set(live))))}. "
-            "Stop its listeners, calls, and browser broker before removal."
+            "Stop its listeners and calls before removal."
         )
 
     for path in (ACCOUNTS_ROOT / alias, runtime, state_dir, cache_dir):

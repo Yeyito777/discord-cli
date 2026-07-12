@@ -14,7 +14,6 @@ import os
 import re
 import ssl
 import subprocess
-import sys
 import threading
 import time
 import urllib.parse
@@ -216,57 +215,8 @@ def _build_headers(token=None, extra_headers=None):
     return headers
 
 
-def _maybe_retry_with_captcha(method, path, *, body=None, body_bytes=None,
-                              token=None, params=None, extra_headers=None,
-                              status=None, raw=None, allow_captcha_retry=True):
-    """Retry a challenged request after solving Discord's hCaptcha flow."""
-    if not allow_captcha_retry or status != 400 or not raw:
-        return None
-
-    try:
-        err = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-    if not isinstance(err, dict) or "captcha_key" not in err:
-        return None
-
-    if os.environ.get("DISCORD_CAPTCHA_DEBUG"):
-        try:
-            print(
-                "DISCORD_CAPTCHA_DEBUG payload:",
-                json.dumps(err, ensure_ascii=False),
-                file=sys.stderr,
-            )
-        except Exception:
-            pass
-
-    from src.captcha import CaptchaChallenge, solve_hcaptcha
-
-    challenge = CaptchaChallenge.from_discord_error(err)
-    solution = solve_hcaptcha(challenge)
-
-    retry_headers = dict(extra_headers or {})
-    retry_headers["X-Captcha-Key"] = solution.token
-    if challenge.session_id:
-        retry_headers["X-Captcha-Session-Id"] = challenge.session_id
-    if challenge.rqtoken:
-        retry_headers["X-Captcha-Rqtoken"] = challenge.rqtoken
-
-    return _request(
-        method,
-        path,
-        body=body,
-        body_bytes=body_bytes,
-        token=token,
-        params=params,
-        extra_headers=retry_headers,
-        allow_captcha_retry=False,
-    )
-
-
 def _request(method, path, body=None, body_bytes=None, token=None, params=None,
-             extra_headers=None, allow_captcha_retry=True):
+             extra_headers=None):
     """Make an API request with connection pooling. Returns parsed JSON."""
     if body is not None and body_bytes is not None:
         raise ValueError("Provide either body or body_bytes, not both")
@@ -322,21 +272,6 @@ def _request(method, path, body=None, body_bytes=None, token=None, params=None,
                 result_id = result.get("id") if isinstance(result, dict) else None
                 audit_event(f"discord-api:{method.upper()}", target=path, result_id=result_id)
             return result
-
-        retried = _maybe_retry_with_captcha(
-            method,
-            path,
-            body=body,
-            body_bytes=body_bytes,
-            token=token,
-            params=params,
-            extra_headers=extra_headers,
-            status=status,
-            raw=raw,
-            allow_captcha_retry=allow_captcha_retry,
-        )
-        if retried is not None:
-            return retried
 
         # Error handling
         try:
