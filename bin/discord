@@ -48,6 +48,7 @@ commands:
 notes:
   - Use `discord -a NAME <command>` or `discord <command> -a NAME ...` to select an account
   - With multiple accounts, sends and other mutations require an explicit account
+  - Captcha-challenged API calls open an isolated account-specific tab in a running vimbrowser
 Run 'discord <command> --help' for command-specific usage.
 EOF
 }

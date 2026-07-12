@@ -215,8 +215,106 @@ def _build_headers(token=None, extra_headers=None):
     return headers
 
 
+def _maybe_retry_with_vimbrowser_captcha(
+        method, path, *, body=None, body_bytes=None, token=None, params=None,
+        extra_headers=None, status=None, raw=None, allow_captcha_fallback=True):
+    """Open a Discord hCaptcha in vimbrowser and retry the request once."""
+    if not allow_captcha_fallback or status != 400 or not raw:
+        return False, None
+
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return False, None
+    if not isinstance(payload, dict) or "captcha_key" not in payload:
+        return False, None
+
+    from src.vimbrowser_captcha import (
+        BrowserReplayResult,
+        VimbrowserCaptchaError,
+        captcha_reason,
+        complete_invite,
+        solve_captcha,
+    )
+
+    reason = captcha_reason(payload)
+    try:
+        retry_headers = dict(extra_headers or {})
+        if payload.get("captcha_session_id"):
+            retry_headers["X-Captcha-Session-Id"] = payload["captcha_session_id"]
+        if payload.get("captcha_rqtoken"):
+            retry_headers["X-Captcha-Rqtoken"] = payload["captcha_rqtoken"]
+        request_headers = _build_headers(token, retry_headers)
+        invite_match = re.fullmatch(r"/invites/([A-Za-z0-9_-]+)", path)
+        if method.upper() == "POST" and invite_match and body_bytes is None:
+            invite_code = invite_match.group(1)
+            expected_guild_id = None
+            expected_guild_name = None
+            try:
+                preview = get(
+                    f"/invites/{invite_code}",
+                    params={"with_counts": "true", "with_expiration": "true"},
+                )
+                preview_guild = preview.get("guild", {}) if isinstance(preview, dict) else {}
+                expected_guild_id = str(preview_guild.get("id") or "") or None
+                expected_guild_name = str(preview_guild.get("name") or "") or None
+            except RuntimeError:
+                pass
+
+            def membership_check():
+                if not expected_guild_id:
+                    return None
+                for guild in get_guilds():
+                    if str(guild.get("id") or "") == expected_guild_id:
+                        return guild
+                return None
+
+            replay = complete_invite(
+                invite_code,
+                request_headers["Authorization"],
+                expected_guild_id=expected_guild_id,
+                expected_guild_name=expected_guild_name,
+                membership_check=membership_check,
+            )
+        else:
+            replay = solve_captcha(
+                payload,
+                replay_request={
+                    "method": method,
+                    "path": path,
+                    "body": body,
+                    "body_bytes": body_bytes,
+                    "params": params,
+                    "headers": request_headers,
+                },
+            )
+    except VimbrowserCaptchaError as e:
+        raise RuntimeError(
+            f"Discord requires a captcha ({reason}), but it could not be "
+            f"completed in vimbrowser: {e}"
+        ) from e
+
+    if not isinstance(replay, BrowserReplayResult):
+        raise RuntimeError("vimbrowser captcha fallback did not replay the Discord request")
+    if not (200 <= replay.status < 300):
+        raise RuntimeError(
+            "Discord rejected the request replayed by vimbrowser after captcha "
+            f"completion (HTTP {replay.status}): {replay.text[:500]}"
+        )
+
+    if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+        from src.accounts import audit_event
+        result_id = replay.body.get("id") if isinstance(replay.body, dict) else None
+        audit_event(
+            f"discord-api:{method.upper()}",
+            target=path,
+            result_id=result_id,
+        )
+    return True, replay.body
+
+
 def _request(method, path, body=None, body_bytes=None, token=None, params=None,
-             extra_headers=None):
+             extra_headers=None, allow_captcha_fallback=True):
     """Make an API request with connection pooling. Returns parsed JSON."""
     if body is not None and body_bytes is not None:
         raise ValueError("Provide either body or body_bytes, not both")
@@ -271,6 +369,21 @@ def _request(method, path, body=None, body_bytes=None, token=None, params=None,
                 from src.accounts import audit_event
                 result_id = result.get("id") if isinstance(result, dict) else None
                 audit_event(f"discord-api:{method.upper()}", target=path, result_id=result_id)
+            return result
+
+        handled, result = _maybe_retry_with_vimbrowser_captcha(
+            method,
+            path,
+            body=body,
+            body_bytes=body_bytes,
+            token=token,
+            params=params,
+            extra_headers=extra_headers,
+            status=status,
+            raw=raw,
+            allow_captcha_fallback=allow_captcha_fallback,
+        )
+        if handled:
             return result
 
         # Error handling
