@@ -35,7 +35,7 @@ commands:
   listen       Start real-time channel listener
   unlisten     Stop a channel listener
   listeners    List active listeners
-  notify       Manage notification relay              (add, remove, label, list, start, stop)
+  notify       Manage notifications                   (subscribe, unsubscribe, list; add/remove aliases; label/start/stop)
   join         Join a server via invite link
   leave        Leave a server
   typing       Trigger typing indicator

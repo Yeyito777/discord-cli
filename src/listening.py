@@ -46,12 +46,17 @@ def listen(argv):
                    help="Listen to a DM or group-DM conversation")
     p.add_argument("--notify", action="store_true",
                    help="Listen for all DMs and @mentions (legacy alias; prefer 'discord notify start')")
-    p.add_argument("--relay-conv", dest="relay_conv", metavar="ID",
-                   help="Exo conversation ID for instant notification relay")
+    p.add_argument(
+        "--relay-conv", dest="relay_conv", metavar="ID",
+        help="Legacy alias: subscribe this Exocortex conversation with wake delivery",
+    )
     args = p.parse_args(argv)
 
     if args.notify:
-        _start_notify_listener(relay_conv=args.relay_conv)
+        if args.relay_conv:
+            from src.notify import subscribe
+            subscribe([args.relay_conv, "--delivery", "wake"])
+        _start_notify_listener()
         return
 
     if not args.target:
@@ -139,7 +144,7 @@ def listen(argv):
     print(f"  PID: {proc.pid}")
 
 
-def _start_notify_listener(relay_conv=None):
+def _start_notify_listener():
     """Start the notification listener (DMs + @mentions)."""
     from src.notify import _find_notify_gateway_pids
 
@@ -166,8 +171,6 @@ def _start_notify_listener(relay_conv=None):
     err_file = LISTENER_DIR / "__notify__.err"
 
     cmd = [sys.executable, str(gateway_script), "__notify__", str(log_file)]
-    if relay_conv:
-        cmd.append(relay_conv)
 
     proc = subprocess.Popen(
         cmd,
@@ -182,13 +185,11 @@ def _start_notify_listener(relay_conv=None):
         "channel_id": "__notify__",
         "channel_name": "Notifications",
         "type": "notify",
-        "relay_conv": relay_conv,
         "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     (LISTENER_DIR / "__notify__.meta").write_text(json.dumps(meta))
 
-    relay_str = f" → relaying to exo conv {relay_conv}" if relay_conv else ""
-    print(f"  Notify listener started{relay_str}")
+    print("  Notify listener started (delivery managed by Exocortex)")
     print(f"  Output: {log_file}")
     print(f"  PID: {proc.pid}")
 

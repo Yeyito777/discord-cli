@@ -62,6 +62,11 @@ class AccountCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("requires '-a/--account <alias>'", result.stderr)
 
+    def test_notification_subscription_requires_explicit_account(self):
+        result = self.run_cli("notify", "subscribe", "conv-1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("requires '-a/--account <alias>'", result.stderr)
+
     def test_abbreviated_dm_send_requires_explicit_account(self):
         result = self.run_cli("dm", "somebody", "--sen", "hello")
         self.assertEqual(result.returncode, 1)

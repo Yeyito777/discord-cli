@@ -29,7 +29,7 @@ if str(PROJECT_DIR) not in sys.path:
 
 import websocket
 
-from src.accounts import account_config_path, listener_dir, selected_account
+from src.accounts import listener_dir, selected_account
 from src.calls.state import call_paths, read_call_meta
 
 # ─── Client fingerprint (matches api.py) ─────────────────────────────────────
@@ -49,7 +49,7 @@ DEFAULT_CAPABILITIES = 30717
 NOTIFY_LISTENER_DIR = listener_dir()
 NOTIFY_LOCK_PATH = NOTIFY_LISTENER_DIR / "__notify__.lock"
 NOTIFY_PID_PATH = NOTIFY_LISTENER_DIR / "__notify__.pid"
-RELAY_SEEN_LIMIT = 200
+NOTIFICATION_SEEN_LIMIT = 200
 
 # ─── Build number ────────────────────────────────────────────────────────────
 
@@ -79,14 +79,18 @@ class GatewayListener:
     automatic reconnection with resume, and graceful shutdown on SIGTERM.
     """
 
-    def __init__(self, channel_id, output_file, relay_targets=None):
+    def __init__(self, channel_id, output_file):
         self.channel_id = channel_id
         self.output_file = output_file
-        self.relay_targets = relay_targets or []   # exo conversation IDs for instant relay
 
         from src.auth import get_token
         self.token = get_token()
         self.account = selected_account()
+
+        self.notification_source = None
+        if self.channel_id == "__notify__":
+            from src.notify import notification_source
+            self.notification_source = notification_source(self.account)
 
         self.running = True
         self.ws = None
@@ -105,11 +109,11 @@ class GatewayListener:
         self._call_event_baseline_until = 0.0  # suppress call-state hydration after READY
         self._notify_lock_fd = None
 
-        # Notification relay queue (notify mode with relay_conv)
-        self._relay_queue = []
-        self._relay_lock = threading.Lock()
-        self._relay_active = False
-        self._relay_seen = defaultdict(dict)  # relay_target -> channel_id -> {ids, order}
+        # Notification IPC publisher queue (notify mode only).
+        self._notification_queue = []
+        self._notification_lock = threading.Lock()
+        self._notification_active = False
+        self._notification_seen = {}  # channel_id -> {ids, order}
 
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
@@ -165,20 +169,19 @@ class GatewayListener:
                 pass
             self._notify_lock_fd = None
 
-    def _get_relay_seen_ids(self, relay_target, channel_id):
-        bucket = self._relay_seen.get(relay_target, {}).get(channel_id)
+    def _get_notification_seen_ids(self, channel_id):
+        bucket = self._notification_seen.get(channel_id)
         if not bucket:
             return set()
         return set(bucket["ids"])
 
-    def _mark_relay_seen(self, relay_target, channel_id, msg_ids):
-        if not relay_target or not channel_id or not msg_ids:
+    def _mark_notification_seen(self, channel_id, msg_ids):
+        if not channel_id or not msg_ids:
             return
-        buckets = self._relay_seen[relay_target]
-        bucket = buckets.get(channel_id)
+        bucket = self._notification_seen.get(channel_id)
         if bucket is None:
             bucket = {"ids": set(), "order": deque()}
-            buckets[channel_id] = bucket
+            self._notification_seen[channel_id] = bucket
 
         seen_ids = bucket["ids"]
         order = bucket["order"]
@@ -187,14 +190,16 @@ class GatewayListener:
                 continue
             seen_ids.add(msg_id)
             order.append(msg_id)
-            while len(order) > RELAY_SEEN_LIMIT:
+            while len(order) > NOTIFICATION_SEEN_LIMIT:
                 old = order.popleft()
                 seen_ids.discard(old)
 
     # ─── Main loop ───────────────────────────────────────────────────────────
 
     def run(self):
-        """Connect and run until stopped. Auto-reconnects on failure."""
+        """Register the source, then connect and run until stopped."""
+        if self.channel_id == "__notify__":
+            self._register_notification_source()
         while self.running:
             try:
                 self._connect()
@@ -531,9 +536,8 @@ class GatewayListener:
         # Always log to file
         self._write(json.dumps(notif) + "\n")
 
-        # If relay is configured, queue for instant delivery
-        if self.relay_targets:
-            self._queue_relay(notif)
+        # Exocortex owns subscription routing and delivery.
+        self._queue_notification(notif)
 
     def _is_call_message(self, d):
         """Return True for Discord's call system message in a DM/group DM."""
@@ -557,6 +561,7 @@ class GatewayListener:
             voice_state_user_ids={str(author.get("id"))} if author.get("id") else set(),
             region=(d.get("call") or {}).get("region") if isinstance(d.get("call"), dict) else None,
             timestamp=d.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%S"),
+            event_id=f"call:{d.get('id')}" if d.get("id") else None,
         )
 
     def _on_notify_call(self, event_type, d):
@@ -583,7 +588,7 @@ class GatewayListener:
         if active_meta:
             # This process started/joined the call. The detached call worker has
             # its own gateway and emits in-call joined/left notifications; the
-            # global DM notification relay must not reclassify our outbound call
+            # global DM notification source must not reclassify our outbound call
             # or participant changes as an incoming call.
             return
         ringing = {str(user_id) for user_id in (d.get("ringing") or []) if user_id}
@@ -606,14 +611,17 @@ class GatewayListener:
             ringing=ringing,
             voice_state_user_ids=voice_state_user_ids,
             region=d.get("region"),
+            event_id=f"call:{d.get('id')}" if d.get("id") else None,
         )
 
-    def _emit_call_notification(self, channel_id, priv, caller, *, ringing=None, voice_state_user_ids=None, region=None, timestamp=None):
+    def _emit_call_notification(self, channel_id, priv, caller, *, ringing=None, voice_state_user_ids=None, region=None, timestamp=None, event_id=None):
         participants = priv.get("participants") or []
         private_type = priv.get("channel_type") or "dm"
         channel_name = priv.get("channel_name") or channel_id
+        occurred_at = timestamp or time.strftime("%Y-%m-%dT%H:%M:%S")
         notif = {
-            "ts": timestamp or time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "ts": occurred_at,
+            "event_id": event_id or f"call:{channel_id}:{occurred_at}",
             "type": "call",
             "channel_type": private_type,
             "is_group_dm": private_type == "group_dm",
@@ -627,8 +635,7 @@ class GatewayListener:
         }
         self._notified_calls.add(channel_id)
         self._write(json.dumps(notif) + "\n")
-        if self.relay_targets:
-            self._queue_relay(notif)
+        self._queue_notification(notif)
 
     def _active_call_meta(self, channel_id):
         return read_call_meta(call_paths(channel_id)["meta"])
@@ -646,68 +653,108 @@ class GatewayListener:
                 return user_id
         return "someone"
 
-    # ─── Instant relay ───────────────────────────────────────────────────────
+    # ─── Exocortex notification IPC ──────────────────────────────────────────
 
-    def _queue_relay(self, notif):
-        """Add a notification to the relay queue and trigger the sender."""
-        with self._relay_lock:
-            self._relay_queue.append(notif)
-            if self._relay_active:
-                return  # sender thread will pick it up
-            self._relay_active = True
+    def _register_notification_source(self):
+        from src.exocortex import register_external_notification_source
 
-        threading.Thread(target=self._relay_sender, daemon=True).start()
+        register_external_notification_source("discord", self.notification_source)
+        self._log(f"Registered notification source {self.notification_source['id']}")
 
-    def _relay_sender(self):
-        """Process the relay queue — sends batched notifications via exo.
+    def _queue_notification(self, notif):
+        """Add an event to the asynchronous, retryable IPC publisher queue."""
+        with self._notification_lock:
+            self._notification_queue.append(notif)
+            if self._notification_active:
+                return
+            self._notification_active = True
 
-        Uses `exo send`, whose busy-conversation fallback queues for the next
-        turn. When the target conversation is idle, notifications send
-        immediately.
-        """
+        threading.Thread(target=self._notification_sender, daemon=True).start()
+
+    def _notification_sender(self):
+        """Publish queued events; event IDs make uncertain retries deduplicable."""
         while self.running:
-            with self._relay_lock:
-                if not self._relay_queue:
-                    self._relay_active = False
+            with self._notification_lock:
+                if not self._notification_queue:
+                    self._notification_active = False
                     return
-                batch = list(self._relay_queue)
-                self._relay_queue.clear()
+                batch = list(self._notification_queue)
+                self._notification_queue.clear()
 
-            self._log(f"Relaying {len(batch)} notification(s) to {len(self.relay_targets)} target(s)")
-
-            for conv_id in self.relay_targets:
-                msg, seen_updates = self._format_relay(batch, relay_target=conv_id)
-                if not msg:
-                    self._log(f"Relay to {conv_id}: skipped stale notification batch")
-                    continue
+            retry_from = None
+            for index, notif in enumerate(batch):
                 try:
-                    result = subprocess.run(
-                        ["exo", "send", msg, "-c", conv_id, "--timeout", "600", "--no-notify"],
-                        capture_output=True, text=True, timeout=660,
-                    )
-                    if result.returncode != 0:
-                        self._log(f"Relay to {conv_id} failed: {result.stderr[:200]}")
-                    else:
-                        for channel_id, msg_ids in seen_updates.items():
-                            self._mark_relay_seen(conv_id, channel_id, msg_ids)
-                        out = result.stdout.strip()
-                        if "queued" in out.lower():
-                            self._log(f"Relay to {conv_id}: queued for next turn")
-                        else:
-                            self._log(f"Relay to {conv_id}: delivered")
-                except subprocess.TimeoutExpired:
-                    self._log(f"Relay to {conv_id} timed out")
-                except Exception as e:
-                    self._log(f"Relay to {conv_id} error: {e}")
+                    self._publish_notification(notif)
+                except Exception as exc:
+                    self._log(f"Notification publish failed: {exc}")
+                    retry_from = index
+                    break
 
-            # Brief pause before checking queue again (lets batching happen)
-            time.sleep(2)
+            if retry_from is not None:
+                with self._notification_lock:
+                    self._notification_queue[0:0] = batch[retry_from:]
+                time.sleep(2)
 
-    def _format_relay(self, batch, *, relay_target=None):
-        """Format notification batch into a human-readable message.
+    def _publish_notification(self, notif):
+        from src.exocortex import publish_external_notification
 
-        Returns (message_text, seen_updates) where seen_updates maps channel_id
-        to message IDs that were actually shown to this relay target.
+        text, seen_updates = self._format_notification_batch([notif])
+        if not text:
+            self._log("Skipped stale notification event")
+            return None
+
+        event_id = self._notification_event_id(notif)
+        result = publish_external_notification(
+            "discord",
+            self.notification_source["id"],
+            event_id,
+            text,
+            occurred_at=self._notification_occurred_at_ms(notif.get("ts")),
+        )
+        failures = [
+            delivery for delivery in (result.get("deliveries") or [])
+            if isinstance(delivery, dict) and delivery.get("status") == "failed"
+        ]
+        if failures:
+            raise RuntimeError(
+                f"Exocortex rejected {len(failures)} notification delivery target(s)"
+            )
+        for channel_id, msg_ids in seen_updates.items():
+            self._mark_notification_seen(channel_id, msg_ids)
+        self._log(f"Published notification event {event_id}")
+        return result
+
+    @staticmethod
+    def _notification_occurred_at_ms(value):
+        if isinstance(value, (int, float)):
+            return int(value)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            from datetime import datetime
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            return int(parsed.timestamp() * 1000)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _notification_event_id(notif):
+        explicit = str(notif.get("event_id") or "").strip()
+        if explicit:
+            return explicit
+        msg_id = str(notif.get("msg_id") or "").strip()
+        if msg_id:
+            return msg_id
+        event_type = str(notif.get("type") or "notification")
+        channel_id = str(notif.get("channel_id") or "unknown")
+        occurred_at = str(notif.get("ts") or "unknown")
+        return f"{event_type}:{channel_id}:{occurred_at}"
+
+    def _format_notification_batch(self, batch):
+        """Format notification events into human-readable text.
+
+        Returns (message_text, seen_updates) where seen_updates maps channel IDs
+        to contextual message IDs included in the published event.
         """
         from src.private_channels import summarize_participants
 
@@ -727,7 +774,7 @@ class GatewayListener:
             if n.get("type") == "call":
                 ch_id = n.get("channel_id", "")
                 if ch_id and self._active_call_meta(ch_id):
-                    self._log(f"Suppressing queued incoming-call relay for active call {ch_id}")
+                    self._log(f"Suppressing queued incoming-call notification for active call {ch_id}")
                     continue
                 channel_type = n.get("channel_type") or "dm"
                 channel_name = n.get("channel_name") or n.get("channel_id", "")
@@ -789,7 +836,7 @@ class GatewayListener:
                 channel_id = n.get("channel_id", "")
                 current_seen = local_seen.get(channel_id)
                 if current_seen is None:
-                    current_seen = self._get_relay_seen_ids(relay_target, channel_id)
+                    current_seen = self._get_notification_seen_ids(channel_id)
                     local_seen[channel_id] = current_seen
 
                 # Fetch recent channel history for server mentions
@@ -1043,19 +1090,8 @@ if __name__ == "__main__":
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-    if len(sys.argv) < 3:
-        print("Usage: gateway.py <channel_id> <output_file> [relay_target ...]", file=sys.stderr)
+    if len(sys.argv) != 3:
+        print("Usage: gateway.py <channel_id> <output_file>", file=sys.stderr)
         sys.exit(1)
 
-    targets = sys.argv[3:] if len(sys.argv) > 3 else []
-
-    # If no relay targets on CLI, try loading from config/notify.json
-    if not targets:
-        config_path = account_config_path("notify.json")
-        try:
-            with open(config_path) as f:
-                targets = json.load(f).get("relay_targets", [])
-        except (FileNotFoundError, json.JSONDecodeError, KeyError):
-            pass
-
-    GatewayListener(sys.argv[1], sys.argv[2], relay_targets=targets).run()
+    GatewayListener(sys.argv[1], sys.argv[2]).run()

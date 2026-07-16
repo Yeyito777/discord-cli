@@ -127,8 +127,11 @@ def _configured_notify_targets():
     if parent:
         return [parent]
     try:
-        from src.notify import get_relay_targets
-        return list(get_relay_targets())
+        from src.notify import get_subscription_targets
+        # Detached call workers still use direct wake delivery for their
+        # call-specific status/transcription stream.  Do not turn an inbox-only
+        # Discord source subscription into a wake.
+        return get_subscription_targets(delivery="wake")
     except Exception:
         return []
 
