@@ -503,7 +503,8 @@ class GatewayListener:
             "author_id": author.get("id", ""),
             "author": author.get("username", ""),
             "display_name": author.get("global_name") or author.get("username", ""),
-            "content": (d.get("content") or "")[:300],
+            "content": d.get("content") or "",
+            "mentions_assistant": mentions_me,
             "channel_id": channel_id,
             "msg_id": d.get("id", ""),
         }
@@ -514,6 +515,9 @@ class GatewayListener:
             participants = priv.get("participants") or []
             if participants:
                 notif["channel_participants"] = participants
+            participant_ids = priv.get("participant_ids") or []
+            if participant_ids:
+                notif["channel_participant_ids"] = participant_ids
 
         # Extract reply reference if present
         ref = d.get("referenced_message")
@@ -521,9 +525,10 @@ class GatewayListener:
             ref_author = ref.get("author", {})
             notif["reply_to"] = {
                 "msg_id": ref.get("id", ""),
+                "author_id": ref_author.get("id", ""),
                 "author": ref_author.get("username", ""),
                 "display_name": ref_author.get("global_name") or ref_author.get("username", ""),
-                "content": (ref.get("content") or "")[:100],
+                "content": ref.get("content") or "",
             }
 
         if not is_dm:
@@ -628,6 +633,7 @@ class GatewayListener:
             "channel_id": channel_id,
             "channel_name": channel_name,
             "channel_participants": participants,
+            "channel_participant_ids": priv.get("participant_ids") or [],
             "caller": caller,
             "ringing_user_ids": sorted(ringing or []),
             "voice_state_user_ids": sorted(voice_state_user_ids or []),
@@ -710,6 +716,7 @@ class GatewayListener:
             event_id,
             text,
             occurred_at=self._notification_occurred_at_ms(notif.get("ts")),
+            data=self._notification_data(notif),
         )
         failures = [
             delivery for delivery in (result.get("deliveries") or [])
@@ -749,6 +756,77 @@ class GatewayListener:
         channel_id = str(notif.get("channel_id") or "unknown")
         occurred_at = str(notif.get("ts") or "unknown")
         return f"{event_type}:{channel_id}:{occurred_at}"
+
+    def _notification_data(self, notif):
+        """Return the stable, machine-readable representation of an event.
+
+        ``text`` is intentionally optimized for people and model context.  This
+        payload is the routing/filtering API and therefore must not depend on
+        punctuation, truncation, or line wrapping in the rendered text.
+        """
+        event_type = str(notif.get("type") or "notification")
+        kind = "server_mention" if event_type == "mention" else event_type
+        account_alias = ""
+        if isinstance(getattr(self, "account", None), dict):
+            account_alias = str(self.account.get("alias") or "")
+
+        data = {
+            "schemaVersion": 1,
+            "accountAlias": account_alias,
+            "kind": kind,
+            "channel": {
+                "id": str(notif.get("channel_id") or ""),
+                "type": str(notif.get("channel_type") or ""),
+                "name": str(notif.get("channel_name") or ""),
+                "participants": list(notif.get("channel_participants") or []),
+                "participantIds": [
+                    str(value) for value in (notif.get("channel_participant_ids") or [])
+                ],
+            },
+        }
+
+        if event_type == "call":
+            data["call"] = {
+                "callerName": str(notif.get("caller") or ""),
+                "ringingUserIds": [
+                    str(value) for value in (notif.get("ringing_user_ids") or [])
+                ],
+                "voiceStateUserIds": [
+                    str(value) for value in (notif.get("voice_state_user_ids") or [])
+                ],
+                "region": notif.get("region"),
+            }
+            return data
+
+        reply = notif.get("reply_to")
+        reply_data = None
+        if isinstance(reply, dict):
+            reply_data = {
+                "messageId": str(reply.get("msg_id") or ""),
+                "author": {
+                    "id": str(reply.get("author_id") or ""),
+                    "username": str(reply.get("author") or ""),
+                    "displayName": str(reply.get("display_name") or ""),
+                },
+                "content": str(reply.get("content") or ""),
+            }
+
+        data.update({
+            "guild": {
+                "id": str(notif.get("guild_id") or ""),
+                "name": str(notif.get("guild_name") or ""),
+            } if event_type == "mention" else None,
+            "messageId": str(notif.get("msg_id") or ""),
+            "author": {
+                "id": str(notif.get("author_id") or ""),
+                "username": str(notif.get("author") or ""),
+                "displayName": str(notif.get("display_name") or ""),
+            },
+            "content": str(notif.get("content") or ""),
+            "mentionsAssistant": bool(notif.get("mentions_assistant")),
+            "replyTo": reply_data,
+        })
+        return data
 
     def _format_notification_batch(self, batch):
         """Format notification events into human-readable text.

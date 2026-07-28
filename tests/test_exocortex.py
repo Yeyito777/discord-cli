@@ -125,7 +125,12 @@ class ExocortexRequestTests(unittest.TestCase):
             )
             self.assertEqual(
                 exocortex.publish_external_notification(
-                    "discord", "source-1", "event-1", "hello", occurred_at="2026-07-15T12:00:00Z"
+                    "discord",
+                    "source-1",
+                    "event-1",
+                    "hello",
+                    occurred_at="2026-07-15T12:00:00Z",
+                    data={"schemaVersion": 1, "kind": "dm"},
                 ),
                 {"delivered": 1},
             )
@@ -146,6 +151,10 @@ class ExocortexRequestTests(unittest.TestCase):
             "convId": "conv-1",
         })
         self.assertEqual(request.call_args_list[4].kwargs["occurredAt"], "2026-07-15T12:00:00Z")
+        self.assertEqual(
+            request.call_args_list[4].kwargs["data"],
+            {"schemaVersion": 1, "kind": "dm"},
+        )
 
     def test_unsubscribe_by_id_does_not_mix_tuple_fields(self):
         with patch.object(exocortex, "request", return_value={"subscriptions": []}) as request:

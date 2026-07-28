@@ -180,6 +180,7 @@ def publish_external_notification(
     text,
     *,
     occurred_at=None,
+    data=None,
     timeout_seconds=10,
 ):
     event = request(
@@ -191,6 +192,7 @@ def publish_external_notification(
         eventId=event_id,
         text=text,
         occurredAt=occurred_at,
+        data=data,
     )
     # Keep the helper useful if the wire event later grows top-level receipt
     # fields while supporting the conventional nested result shape now.

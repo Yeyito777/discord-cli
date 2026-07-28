@@ -12,6 +12,7 @@ class GatewayNotificationTests(unittest.TestCase):
             "id": "account:paramount:notifications",
             "label": "Paramount · DMs and @mentions",
         }
+        listener.account = {"alias": "paramount"}
         listener._log = Mock()
 
         with patch("src.exocortex.register_external_notification_source") as register:
@@ -25,6 +26,7 @@ class GatewayNotificationTests(unittest.TestCase):
             "id": "account:paramount:notifications",
             "label": "Paramount · DMs and @mentions",
         }
+        listener.account = {"alias": "paramount"}
         listener._format_notification_batch = Mock(
             return_value=("[Discord/paramount Notification] hello", defaultdict(set, {"ch-1": {"old-1"}}))
         )
@@ -35,6 +37,11 @@ class GatewayNotificationTests(unittest.TestCase):
             "ts": "2026-07-15T12:00:00Z",
             "channel_id": "ch-1",
             "type": "dm",
+            "channel_type": "dm",
+            "author_id": "friend-1",
+            "author": "friend",
+            "display_name": "Friend",
+            "content": "hello",
         }
 
         with patch(
@@ -48,6 +55,28 @@ class GatewayNotificationTests(unittest.TestCase):
             "message-1",
             "[Discord/paramount Notification] hello",
             occurred_at=1784116800000,
+            data={
+                "schemaVersion": 1,
+                "accountAlias": "paramount",
+                "kind": "dm",
+                "channel": {
+                    "id": "ch-1",
+                    "type": "dm",
+                    "name": "",
+                    "participants": [],
+                    "participantIds": [],
+                },
+                "guild": None,
+                "messageId": "message-1",
+                "author": {
+                    "id": "friend-1",
+                    "username": "friend",
+                    "displayName": "Friend",
+                },
+                "content": "hello",
+                "mentionsAssistant": False,
+                "replyTo": None,
+            },
         )
         listener._mark_notification_seen.assert_called_once_with("ch-1", {"old-1"})
         self.assertEqual(result, {"delivered": 1})
@@ -58,6 +87,7 @@ class GatewayNotificationTests(unittest.TestCase):
             "id": "account:paramount:notifications",
             "label": "Paramount · DMs and @mentions",
         }
+        listener.account = {"alias": "paramount"}
         listener._format_notification_batch = Mock(
             return_value=("notification", defaultdict(set, {"ch-1": {"old-1"}}))
         )
@@ -122,6 +152,75 @@ class GatewayNotificationTests(unittest.TestCase):
         queued = listener._queue_notification.call_args.args[0]
         self.assertEqual(queued["msg_id"], "message-1")
         self.assertEqual(queued["type"], "dm")
+
+    def test_structured_dm_data_preserves_multiline_content_and_reply_fields(self):
+        listener = object.__new__(GatewayListener)
+        listener.account = {"alias": "paramount"}
+
+        data = listener._notification_data({
+            "type": "dm",
+            "channel_type": "dm",
+            "channel_id": "ch-1",
+            "channel_name": "Yeyito",
+            "channel_participants": ["yeyito777"],
+            "channel_participant_ids": ["owner-1"],
+            "msg_id": "message-1",
+            "author_id": "owner-1",
+            "author": "yeyito777",
+            "display_name": "Yeyito",
+            "content": "first line\nsecond line",
+            "mentions_assistant": False,
+            "reply_to": {
+                "msg_id": "old-1",
+                "author_id": "assistant-1",
+                "author": "paramount.available",
+                "display_name": "Paramount",
+                "content": "the complete referenced message",
+            },
+        })
+
+        self.assertEqual(data["kind"], "dm")
+        self.assertEqual(data["content"], "first line\nsecond line")
+        self.assertEqual(data["author"]["id"], "owner-1")
+        self.assertEqual(data["channel"]["participantIds"], ["owner-1"])
+        self.assertEqual(data["replyTo"]["author"]["id"], "assistant-1")
+        self.assertEqual(data["replyTo"]["content"], "the complete referenced message")
+
+    def test_structured_server_mention_and_call_are_discriminated(self):
+        listener = object.__new__(GatewayListener)
+        listener.account = {"alias": "paramount"}
+
+        mention = listener._notification_data({
+            "type": "mention",
+            "channel_type": "guild_text",
+            "channel_id": "channel-1",
+            "channel_name": "general",
+            "guild_id": "guild-1",
+            "guild_name": "raw mutton",
+            "msg_id": "message-1",
+            "author_id": "owner-1",
+            "author": "yeyito777",
+            "display_name": "Yeyito",
+            "content": "@Paramount hello",
+            "mentions_assistant": True,
+        })
+        call = listener._notification_data({
+            "type": "call",
+            "channel_type": "dm",
+            "channel_id": "dm-1",
+            "channel_name": "Yeyito",
+            "caller": "yeyito777",
+            "ringing_user_ids": ["assistant-1"],
+            "voice_state_user_ids": ["owner-1"],
+            "region": "us-east",
+        })
+
+        self.assertEqual(mention["kind"], "server_mention")
+        self.assertEqual(mention["guild"], {"id": "guild-1", "name": "raw mutton"})
+        self.assertTrue(mention["mentionsAssistant"])
+        self.assertEqual(call["kind"], "call")
+        self.assertEqual(call["call"]["voiceStateUserIds"], ["owner-1"])
+        self.assertNotIn("content", call)
 
 
 if __name__ == "__main__":
