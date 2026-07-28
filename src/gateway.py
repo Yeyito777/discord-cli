@@ -828,6 +828,24 @@ class GatewayListener:
         })
         return data
 
+    def _notification_actor(self, user_id, display_name, labels):
+        user_id = str(user_id or "")
+        name = str(display_name or "?")
+        mention = f" <@{user_id}>" if user_id else ""
+        entry = labels.get(user_id, {}) if labels else {}
+        label = entry.get("label", "") if isinstance(entry, dict) else entry
+        if not label and user_id and user_id == str(getattr(self, "my_id", "")):
+            label = (getattr(self, "account", {}) or {}).get("owner", "")
+        label_tag = f" [{label}]" if label else ""
+        return f"{name}{mention}{label_tag}"
+
+    @staticmethod
+    def _notification_reply_marker(reply_to):
+        if not isinstance(reply_to, dict):
+            return ""
+        message_id = str(reply_to.get("msg_id") or "")
+        return f" ↳ [reply-to:{message_id}]" if message_id else ""
+
     def _format_notification_batch(self, batch):
         """Format notification events into human-readable text.
 
@@ -862,52 +880,33 @@ class GatewayListener:
                 if channel_type == "group_dm":
                     preview = summarize_participants(participants)
                     summary = channel_name or preview or "Group DM"
-                    participant_suffix = f" [group: {preview}]" if preview and preview != summary else ""
-                    parts.append(f"☎ Incoming group DM call [{summary}] from {caller}{participant_suffix}{ch_tag}")
+                    parts.append(f"Group DM › {summary}{ch_tag}\n\n→ Incoming call from {caller}")
                 else:
-                    conv_tag = f" [dm:{channel_name}]" if channel_name else ""
-                    parts.append(f"☎ Incoming DM call from {caller}{conv_tag}{ch_tag}")
+                    parts.append(f"{channel_name or 'DM'}{ch_tag}\n\n→ Incoming call from {caller}")
                 continue
 
             name = n.get("display_name") or n.get("author", "?")
-            username = n.get("author", "?")
             author_id = n.get("author_id", "")
-            entry = labels.get(author_id, {})
-            label = entry.get("label", "") if isinstance(entry, dict) else entry
-            label_str = f" [{label}]" if label else ""
-            content = n.get("content", "")[:200]
-
+            actor = self._notification_actor(author_id, name, labels)
+            content = n.get("content") or "[message]"
             msg_id = n.get("msg_id", "")
-            id_tag = f" [msg:{msg_id}]" if msg_id else ""
-
-            # Format reply context if present
-            reply_ctx = ""
-            reply_to = n.get("reply_to")
-            if reply_to:
-                ref_name = reply_to.get("display_name") or reply_to.get("author", "?")
-                ref_preview = reply_to.get("content", "")[:80]
-                reply_ctx = f' (replying to {ref_name}: "{ref_preview}")'
+            id_line = f"\n[msg:{msg_id}]" if msg_id else ""
+            reply_marker = self._notification_reply_marker(n.get("reply_to"))
+            event_line = f"→ {actor}{reply_marker}:\n{content}{id_line}"
 
             if n.get("type") in {"dm", "group_dm"}:
                 ch_id = n.get("channel_id", "")
                 channel_type = n.get("channel_type") or n.get("type") or "dm"
                 channel_name = n.get("channel_name") or ch_id
                 participants = n.get("channel_participants") or []
+                ch_tag = f" [ch:{ch_id}]" if ch_id else ""
 
                 if channel_type == "group_dm":
                     preview = summarize_participants(participants)
                     summary = channel_name or preview or "Group DM"
-                    participant_suffix = f" [group: {preview}]" if preview and preview != summary else ""
-                    ch_tag = f" [ch:{ch_id}]" if ch_id else ""
-                    parts.append(
-                        f'Group DM [{summary}] from {name} (@{username}){label_str}{participant_suffix}{ch_tag}{id_tag}{reply_ctx}: "{content}"'
-                    )
+                    parts.append(f"Group DM › {summary}{ch_tag}\n\n{event_line}")
                 else:
-                    ch_tag = f" [ch:{ch_id}]" if ch_id else ""
-                    conv_tag = f" [dm:{channel_name}]" if channel_name else ""
-                    parts.append(
-                        f'DM from {name} (@{username}){label_str}{conv_tag}{ch_tag}{id_tag}{reply_ctx}: "{content}"'
-                    )
+                    parts.append(f"{channel_name or name}{ch_tag}\n\n{event_line}")
             else:
                 guild = n.get("guild_name", "?")
                 channel = n.get("channel_name", "?")
@@ -917,7 +916,6 @@ class GatewayListener:
                     current_seen = self._get_notification_seen_ids(channel_id)
                     local_seen[channel_id] = current_seen
 
-                # Fetch recent channel history for server mentions
                 history_lines, shown_history_ids = self._fetch_channel_history(
                     channel_id, msg_id, history_cache, labels, seen_ids=current_seen
                 )
@@ -925,22 +923,14 @@ class GatewayListener:
                     current_seen.update(shown_history_ids)
                     seen_updates[channel_id].update(shown_history_ids)
 
-                # Notification line — ⟶ prefix distinguishes from history
+                location = f"{guild} › #{channel}"
+                if channel_id:
+                    location += f" [ch:{channel_id}]"
                 if history_lines:
-                    # Server/channel in header, don't repeat in notification line
-                    mention_line = (
-                        f'\u27F6 @mention from {name} (@{username}){label_str}'
-                        f'{id_tag}{reply_ctx}: "{content}"'
-                    )
-                    header = f"Server: {guild} | Channel: #{channel}"
-                    history_block = "Recent history:\n" + "\n".join(history_lines)
-                    parts.append(f'{header}\n{history_block}\n{mention_line}')
+                    history_block = "Context:\n" + "\n".join(history_lines)
+                    parts.append(f"{location}\n\n{history_block}\n\n{event_line}")
                 else:
-                    # Fallback: no history available, include server/channel in notification line
-                    parts.append(
-                        f'\u27F6 @mention from {name} (@{username}){label_str}'
-                        f' in #{channel} ({guild}){id_tag}{reply_ctx}: "{content}"'
-                    )
+                    parts.append(f"{location}\n\n{event_line}")
 
                 if msg_id:
                     current_seen.add(msg_id)
@@ -948,17 +938,7 @@ class GatewayListener:
 
         if not parts:
             return "", seen_updates
-
-        if len(parts) == 1:
-            # Server mentions with history are multiline; DMs stay on one line
-            if "\n" in parts[0]:
-                return f"[Discord/{self.account['alias']} Notification]\n{parts[0]}", seen_updates
-            else:
-                return f"[Discord/{self.account['alias']} Notification] {parts[0]}", seen_updates
-        else:
-            header = f"[Discord/{self.account['alias']} Notification] {len(parts)} new:"
-            body = "\n".join(f"  \u2022 {p}" for p in parts)
-            return f"{header}\n{body}", seen_updates
+        return "\n\n".join(parts), seen_updates
 
     def _fetch_channel_history(self, channel_id, exclude_msg_id, cache, labels=None, seen_ids=None):
         """Fetch recent messages from a channel for context.
@@ -984,35 +964,6 @@ class GatewayListener:
         if not messages:
             return [], []
 
-        # Build user_id → display_name map for mention resolution
-        user_names = {}
-
-        # 1. From labels config
-        if labels:
-            for uid, entry in labels.items():
-                if isinstance(entry, dict):
-                    name = entry.get("name") or entry.get("username")
-                else:
-                    name = str(entry)
-                if name:
-                    user_names[uid] = name
-
-        # 2. From message authors and mentions in this history batch
-        for m in messages:
-            author = m.get("author", {})
-            aid = author.get("id")
-            if aid and aid not in user_names:
-                user_names[aid] = author.get("global_name") or author.get("username", "?")
-            for mention in m.get("mentions", []):
-                mid = mention.get("id")
-                if mid and mid not in user_names:
-                    user_names[mid] = mention.get("global_name") or mention.get("username", "?")
-
-        def _resolve_mention(match):
-            uid = match.group(1)
-            name = user_names.get(uid)
-            return f"@{name}" if name else match.group(0)
-
         seen_ids = seen_ids or set()
         lines = []
         shown_message_ids = []
@@ -1022,11 +973,9 @@ class GatewayListener:
                 continue
             author = m.get("author", {})
             author_name = author.get("global_name") or author.get("username", "?")
-            body = (m.get("content") or "")[:150]
-
-            # Resolve user mentions (<@id> and <@!id>) in body
-            if body:
-                body = re.sub(r'<@!?(\d+)>', _resolve_mention, body)
+            author_id = author.get("id", "")
+            actor = self._notification_actor(author_id, author_name, labels or {})
+            body = re.sub(r"\s+", " ", m.get("content") or "").strip()[:200]
 
             # Build attachment / embed / sticker indicators
             extras = []
@@ -1058,14 +1007,13 @@ class GatewayListener:
             else:
                 continue  # nothing to show
 
-            # Check if this message is a reply
             ref = m.get("referenced_message")
             if ref and isinstance(ref, dict):
-                ref_author = ref.get("author", {})
-                ref_name = ref_author.get("global_name") or ref_author.get("username", "?")
-                lines.append(f"  [msg:{mid}] (reply to {ref_name}) {author_name}: {content}")
+                ref_id = str(ref.get("id") or "")
+                reply_marker = f" ↳ [reply-to:{ref_id}]" if ref_id else ""
+                lines.append(f"{actor}{reply_marker}: {content} [msg:{mid}]")
             else:
-                lines.append(f"  [msg:{mid}] {author_name}: {content}")
+                lines.append(f"{actor}: {content} [msg:{mid}]")
             shown_message_ids.append(mid)
 
         return lines, shown_message_ids

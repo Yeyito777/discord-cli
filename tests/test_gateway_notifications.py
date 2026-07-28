@@ -222,6 +222,109 @@ class GatewayNotificationTests(unittest.TestCase):
         self.assertEqual(call["call"]["voiceStateUserIds"], ["owner-1"])
         self.assertNotIn("content", call)
 
+    def test_server_mention_projection_keeps_context_and_actionable_ids(self):
+        listener = object.__new__(GatewayListener)
+        listener.account = {"alias": "paramount", "owner": "assistant"}
+        listener.my_id = "assistant-1"
+        listener._active_call_meta = Mock(return_value=None)
+        listener._get_notification_seen_ids = Mock(return_value=set())
+        listener._fetch_channel_history = Mock(return_value=(
+            [
+                "Yeyito <@owner-1> [owner]: previous message [msg:old-1]",
+                "Paramount <@assistant-1> [assistant] ↳ [reply-to:old-1]: response [msg:old-2]",
+            ],
+            ["old-1", "old-2"],
+        ))
+
+        notification = {
+            "type": "mention",
+            "channel_type": "guild_text",
+            "guild_name": "raw mutton",
+            "channel_name": "yeyo-dev",
+            "channel_id": "channel-1",
+            "msg_id": "message-1",
+            "author_id": "owner-1",
+            "author": "yeyito777",
+            "display_name": "Yeyito",
+            "content": "first line\nsecond line",
+        }
+        with patch("src.notify.get_labels", return_value={"owner-1": {"label": "owner"}}):
+            text, seen = listener._format_notification_batch([notification])
+
+        self.assertEqual(text, "\n".join([
+            "raw mutton › #yeyo-dev [ch:channel-1]",
+            "",
+            "Context:",
+            "Yeyito <@owner-1> [owner]: previous message [msg:old-1]",
+            "Paramount <@assistant-1> [assistant] ↳ [reply-to:old-1]: response [msg:old-2]",
+            "",
+            "→ Yeyito <@owner-1> [owner]:",
+            "first line",
+            "second line",
+            "[msg:message-1]",
+        ]))
+        self.assertEqual(seen["channel-1"], {"old-1", "old-2", "message-1"})
+        self.assertNotIn("[Discord/", text)
+
+    def test_dm_projection_formats_reply_without_duplicate_provenance(self):
+        listener = object.__new__(GatewayListener)
+        listener.account = {"alias": "paramount", "owner": "assistant"}
+        listener.my_id = "assistant-1"
+        with patch("src.notify.get_labels", return_value={"owner-1": {"label": "owner"}}):
+            text, _ = listener._format_notification_batch([{
+                "type": "dm",
+                "channel_type": "dm",
+                "channel_name": "Yeyito",
+                "channel_id": "dm-1",
+                "msg_id": "message-1",
+                "author_id": "owner-1",
+                "author": "yeyito777",
+                "display_name": "Yeyito",
+                "content": "hello",
+                "reply_to": {"msg_id": "old-1"},
+            }])
+
+        self.assertEqual(text, "\n".join([
+            "Yeyito [ch:dm-1]",
+            "",
+            "→ Yeyito <@owner-1> [owner] ↳ [reply-to:old-1]:",
+            "hello",
+            "[msg:message-1]",
+        ]))
+
+    def test_history_projection_is_chronological_and_keeps_user_message_and_reply_ids(self):
+        listener = object.__new__(GatewayListener)
+        listener.account = {"alias": "paramount", "owner": "assistant"}
+        listener.my_id = "assistant-1"
+        listener._log = Mock()
+        messages_newest_first = [
+            {
+                "id": "old-2",
+                "author": {"id": "assistant-1", "username": "paramount.available", "global_name": "Paramount"},
+                "content": "response\ncontinued",
+                "referenced_message": {"id": "old-1"},
+            },
+            {
+                "id": "old-1",
+                "author": {"id": "owner-1", "username": "yeyito777", "global_name": "Yeyito"},
+                "content": "previous message",
+            },
+        ]
+
+        with patch("src.api.get_messages", return_value=messages_newest_first):
+            lines, ids = listener._fetch_channel_history(
+                "channel-1",
+                "current-1",
+                {},
+                labels={"owner-1": {"label": "owner"}},
+            )
+
+        self.assertEqual(lines, [
+            "Yeyito <@owner-1> [owner]: previous message [msg:old-1]",
+            "Paramount <@assistant-1> [assistant] ↳ [reply-to:old-1]: response continued [msg:old-2]",
+        ])
+        self.assertEqual(ids, ["old-1", "old-2"])
+
 
 if __name__ == "__main__":
     unittest.main()
