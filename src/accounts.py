@@ -276,7 +276,7 @@ def _is_mutating(cmd: str, argv: list[str]) -> bool:
     return cmd in {
         "send", "reply", "edit", "delete", "del", "react", "unreact",
         "call", "voice", "join-call", "listen", "unlisten", "join", "leave",
-        "typing", "read",
+        "typing", "read", "thread",
     }
 
 

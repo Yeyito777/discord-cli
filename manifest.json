@@ -1,7 +1,7 @@
 {
   "name": "discord",
   "bin": "./bin/discord",
-  "systemHint": "You have access to Discord through the `discord` CLI tool (source at ~/Workspace/Exocortex/external-tools/discord-cli). It supports named accounts; use `discord accounts` to list them and `discord <command> -a <alias> ...` to select one. Mutating commands require an explicit account when multiple logins exist. Use `discord notify subscribe|unsubscribe|list` to manage Exocortex notification delivery (`add`/`remove` remain aliases). Run `discord -h` for usage reference.",
+  "systemHint": "You have access to Discord through the `discord` CLI tool (source at ~/Workspace/exocortex/external-tools/discord-cli). It supports named accounts; use `discord accounts` to list them and `discord <command> -a <alias> ...` to select one. Mutating commands require an explicit account when multiple logins exist. Use `discord thread create` to create server threads and `discord notify subscribe|unsubscribe|list` to manage Exocortex notification delivery (`add`/`remove` remain aliases). Run `discord -h` for usage reference.",
   "display": {
     "label": "Discord",
     "color": "#5865F2"

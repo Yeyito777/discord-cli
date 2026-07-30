@@ -23,6 +23,7 @@ commands:
   search       Search messages                        (alias: s)
   pins         Get pinned messages
   threads      List active threads in a server
+  thread       Create a thread                         (subcommand: create)
   members      List or search server members
   me           Show current user info
   send         Send a message
@@ -112,7 +113,7 @@ case "$cmd" in
         exec "$PYTHON" -c "import sys; from src.reading import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     download)
         exec "$PYTHON" -c "import sys; from src.downloading import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
-    send|reply|edit|delete|del|react|unreact)
+    send|reply|edit|delete|del|react|unreact|thread)
         exec "$PYTHON" -c "import sys; from src.writing import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     call|voice|join-call)
         exec "$PYTHON" -c "import sys; from src.calls.cli import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;

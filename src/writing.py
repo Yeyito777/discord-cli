@@ -1,4 +1,4 @@
-"""Writing subcommands — send, reply, edit, delete, react, unreact."""
+"""Writing subcommands — messages, reactions, and thread creation."""
 
 import argparse
 import os
@@ -208,6 +208,79 @@ def unreact(argv):
     print(f"Removed {args.emoji}.")
 
 
+def thread(argv):
+    p = argparse.ArgumentParser(
+        prog="discord thread",
+        description="Create a Discord thread.",
+    )
+    sub = p.add_subparsers(dest="action", required=True)
+    create = sub.add_parser("create", help="Create a thread in a server channel")
+    create.add_argument("channel", help="Parent channel name or ID")
+    create.add_argument("name", help="Thread name (1-100 characters)")
+    create.add_argument(
+        "-g", "--guild", "--server", dest="guild",
+        help="Server (required if using a channel name)",
+    )
+    create.add_argument(
+        "--message",
+        help="Message ID to anchor the thread to (creates a public thread)",
+    )
+    create.add_argument(
+        "--private", action="store_true",
+        help="Create a private thread (not valid with --message)",
+    )
+    create.add_argument(
+        "--auto-archive", type=int, choices=(60, 1440, 4320, 10080),
+        default=1440, metavar="MINUTES",
+        help="Archive after inactivity: 60, 1440, 4320, or 10080 (default: 1440)",
+    )
+    create.add_argument(
+        "--slowmode", type=int, default=0, metavar="SECONDS",
+        help="Per-user message cooldown from 0 to 21600 seconds (default: 0)",
+    )
+    create.add_argument(
+        "--not-invitable", action="store_true",
+        help="For a private thread, prevent non-moderators from inviting others",
+    )
+    args = p.parse_args(argv)
+
+    if not 1 <= len(args.name) <= 100:
+        p.error("thread name must be between 1 and 100 characters")
+    if not 0 <= args.slowmode <= 21600:
+        p.error("--slowmode must be between 0 and 21600 seconds")
+    if args.private and args.message:
+        p.error("--private cannot be combined with --message")
+    if args.not_invitable and not args.private:
+        p.error("--not-invitable requires --private")
+
+    guild_id = None
+    if args.guild:
+        guild_id = resolve_guild(args.guild)["id"]
+    channel = resolve_channel(args.channel, guild_id)
+    channel_type = channel.get("type")
+    allowed_parent_types = (0, 5) if args.message else (0,)
+    if channel_type is not None and channel_type not in allowed_parent_types:
+        if channel_type in (15, 16):
+            p.error("forum/media channels create posts, not threads; choose a text channel")
+        p.error("threads can only be created in a compatible server text channel")
+    result = api.create_thread(
+        channel["id"],
+        args.name,
+        message_id=args.message,
+        auto_archive_duration=args.auto_archive,
+        thread_type=12 if args.private else 11,
+        invitable=not args.not_invitable,
+        rate_limit_per_user=args.slowmode,
+    )
+
+    thread_id = result["id"]
+    thread_name = result.get("name") or args.name
+    result_guild_id = result.get("guild_id") or guild_id
+    print(f"Created thread #{thread_name}. Thread ID: {thread_id}")
+    if result_guild_id:
+        print(f"https://discord.com/channels/{result_guild_id}/{thread_id}")
+
+
 _ALIASES = {
     "del": "delete",
 }
@@ -219,6 +292,7 @@ _COMMANDS = {
     "delete": delete,
     "react": react,
     "unreact": unreact,
+    "thread": thread,
 }
 
 

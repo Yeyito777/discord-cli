@@ -699,6 +699,31 @@ def ack_message(channel_id, message_id):
 
 # ─── Threads ──────────────────────────────────────────────────────────────────
 
+def create_thread(channel_id, name, *, message_id=None,
+                  auto_archive_duration=1440, thread_type=11,
+                  invitable=True, rate_limit_per_user=0):
+    """Create a thread in a channel, optionally anchored to a message.
+
+    Message-anchored threads are always public (or announcement threads when
+    the parent is an announcement channel), so Discord does not accept
+    ``type`` or ``invitable`` for that endpoint.
+    """
+    body = {
+        "name": name,
+        "auto_archive_duration": auto_archive_duration,
+        "rate_limit_per_user": rate_limit_per_user,
+    }
+    if message_id:
+        return post(
+            f"/channels/{channel_id}/messages/{message_id}/threads",
+            body=body,
+        )
+
+    body["type"] = thread_type
+    if thread_type == 12:
+        body["invitable"] = invitable
+    return post(f"/channels/{channel_id}/threads", body=body)
+
 def get_active_threads(guild_id):
     """Get active threads in a guild.
 
