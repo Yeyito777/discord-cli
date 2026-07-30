@@ -5,6 +5,7 @@ import os
 
 from src import api
 from src import format as fmt
+from src.payload import read_stdin_text, reject_inline_text
 from src.resolve import resolve_guild, resolve_channel, resolve_dm
 
 
@@ -63,24 +64,36 @@ def dms(argv):
 
 
 def dm(argv):
-    p = argparse.ArgumentParser(prog="discord dm", description="Read or send DMs.")
+    p = argparse.ArgumentParser(
+        prog="discord dm",
+        description="Read DMs, or send with --send and message text on stdin.",
+        epilog="Inline --send values are not accepted. Stdin is optional only for file-only DMs.",
+    )
     p.add_argument("target", help="Username or DM channel ID")
+    p.add_argument("inline_text", nargs="*", help=argparse.SUPPRESS)
     p.add_argument("-n", "--limit", type=int, default=20, help="Number of messages")
-    p.add_argument("--send", dest="send_text", nargs="?", const="", default=None,
-                   help="Send a DM (text optional when using --file)")
+    p.add_argument("--send", action="store_true",
+                   help="Send a DM; message text is read exactly from stdin")
     p.add_argument("-f", "--file", nargs="+", dest="files", metavar="PATH",
                    help="File(s) to attach (requires --send)")
     p.add_argument("--before", help="Get messages before this message ID")
     args = p.parse_args(argv)
 
-    if args.files and args.send_text is None:
+    if args.inline_text:
+        if args.send:
+            reject_inline_text(p, args.inline_text, label="DM text")
+        p.error("to send DM text, use --send and provide the text via stdin")
+    if args.files and not args.send:
         p.error("--file requires --send")
+
+    text = None
+    if args.send:
+        text = read_stdin_text(p, label="DM text", required=not args.files)
 
     d = resolve_dm(args.target)
     channel_id = d["id"]
 
-    if args.send_text is not None:
-        text = args.send_text or None  # convert empty string to None
+    if args.send:
         if text:
             from src.writing import _resolve_mentions
             text = _resolve_mentions(text)
@@ -90,8 +103,6 @@ def dm(argv):
                     raise RuntimeError(f"File not found: {fp}")
             data = api.send_message_with_files(channel_id, args.files, content=text)
         else:
-            if not text:
-                p.error("must provide text with --send or use --file")
             data = api.send_message(channel_id, text)
         print(f"Sent. Message ID: {data['id']}")
         return

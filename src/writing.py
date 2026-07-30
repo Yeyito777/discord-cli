@@ -6,6 +6,7 @@ import re
 import sys
 
 from src import api
+from src.payload import read_stdin_text, reject_inline_text
 from src.resolve import resolve_guild, resolve_channel
 
 
@@ -106,16 +107,20 @@ def _resolve_mentions(text, guild_id=None):
 
 
 def send(argv):
-    p = argparse.ArgumentParser(prog="discord send", description="Send a message.")
+    p = argparse.ArgumentParser(
+        prog="discord send",
+        description="Send a message. Message text is read exactly from stdin.",
+        epilog="Inline message arguments are not accepted. Stdin is optional only for file-only messages.",
+    )
     p.add_argument("channel", help="Channel name or ID")
-    p.add_argument("text", nargs="?", default=None, help="Message text (optional when using --file)")
+    p.add_argument("inline_text", nargs="*", help=argparse.SUPPRESS)
     p.add_argument("-g", "--guild", "--server", dest="guild", help="Server (required if using channel name)")
     p.add_argument("--reply", help="Message ID to reply to")
     p.add_argument("-f", "--file", nargs="+", dest="files", metavar="PATH", help="File(s) to attach")
     args = p.parse_args(argv)
 
-    if not args.text and not args.files:
-        p.error("must provide text and/or --file")
+    reject_inline_text(p, args.inline_text, label="message text")
+    text = read_stdin_text(p, label="message text", required=not args.files)
 
     guild_id = None
     if args.guild:
@@ -123,7 +128,7 @@ def send(argv):
         guild_id = g["id"]
     ch = resolve_channel(args.channel, guild_id)
 
-    text = _resolve_mentions(args.text, guild_id)
+    text = _resolve_mentions(text, guild_id)
 
     if args.files:
         _validate_files(args.files)
@@ -136,16 +141,20 @@ def send(argv):
 
 
 def reply(argv):
-    p = argparse.ArgumentParser(prog="discord reply", description="Reply to a message.")
+    p = argparse.ArgumentParser(
+        prog="discord reply",
+        description="Reply to a message. Reply text is read exactly from stdin.",
+        epilog="Inline reply arguments are not accepted. Stdin is optional only for file-only replies.",
+    )
     p.add_argument("channel", help="Channel name or ID")
     p.add_argument("message", help="Message ID to reply to")
-    p.add_argument("text", nargs="?", default=None, help="Reply text (optional when using --file)")
+    p.add_argument("inline_text", nargs="*", help=argparse.SUPPRESS)
     p.add_argument("-g", "--guild", "--server", dest="guild", help="Server (required if using channel name)")
     p.add_argument("-f", "--file", nargs="+", dest="files", metavar="PATH", help="File(s) to attach")
     args = p.parse_args(argv)
 
-    if not args.text and not args.files:
-        p.error("must provide text and/or --file")
+    reject_inline_text(p, args.inline_text, label="reply text")
+    text = read_stdin_text(p, label="reply text", required=not args.files)
 
     guild_id = None
     if args.guild:
@@ -153,7 +162,7 @@ def reply(argv):
         guild_id = g["id"]
     ch = resolve_channel(args.channel, guild_id)
 
-    text = _resolve_mentions(args.text, guild_id)
+    text = _resolve_mentions(text, guild_id)
 
     if args.files:
         _validate_files(args.files)
@@ -166,13 +175,19 @@ def reply(argv):
 
 
 def edit(argv):
-    p = argparse.ArgumentParser(prog="discord edit", description="Edit a message.")
+    p = argparse.ArgumentParser(
+        prog="discord edit",
+        description="Edit a message. Replacement text is read exactly from stdin.",
+        epilog="Inline replacement-text arguments are not accepted; stdin is required.",
+    )
     p.add_argument("channel", help="Channel ID")
     p.add_argument("message", help="Message ID")
-    p.add_argument("text", help="New message text")
+    p.add_argument("inline_text", nargs="*", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
 
-    api.edit_message(args.channel, args.message, args.text)
+    reject_inline_text(p, args.inline_text, label="replacement text")
+    text = read_stdin_text(p, label="replacement text")
+    api.edit_message(args.channel, args.message, text)
     print(f"Edited.")
 
 

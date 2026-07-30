@@ -6,14 +6,6 @@
     "label": "Discord",
     "color": "#5865F2"
   },
-  "shell": {
-    "literalArgs": [
-      { "subcommand": "send", "kind": "tail" },
-      { "subcommand": "reply", "kind": "tail" },
-      { "subcommand": "edit", "kind": "tail" },
-      { "subcommand": "dm", "kind": "flag", "flag": "--send" }
-    ]
-  },
   "daemon": {
     "command": "env DISCORD_ACCOUNT=\"$(.venv/bin/python3 -c 'from src.accounts import supervised_notify_alias; print(supervised_notify_alias() or \"\")')\" .venv/bin/python3 -m src.notify __daemon__",
     "restart": "always"
