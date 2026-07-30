@@ -613,8 +613,10 @@ class NoAudioCallJoiner:
     def _send_notification(self, target, prefix, message, timing=None):
         send_started_at = time.time()
         try:
+            payload = f"[{prefix}] {message}"
             proc = subprocess.run(
-                ["exo", "send", f"[{prefix}] {message}", "-c", target, "--timeout", "600", "--no-notify"],
+                ["exo", "send", "-c", target, "--timeout", "600", "--no-notify"],
+                input=payload,
                 capture_output=True,
                 text=True,
                 timeout=660,
