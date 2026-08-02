@@ -74,7 +74,7 @@ def _recipient_ids_for_private_call(channel):
 
 
 
-def _join_foreground_channel(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True, save_audio=False, audio_dir=None, notify_audio_state=False):
+def _join_foreground_channel(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True, save_audio=False, audio_dir=None, notify_audio_state=False, bidi=False, exocortex_conversation=None, exocortex_socket=None, bidi_voice=None):
     joiner = NoAudioCallJoiner(
         channel_id,
         guild_id=guild_id,
@@ -86,6 +86,10 @@ def _join_foreground_channel(channel_id, guild_id, label, *, self_mute=True, sel
         save_audio=save_audio,
         audio_dir=audio_dir,
         notify_audio_state=notify_audio_state,
+        bidi=bidi,
+        exocortex_conversation=exocortex_conversation,
+        exocortex_socket=exocortex_socket,
+        bidi_voice=bidi_voice,
     )
     try:
         _update_call_meta_env(status="joining", updated_at=time.time())
@@ -107,6 +111,10 @@ def _join_child(argv):
     p.add_argument("--save-audio", "--keep-audio", action="store_true")
     p.add_argument("--audio-dir")
     p.add_argument("--notify-audio-state", action="store_true")
+    p.add_argument("--bidi", action="store_true")
+    p.add_argument("--exo-conversation")
+    p.add_argument("--exo-socket")
+    p.add_argument("--bidi-voice")
     args = p.parse_args(argv)
     return _join_foreground_channel(
         args.channel_id,
@@ -119,6 +127,10 @@ def _join_child(argv):
         save_audio=args.save_audio,
         audio_dir=args.audio_dir,
         notify_audio_state=args.notify_audio_state,
+        bidi=args.bidi,
+        exocortex_conversation=args.exo_conversation,
+        exocortex_socket=args.exo_socket,
+        bidi_voice=args.bidi_voice,
     )
 
 
@@ -147,7 +159,7 @@ def _normalize_notify_targets(targets):
     return result
 
 
-def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, notify_targets=None, ring_recipient_ids=None, transcribe=True, save_audio=False, notify_audio_state=False):
+def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_deaf=False, notify_targets=None, ring_recipient_ids=None, transcribe=True, save_audio=False, notify_audio_state=False, bidi=False, exocortex_conversation=None, exocortex_socket=None, bidi_voice=None):
     paths = _call_paths(channel_id)
     existing = _read_call_meta(paths["meta"])
     if existing:
@@ -186,6 +198,14 @@ def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_de
         cmd.extend(["--save-audio", "--audio-dir", str(paths["segments"])])
     if notify_audio_state:
         cmd.append("--notify-audio-state")
+    if bidi:
+        cmd.append("--bidi")
+    if exocortex_conversation:
+        cmd.extend(["--exo-conversation", str(exocortex_conversation)])
+    if exocortex_socket:
+        cmd.extend(["--exo-socket", str(exocortex_socket)])
+    if bidi_voice:
+        cmd.extend(["--bidi-voice", str(bidi_voice)])
     for user_id in ring_recipient_ids:
         cmd.extend(["--ring", user_id])
 
@@ -211,6 +231,8 @@ def _spawn_detached_call(channel_id, guild_id, label, *, self_mute=True, self_de
         "transcribe": bool(transcribe and not self_deaf),
         "save_audio": bool(save_audio),
         "notify_audio_state": bool(notify_audio_state),
+        "bidi": bool(bidi),
+        "exocortex_conversation": str(exocortex_conversation) if exocortex_conversation else None,
         "segments_dir": str(paths["segments"]) if save_audio else None,
         "control_seq": 0,
         "started_at": time.time(),
@@ -259,19 +281,25 @@ def join(argv):
     p.add_argument("--notify-parent", metavar="CONV_ID", action="append", help="Relay call activity to an Exocortex conversation; defaults to EXOCORTEX_PARENT_CONV_ID")
     p.add_argument("--no-notify", action="store_true", help="Disable detached call activity notifications")
     p.add_argument("--notify-audio-state", action="store_true", help="Also notify when participants mute/unmute/deafen/undeafen")
+    p.add_argument("--bidi", action="store_true", help="Bridge Discord audio to an Exocortex realtime call instead of locally transcribing")
+    p.add_argument("--exo-conversation", metavar="CONV_ID", help="Owning Exocortex conversation; omitted creates a dedicated Discord call conversation")
+    p.add_argument("--exo-socket", metavar="PATH", help=argparse.SUPPRESS)
+    p.add_argument("--voice", dest="bidi_voice", help="OpenAI realtime voice for --bidi")
     args = p.parse_args(argv)
 
     channel_id, guild_id, label = _resolve_call_target(args)
-    self_mute = not args.unmuted
+    self_mute = False if args.bidi else not args.unmuted
     self_deaf = bool(args.deafened and not args.undeafened)
+    if args.bidi and self_deaf:
+        raise SystemExit("--bidi cannot be used with --deafened")
     notify_targets = [] if args.no_notify else _normalize_notify_targets(args.notify_parent or _configured_notify_targets())
-    transcribe = not args.no_transcribe
+    transcribe = not args.no_transcribe and not args.bidi
     if args.foreground:
         if notify_targets:
             os.environ[CALL_NOTIFY_TARGETS_ENV] = ",".join(notify_targets)
         audio_dir = str(_call_paths(channel_id)["segments"]) if args.save_audio else None
-        return _join_foreground_channel(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, transcribe=transcribe, save_audio=args.save_audio, audio_dir=audio_dir, notify_audio_state=args.notify_audio_state)
-    return _spawn_detached_call(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, notify_targets=notify_targets, transcribe=transcribe, save_audio=args.save_audio, notify_audio_state=args.notify_audio_state)
+        return _join_foreground_channel(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, transcribe=transcribe, save_audio=args.save_audio, audio_dir=audio_dir, notify_audio_state=args.notify_audio_state, bidi=args.bidi, exocortex_conversation=args.exo_conversation, exocortex_socket=args.exo_socket, bidi_voice=args.bidi_voice)
+    return _spawn_detached_call(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, notify_targets=notify_targets, transcribe=transcribe, save_audio=args.save_audio, notify_audio_state=args.notify_audio_state, bidi=args.bidi, exocortex_conversation=args.exo_conversation, exocortex_socket=args.exo_socket, bidi_voice=args.bidi_voice)
 
 
 def start(argv):
@@ -291,6 +319,10 @@ def start(argv):
     p.add_argument("--notify-parent", metavar="CONV_ID", action="append", help="Relay call activity to an Exocortex conversation; defaults to EXOCORTEX_PARENT_CONV_ID")
     p.add_argument("--no-notify", action="store_true", help="Disable detached call activity notifications")
     p.add_argument("--notify-audio-state", action="store_true", help="Also notify when participants mute/unmute/deafen/undeafen")
+    p.add_argument("--bidi", action="store_true", help="Bridge Discord audio to an Exocortex realtime call instead of locally transcribing")
+    p.add_argument("--exo-conversation", metavar="CONV_ID", help="Owning Exocortex conversation; omitted creates a dedicated Discord call conversation")
+    p.add_argument("--exo-socket", metavar="PATH", help=argparse.SUPPRESS)
+    p.add_argument("--voice", dest="bidi_voice", help="OpenAI realtime voice for --bidi")
     args = p.parse_args(argv)
 
     channel = _resolve_call_channel(args)
@@ -300,16 +332,18 @@ def start(argv):
     channel_id = channel["id"]
     guild_id = None
     label = private_channel_label_for_type(private_channel_type(channel), private_channel_name(channel))
-    self_mute = not args.unmuted
+    self_mute = False if args.bidi else not args.unmuted
     self_deaf = bool(args.deafened and not args.undeafened)
+    if args.bidi and self_deaf:
+        raise SystemExit("--bidi cannot be used with --deafened")
     notify_targets = [] if args.no_notify else _normalize_notify_targets(args.notify_parent or _configured_notify_targets())
-    transcribe = not args.no_transcribe
+    transcribe = not args.no_transcribe and not args.bidi
     if args.foreground:
         if notify_targets:
             os.environ[CALL_NOTIFY_TARGETS_ENV] = ",".join(notify_targets)
         audio_dir = str(_call_paths(channel_id)["segments"]) if args.save_audio else None
-        return _join_foreground_channel(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, ring_recipient_ids=recipient_ids, transcribe=transcribe, save_audio=args.save_audio, audio_dir=audio_dir, notify_audio_state=args.notify_audio_state)
-    return _spawn_detached_call(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, notify_targets=notify_targets, ring_recipient_ids=recipient_ids, transcribe=transcribe, save_audio=args.save_audio, notify_audio_state=args.notify_audio_state)
+        return _join_foreground_channel(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, ring_recipient_ids=recipient_ids, transcribe=transcribe, save_audio=args.save_audio, audio_dir=audio_dir, notify_audio_state=args.notify_audio_state, bidi=args.bidi, exocortex_conversation=args.exo_conversation, exocortex_socket=args.exo_socket, bidi_voice=args.bidi_voice)
+    return _spawn_detached_call(channel_id, guild_id, label, self_mute=self_mute, self_deaf=self_deaf, notify_targets=notify_targets, ring_recipient_ids=recipient_ids, transcribe=transcribe, save_audio=args.save_audio, notify_audio_state=args.notify_audio_state, bidi=args.bidi, exocortex_conversation=args.exo_conversation, exocortex_socket=args.exo_socket, bidi_voice=args.bidi_voice)
 
 
 def list_calls(argv):
@@ -328,10 +362,13 @@ def list_calls(argv):
         transcribe = "transcribe:on" if meta.get("transcribe", True) and not meta.get("self_deaf", False) else "transcribe:off"
         save_audio = "save-audio:on" if meta.get("save_audio") else "save-audio:off"
         audio_notify = "audio-state-notify:on" if meta.get("notify_audio_state") else "audio-state-notify:off"
-        print(f"{meta.get('channel_id')}  pid {meta.get('pid')}  {status}  {mute}/{deaf}  {transcribe}  {save_audio}  {audio_notify}  {meta.get('label')}")
+        bidi = "bidi:on" if meta.get("bidi") else "bidi:off"
+        print(f"{meta.get('channel_id')}  pid {meta.get('pid')}  {status}  {mute}/{deaf}  {transcribe}  {bidi}  {save_audio}  {audio_notify}  {meta.get('label')}")
         print(f"  log: {meta.get('log')}")
         if meta.get("segments_dir"):
             print(f"  segments: {meta.get('segments_dir')}")
+        if meta.get("exocortex_conversation"):
+            print(f"  exocortex: {meta.get('exocortex_conversation')}  call {meta.get('exocortex_call_id') or 'starting'}")
         print(notify_text)
 
 
@@ -511,6 +548,8 @@ def say(argv):
         raise SystemExit("More than one detached call is active; pass the target/channel ID as the second argument.")
 
     meta = metas[0]
+    if meta.get("bidi"):
+        raise SystemExit("discord call say is unavailable for Bidi calls; realtime output owns the Discord audio stream")
     if str(meta.get("status") or "") != "joined":
         raise SystemExit(f"Call is not joined yet (status: {meta.get('status') or 'unknown'}). Try again once `discord call list` shows joined.")
     channel_id = meta.get("channel_id")

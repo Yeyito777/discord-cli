@@ -21,7 +21,9 @@ from src import api
 from src.accounts import selected_account
 from src.auth import get_token
 from src.calls.receive import VoiceReceiveTranscription
-from src.calls.send import send_audio_file
+from src.calls.send import send_audio_file, send_outgoing_opus_payload
+from src.calls.bidi import DiscordBidiBridge
+from src.calls.exocortex import ExocortexCallClient
 from src.calls.state import CALL_META_ENV, CALL_NOTIFY_TARGETS_ENV, update_call_meta_env as _update_call_meta_env, write_call_meta as _write_call_meta
 from src.calls.transport import OPUS_PAYLOAD_TYPE, select_encryption_mode, udp_discovery
 
@@ -124,7 +126,7 @@ def _record_style_display_name(user):
 
 
 class NoAudioCallJoiner:
-    def __init__(self, channel_id, *, guild_id=None, label=None, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True, save_audio=False, audio_dir=None, notify_audio_state=False):
+    def __init__(self, channel_id, *, guild_id=None, label=None, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True, save_audio=False, audio_dir=None, notify_audio_state=False, bidi=False, exocortex_conversation=None, exocortex_socket=None, bidi_voice=None):
         self.channel_id = channel_id
         self.guild_id = guild_id
         self.label = label or channel_id
@@ -134,6 +136,10 @@ class NoAudioCallJoiner:
         self.save_audio = bool(save_audio)
         self.audio_dir = str(audio_dir) if audio_dir else None
         self.notify_audio_state = bool(notify_audio_state)
+        self.bidi_enabled = bool(bidi)
+        self.exocortex_conversation = str(exocortex_conversation).strip() if exocortex_conversation else None
+        self.exocortex_socket = str(exocortex_socket).strip() if exocortex_socket else None
+        self.bidi_voice = str(bidi_voice).strip() if bidi_voice else None
         self.ring_recipient_ids = [str(user_id) for user_id in (ring_recipient_ids or []) if user_id]
         self.token = get_token()
         self.account_alias = selected_account()["alias"]
@@ -177,6 +183,11 @@ class NoAudioCallJoiner:
         self._ssrc_cache = []
         self._speaking_cache = {}
         self._pending_voice_session_description = None
+        self._bidi_client = None
+        self._bidi_bridge = None
+        self._bidi_call_id = None
+        self._bidi_monitor_thread = None
+        self._voice_send_lock = threading.Lock()
 
     def run(self):
         old_int = signal.getsignal(signal.SIGINT)
@@ -209,6 +220,8 @@ class NoAudioCallJoiner:
             print(f"Joined {self.label}. Press Ctrl+C to leave.", flush=True)
             if self.ring_recipient_ids:
                 self._ring_recipients()
+            if self.bidi_enabled:
+                self._start_bidi()
 
             while self.running:
                 self._pump_app_gateway_once()
@@ -218,6 +231,7 @@ class NoAudioCallJoiner:
                     self._pump_voice_gateway_once()
         finally:
             self.running = False
+            self._stop_bidi()
             self._leave_voice()
             self._close()
             signal.signal(signal.SIGINT, old_int)
@@ -638,6 +652,86 @@ class NoAudioCallJoiner:
     def _log_voice_transcription(self, message):
         print(f"[voice-transcribe] {message}", flush=True)
 
+    def _receive_bidi_pcm(self, user_id, pcm, sample_rate, channels):
+        bridge = self._bidi_bridge
+        if bridge:
+            bridge.push_pcm(user_id, pcm, sample_rate, channels)
+
+    def send_bidi_opus(self, opus_payload):
+        transcription = self._voice_transcription
+        if not transcription or not transcription.can_encode_outgoing():
+            return False
+        with self._voice_send_lock:
+            return send_outgoing_opus_payload(self, opus_payload, transcription)
+
+    def _start_bidi(self):
+        client = ExocortexCallClient(self.exocortex_socket)
+        client.connect()
+        conv_id = self.exocortex_conversation or client.create_conversation(f"Discord call · {self.label}")
+        adapter = {
+            "type": "discord",
+            "id": f"{self.account_alias}:{self.channel_id}",
+            "accountAlias": self.account_alias,
+            "channelId": str(self.channel_id),
+            "label": self.label,
+        }
+        call_id, _state = client.start_call(conv_id, adapter, voice=self.bidi_voice)
+        bridge = DiscordBidiBridge(self, client, conv_id, call_id, log=self._log_voice_transcription)
+        self._bidi_client = client
+        self._bidi_bridge = bridge
+        self._bidi_call_id = call_id
+        self.exocortex_conversation = conv_id
+        bridge.start()
+        self.update_call_meta(
+            bidi=True,
+            exocortex_conversation=conv_id,
+            exocortex_call_id=call_id,
+            updated_at=time.time(),
+        )
+        self._bidi_monitor_thread = threading.Thread(
+            target=self._monitor_bidi,
+            name="discord-bidi-control",
+            daemon=True,
+        )
+        self._bidi_monitor_thread.start()
+        print(f"Discord Bidi attached to Exocortex conversation {conv_id} (call {call_id}).", flush=True)
+
+    def _monitor_bidi(self):
+        client = self._bidi_client
+        call_id = self._bidi_call_id
+        while self.running and client is self._bidi_client:
+            try:
+                event = client.receive(timeout=1)
+            except TimeoutError:
+                continue
+            except Exception:
+                if self.running:
+                    self.running = False
+                return
+            if event.get("type") == "call_state" and event.get("callId") == call_id:
+                if event.get("state") in {"closed", "error"}:
+                    self.running = False
+                    return
+
+    def _stop_bidi(self):
+        bridge, self._bidi_bridge = self._bidi_bridge, None
+        if bridge:
+            bridge.stop()
+        client, self._bidi_client = self._bidi_client, None
+        call_id, self._bidi_call_id = self._bidi_call_id, None
+        if client:
+            if call_id and self.exocortex_conversation:
+                try:
+                    client.send({
+                        "type": "stop_call",
+                        "reqId": f"discord-call-stop-{uuid.uuid4()}",
+                        "convId": self.exocortex_conversation,
+                        "callId": call_id,
+                    })
+                except Exception:
+                    pass
+            client.close()
+
     def _set_transcription_enabled(self, enabled):
         if self._voice_transcription:
             self._voice_transcription.set_enabled(enabled)
@@ -956,8 +1050,9 @@ class NoAudioCallJoiner:
             log=self._log_voice_transcription,
             keep_audio=self.save_audio,
             audio_dir=self.audio_dir,
+            pcm_sink=self._receive_bidi_pcm if self.bidi_enabled else None,
         )
-        self._voice_transcription.set_enabled(self.transcribe_enabled)
+        self._voice_transcription.set_enabled(self.transcribe_enabled and not self.bidi_enabled)
         self._sync_transcription_participants()
         for ssrc, user_id in self._ssrc_cache:
             self._voice_transcription.add_ssrc_mapping(ssrc, user_id)

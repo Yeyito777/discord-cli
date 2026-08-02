@@ -967,6 +967,21 @@ class SpeakerSegmenter:
         self.pre_roll_packet_trace.clear()
 
 
+class PcmOnlyTranscriber:
+    """No-op transcription facade used when decoded PCM goes directly to Bidi."""
+
+    enabled = False
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = False
+
+    def submit(self, *args, **kwargs):
+        return None
+
+    def stop(self):
+        return None
+
+
 class VoiceTranscriber:
     def __init__(self, *, label: str, notify, log=print, keep_audio: bool | None = None, audio_dir: str | os.PathLike | None = None):
         self.label = label
@@ -1429,7 +1444,7 @@ class VoiceReceiveTranscription:
     def advertised_dave_protocol_version_static():
         return int(dave.get_max_supported_protocol_version()) if dave is not None else 0
 
-    def __init__(self, *, udp=None, mode: str | None = None, secret_key=None, self_user_id: str, channel_id: str, label: str, send_json, send_binary, notify, name_for_user, log=print, keep_audio: bool | None = None, audio_dir: str | os.PathLike | None = None):
+    def __init__(self, *, udp=None, mode: str | None = None, secret_key=None, self_user_id: str, channel_id: str, label: str, send_json, send_binary, notify, name_for_user, log=print, keep_audio: bool | None = None, audio_dir: str | os.PathLike | None = None, pcm_sink=None):
         self.udp = udp
         self.mode = mode
         self.secret_key = bytes(secret_key or b"")
@@ -1441,6 +1456,7 @@ class VoiceReceiveTranscription:
         self.notify = notify
         self.name_for_user = name_for_user
         self.log = log
+        self.pcm_sink = pcm_sink
         self.running = False
         self.thread = None
         self.ssrc_to_user_id = {}
@@ -1476,7 +1492,13 @@ class VoiceReceiveTranscription:
         self.last_decode_error_log_at = 0.0
         self.last_invalid_opus_log_at = 0.0
         self.last_stats_at = time.time()
-        self.transcriber = VoiceTranscriber(label=label, notify=notify, log=log, keep_audio=keep_audio, audio_dir=audio_dir)
+        self.transcriber = PcmOnlyTranscriber() if pcm_sink is not None else VoiceTranscriber(
+            label=label,
+            notify=notify,
+            log=log,
+            keep_audio=keep_audio,
+            audio_dir=audio_dir,
+        )
         self.dave = DavePassthroughDecryptor(
             user_id=self.self_user_id,
             channel_id=self.channel_id,
@@ -1506,13 +1528,13 @@ class VoiceReceiveTranscription:
         if nacl is None:
             self.log("Voice transcription disabled: PyNaCl is not installed")
             return
-        if not shutil.which("exo"):
+        if self.pcm_sink is None and not shutil.which("exo"):
             self.log("Voice transcription disabled: exo CLI is not in PATH")
             return
         self.running = True
         self.thread = threading.Thread(target=self._recv_loop, name="discord-voice-receive", daemon=True)
         self.thread.start()
-        self.log("Voice transcription receiver started")
+        self.log("Discord Bidi media receiver started" if self.pcm_sink is not None else "Voice transcription receiver started")
 
     def stop(self):
         self.running = False
@@ -1895,6 +1917,10 @@ class VoiceReceiveTranscription:
 
     def _segment_pcm(self, user_id: str, pcm: bytes, sample_rate: int, channels: int, *, packet_info: dict | None = None):
         if not pcm:
+            return
+        if self.pcm_sink is not None:
+            self.pcm_sink(user_id, pcm, sample_rate, channels)
+        if not self.transcriber.enabled:
             return
         duration = len(pcm) / (sample_rate * channels * 2)
         segmenter = self.segmenters.get(user_id)
