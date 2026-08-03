@@ -3,6 +3,9 @@
 import sys
 
 
+DISCORD_MESSAGE_CHARACTER_LIMIT = 2_000
+
+
 def reject_inline_text(parser, values, *, label="content"):
     """Reject legacy inline payload positionals with an actionable error."""
     if values:
@@ -30,3 +33,15 @@ def read_stdin_text(parser, *, label="content", required=True):
             parser.error(f"{label} is required on stdin")
         return None
     return text
+
+
+def validate_message_length(parser, text, *, label="message text"):
+    """Reject message content that Discord cannot accept."""
+    if text is None:
+        return
+    length = len(text)
+    if length > DISCORD_MESSAGE_CHARACTER_LIMIT:
+        parser.error(
+            f"{label} is {length:,} characters; "
+            f"Discord allows at most {DISCORD_MESSAGE_CHARACTER_LIMIT:,}"
+        )

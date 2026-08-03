@@ -5,7 +5,7 @@ import os
 
 from src import api
 from src import format as fmt
-from src.payload import read_stdin_text, reject_inline_text
+from src.payload import read_stdin_text, reject_inline_text, validate_message_length
 from src.resolve import resolve_guild, resolve_channel, resolve_dm
 
 
@@ -97,6 +97,7 @@ def dm(argv):
         if text:
             from src.writing import _resolve_mentions
             text = _resolve_mentions(text)
+        validate_message_length(p, text, label="DM text")
         if args.files:
             for fp in args.files:
                 if not os.path.isfile(fp):

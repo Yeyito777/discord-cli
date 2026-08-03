@@ -6,7 +6,7 @@ import re
 import sys
 
 from src import api
-from src.payload import read_stdin_text, reject_inline_text
+from src.payload import read_stdin_text, reject_inline_text, validate_message_length
 from src.resolve import resolve_guild, resolve_channel
 
 
@@ -129,6 +129,7 @@ def send(argv):
     ch = resolve_channel(args.channel, guild_id)
 
     text = _resolve_mentions(text, guild_id)
+    validate_message_length(p, text, label="message text")
 
     if args.files:
         _validate_files(args.files)
@@ -163,6 +164,7 @@ def reply(argv):
     ch = resolve_channel(args.channel, guild_id)
 
     text = _resolve_mentions(text, guild_id)
+    validate_message_length(p, text, label="reply text")
 
     if args.files:
         _validate_files(args.files)
@@ -187,6 +189,7 @@ def edit(argv):
 
     reject_inline_text(p, args.inline_text, label="replacement text")
     text = read_stdin_text(p, label="replacement text")
+    validate_message_length(p, text, label="replacement text")
     api.edit_message(args.channel, args.message, text)
     print(f"Edited.")
 
