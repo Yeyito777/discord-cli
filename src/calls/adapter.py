@@ -30,6 +30,7 @@ OUTPUT_SILENCE_THRESHOLD_DB = -58.0
 OUTPUT_SPEECH_HANGOVER_SECONDS = 0.3
 INPUT_SILENCE_THRESHOLD_DB = -52.0
 INPUT_SPEECH_HANGOVER_SECONDS = 0.35
+INPUT_GAIN = 1.5
 
 
 def _mono_48k(pcm: bytes, sample_rate: int, channels: int) -> bytes:
@@ -83,6 +84,17 @@ def _pcm_rms_db(pcm: bytes) -> float:
     return 20 * math.log10(max(mean_square ** 0.5, 1e-6))
 
 
+def _apply_s16_gain(pcm: bytes, gain: float) -> bytes:
+    """Apply bounded gain to signed 16-bit PCM without wrapping on peaks."""
+    if not pcm or gain == 1.0:
+        return pcm
+    samples = array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+    for index, sample in enumerate(samples):
+        samples[index] = max(-32768, min(32767, round(sample * gain)))
+    return samples.tobytes()
+
+
 class DiscordInputAudioTrack(AudioStreamTrack):
     """Paced mono track mixing one 20 ms frame from every Discord speaker."""
 
@@ -102,7 +114,7 @@ class DiscordInputAudioTrack(AudioStreamTrack):
         self._timestamp = 0
 
     def push_pcm(self, user_id: str, pcm: bytes, sample_rate: int, channels: int):
-        normalized = _mono_48k(pcm, sample_rate, channels)
+        normalized = _apply_s16_gain(_mono_48k(pcm, sample_rate, channels), INPUT_GAIN)
         if not normalized:
             return
         frame_bytes = FRAME_SAMPLES * 2
@@ -203,12 +215,15 @@ class DiscordCallAdapter:
     def _publish_speakers(self, participant_ids, observed_at):
         if self.stopping or self.exocortex is None:
             return
-        self.exocortex.update_speakers(
-            self.conv_id,
-            self.call_id,
-            participant_ids,
-            observed_at,
-        )
+        try:
+            self.exocortex.update_speakers(
+                self.conv_id,
+                self.call_id,
+                participant_ids,
+                observed_at,
+            )
+        except Exception as exc:
+            self.log(f"Could not publish Discord call speakers: {exc}")
 
     def stop(self):
         self.stopping = True

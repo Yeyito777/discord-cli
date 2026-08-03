@@ -944,8 +944,15 @@ class VoiceReceiveMedia:
             return
         self.packet_count += 1
         user_id = self.ssrc_to_user_id.get(parsed["ssrc"])
-        if not user_id and len(self.fallback_user_ids) == 1:
-            user_id = next(iter(self.fallback_user_ids))
+        if not user_id:
+            # Infer only a participant that has no mapped audio stream yet. A
+            # second unknown SSRC may belong to a bot or an old DAVE epoch; tying
+            # every unknown stream to the sole participant makes two SSRCs steal
+            # one identity back and forth, resetting decryptors and audio state.
+            mapped_users = set(self.ssrc_to_user_id.values())
+            unmapped_users = self.fallback_user_ids - mapped_users
+            user_id = next(iter(unmapped_users)) if len(unmapped_users) == 1 else None
+        if user_id:
             self.add_ssrc_mapping(parsed["ssrc"], user_id)
             self.log(f"Discord media inferred SSRC {parsed['ssrc']} for {self.name_for_user(user_id)}")
         if not user_id:

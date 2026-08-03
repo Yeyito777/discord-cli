@@ -47,7 +47,7 @@ class CallWorkerDisplayNameTests(unittest.TestCase):
         worker._active_participant_ids = {"123", "456", "789"}
 
         with patch("src.calls.worker.get_labels", return_value={
-            "123": {"label": "owner"},
+            "123": {"label": "owner", "display_name": "Configured Owner"},
             "456": {"label": "friend"},
             "789": {"label": "anything-else"},
         }):
@@ -58,6 +58,18 @@ class CallWorkerDisplayNameTests(unittest.TestCase):
             {"id": "456", "displayName": "Friend Name", "trust": "friend"},
             {"id": "789", "displayName": "Unknown", "trust": "untrusted"},
         ])
+
+    def test_call_participant_name_uses_configured_identity_before_gateway_profile_arrives(self):
+        worker = object.__new__(DiscordCallWorker)
+        worker._participant_names = {}
+        worker._active_participant_ids = {"123"}
+
+        with patch("src.calls.worker.get_labels", return_value={
+            "123": {"label": "owner", "display_name": "Yeyito"},
+        }):
+            participants = worker._call_participants()
+
+        self.assertEqual(participants, [{"id": "123", "displayName": "Yeyito", "trust": "owner"}])
 
     def test_remote_voice_leave_republishes_the_reduced_participant_roster(self):
         worker = object.__new__(DiscordCallWorker)
@@ -74,6 +86,27 @@ class CallWorkerDisplayNameTests(unittest.TestCase):
         })
 
         worker._sync_call_participants.assert_called_once_with({"123"})
+
+    def test_dave_users_are_cached_before_media_setup(self):
+        worker = object.__new__(DiscordCallWorker)
+        worker._dave_known_user_ids = set()
+        worker._voice_media = None
+
+        worker._remember_dave_users(["123", "456"])
+
+        self.assertEqual(worker._dave_known_user_ids, {"123", "456"})
+
+    def test_media_observation_publishes_roster_before_audio(self):
+        worker = object.__new__(DiscordCallWorker)
+        worker._active_participant_ids = set()
+        worker._sync_call_participants = MagicMock()
+        worker._call_adapter = MagicMock()
+        pcm = b"\x00\x01"
+
+        worker._receive_call_pcm("123", pcm, 48_000, 1)
+
+        worker._sync_call_participants.assert_called_once_with({"123"})
+        worker._call_adapter.push_pcm.assert_called_once_with("123", pcm, 48_000, 1)
 
 if __name__ == "__main__":
     unittest.main()

@@ -158,6 +158,9 @@ class DiscordCallWorker:
         self._requested_leave = False
         self._participant_names = {}
         self._active_participant_ids = set()
+        # Voice opcode 11 may arrive before VoiceReceiveMedia exists. Preserve
+        # recognized users so DAVE MLS validation is independent of setup order.
+        self._dave_known_user_ids = set()
         self._control_seq = 0
         self._voice_media = None
         self._ssrc_cache = []
@@ -449,9 +452,13 @@ class DiscordCallWorker:
             raw_label = entry.get("label", "") if isinstance(entry, dict) else entry
             normalized_label = str(raw_label or "").strip().lower()
             trust = normalized_label if normalized_label in {"owner", "friend"} else "untrusted"
+            configured_name = None
+            if isinstance(entry, dict):
+                configured_name = entry.get("display_name") or entry.get("username")
+            display_name = self._participant_names.get(str(user_id)) or configured_name or str(user_id)
             participants.append({
                 "id": str(user_id),
-                "displayName": self._display_name_for_user(user_id),
+                "displayName": display_name,
                 "trust": trust,
             })
         return participants
@@ -515,13 +522,29 @@ class DiscordCallWorker:
         self._publish_call_participants()
 
     def _sync_media_participants(self):
+        self._remember_dave_users(self._active_participant_ids)
         if self._voice_media:
             self._voice_media.set_active_remote_users(self._active_participant_ids)
+
+    def _remember_dave_users(self, user_ids):
+        user_ids = {str(user_id) for user_id in (user_ids or []) if user_id}
+        if not user_ids:
+            return
+        self._dave_known_user_ids.update(user_ids)
+        if self._voice_media:
+            self._voice_media.dave.add_known_users(user_ids)
 
     def _log_voice_media(self, message):
         print(f"[voice-media] {message}", flush=True)
 
     def _receive_call_pcm(self, user_id, pcm, sample_rate, channels):
+        user_id = str(user_id)
+        # SSRC media can precede its app-gateway voice-state event. Publish the
+        # media-authenticated identity before VAD reports the speaker boundary.
+        if user_id not in self._active_participant_ids:
+            current = set(self._active_participant_ids)
+            current.add(user_id)
+            self._sync_call_participants(current)
         bridge = self._call_adapter
         if bridge:
             bridge.push_pcm(user_id, pcm, sample_rate, channels)
@@ -607,6 +630,7 @@ class DiscordCallWorker:
             client.close()
 
     def _remove_media_user(self, user_id):
+        self._dave_known_user_ids.discard(str(user_id))
         if self._voice_media:
             self._voice_media.remove_user(user_id)
 
@@ -742,9 +766,7 @@ class DiscordCallWorker:
         elif op == 11:
             data = payload.get("d") or {}
             if isinstance(data, dict):
-                user_ids = [str(user_id) for user_id in data.get("user_ids") or [] if user_id]
-                if self._voice_media:
-                    self._voice_media.dave.add_known_users(user_ids)
+                self._remember_dave_users(data.get("user_ids") or [])
         elif op == 13:
             data = payload.get("d") or {}
             if isinstance(data, dict) and data.get("user_id"):
@@ -918,6 +940,7 @@ class DiscordCallWorker:
             log=self._log_voice_media,
             pcm_sink=self._receive_call_pcm,
         )
+        self._voice_media.dave.add_known_users(self._dave_known_user_ids)
         self._sync_media_participants()
         for ssrc, user_id in self._ssrc_cache:
             self._voice_media.add_ssrc_mapping(ssrc, user_id)
