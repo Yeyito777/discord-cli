@@ -67,6 +67,9 @@ class ExocortexCallClientTests(unittest.TestCase):
                     })
                     send_line(conn, {"type": "ack", "reqId": attach["reqId"], "convId": "conv-discord"})
 
+                    utterance = recv_line(file)
+                    seen.append(utterance)
+
                     stop = recv_line(file)
                     seen.append(stop)
                     send_line(conn, {"type": "ack", "reqId": stop["reqId"], "convId": "conv-discord"})
@@ -87,6 +90,7 @@ class ExocortexCallClientTests(unittest.TestCase):
                     "accountAlias": "paramount",
                     "endpointId": "123",
                     "label": "#voice",
+                    "inputMode": "attributed_utterances",
                 }
                 participant_list = [{"id": "310", "displayName": "Owner", "trust": "owner"}]
                 call_id, state = client.start_call(
@@ -98,6 +102,15 @@ class ExocortexCallClientTests(unittest.TestCase):
                 client.update_participants(conv_id, call_id, participant_list)
                 client.update_speakers(conv_id, call_id, ["310"], 1234)
                 answer = client.attach_media(conv_id, call_id, "v=0\r\no=offer")
+                client.submit_utterance(
+                    conv_id,
+                    call_id,
+                    utterance_id="utterance-1",
+                    participant_id="310",
+                    audio=b"wav",
+                    started_at=1000,
+                    ended_at=2000,
+                )
                 client.stop_call(conv_id, call_id)
             finally:
                 client.close()
@@ -117,6 +130,7 @@ class ExocortexCallClientTests(unittest.TestCase):
                     "update_call_participants",
                     "update_call_speakers",
                     "attach_call_media",
+                    "submit_call_utterance",
                     "stop_call",
                 ],
             )
@@ -124,7 +138,9 @@ class ExocortexCallClientTests(unittest.TestCase):
             self.assertEqual(seen[2]["adapter"]["accountAlias"], "paramount")
             self.assertEqual(seen[2]["participants"], participant_list)
             self.assertEqual(seen[4]["speakers"]["participantIds"], ["310"])
-            self.assertEqual(seen[6]["callId"], "call-discord")
+            self.assertEqual(seen[6]["participantId"], "310")
+            self.assertEqual(seen[6]["audioBase64"], "d2F2")
+            self.assertEqual(seen[7]["callId"], "call-discord")
 
 
 if __name__ == "__main__":

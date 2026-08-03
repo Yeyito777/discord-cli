@@ -567,6 +567,7 @@ class DiscordCallWorker:
             "accountAlias": self.account_alias,
             "endpointId": str(self.channel_id),
             "label": self.label,
+            "inputMode": "attributed_utterances",
         }
         call_id, _state = client.start_call(
             conv_id,

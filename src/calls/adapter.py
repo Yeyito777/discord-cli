@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from array import array
 import asyncio
-from collections import defaultdict, deque
 import fractions
 import math
+import queue
 import threading
 import time
+import uuid
 
 try:  # Optional until a call adapter is started.
     import av  # type: ignore
@@ -20,16 +21,14 @@ except Exception:  # pragma: no cover - deployment dependency validation
     RTCSessionDescription = None
 
 from src.calls.send import send_outgoing_opus_payload
+from src.calls.utterances import DiscordUtteranceSegmenter
 
 
 SAMPLE_RATE = 48_000
 FRAME_SAMPLES = 960
 FRAME_SECONDS = FRAME_SAMPLES / SAMPLE_RATE
-MAX_QUEUED_FRAMES_PER_USER = 12
 OUTPUT_SILENCE_THRESHOLD_DB = -58.0
 OUTPUT_SPEECH_HANGOVER_SECONDS = 0.3
-INPUT_SILENCE_THRESHOLD_DB = -52.0
-INPUT_SPEECH_HANGOVER_SECONDS = 0.35
 INPUT_GAIN = 1.5
 
 
@@ -96,70 +95,14 @@ def _apply_s16_gain(pcm: bytes, gain: float) -> bytes:
 
 
 class DiscordInputAudioTrack(AudioStreamTrack):
-    """Paced mono track mixing one 20 ms frame from every Discord speaker."""
+    """Paced silent carrier; attributed Discord speech enters through IPC text."""
 
     kind = "audio"
 
-    def __init__(self, *, on_speakers=None, monotonic=time.monotonic, wall_clock=time.time):
+    def __init__(self):
         super().__init__()
-        self._lock = threading.Lock()
-        self._queues = defaultdict(lambda: deque(maxlen=MAX_QUEUED_FRAMES_PER_USER))
-        self._remainders = defaultdict(bytearray)
-        self._last_audible_at = {}
-        self._reported_speakers = frozenset()
-        self._on_speakers = on_speakers
-        self._monotonic = monotonic
-        self._wall_clock = wall_clock
         self._start = None
         self._timestamp = 0
-
-    def push_pcm(self, user_id: str, pcm: bytes, sample_rate: int, channels: int):
-        normalized = _apply_s16_gain(_mono_48k(pcm, sample_rate, channels), INPUT_GAIN)
-        if not normalized:
-            return
-        frame_bytes = FRAME_SAMPLES * 2
-        with self._lock:
-            remainder = self._remainders[str(user_id)]
-            remainder.extend(normalized)
-            queue = self._queues[str(user_id)]
-            while len(remainder) >= frame_bytes:
-                chunk = bytes(remainder[:frame_bytes])
-                queue.append(chunk)
-                if _pcm_rms_db(chunk) >= INPUT_SILENCE_THRESHOLD_DB:
-                    self._last_audible_at[str(user_id)] = self._monotonic()
-                del remainder[:frame_bytes]
-
-    def _mixed_frame(self) -> bytes:
-        changed = None
-        with self._lock:
-            chunks = [queue.popleft() for queue in self._queues.values() if queue]
-            now = self._monotonic()
-            active = frozenset(
-                user_id for user_id, audible_at in self._last_audible_at.items()
-                if now - audible_at <= INPUT_SPEECH_HANGOVER_SECONDS
-            )
-            for user_id in set(self._last_audible_at) - set(active):
-                self._last_audible_at.pop(user_id, None)
-            if active != self._reported_speakers:
-                self._reported_speakers = active
-                changed = tuple(sorted(active))
-        if changed is not None and self._on_speakers:
-            try:
-                self._on_speakers(changed, int(self._wall_clock() * 1000))
-            except Exception:
-                # Speaker metadata is advisory; never break the media clock.
-                pass
-        if not chunks:
-            return bytes(FRAME_SAMPLES * 2)
-        mixed = array("h", [0]) * FRAME_SAMPLES
-        divisor = max(1.0, len(chunks) ** 0.5)
-        for chunk in chunks:
-            samples = array("h")
-            samples.frombytes(chunk)
-            for index, sample in enumerate(samples[:FRAME_SAMPLES]):
-                value = mixed[index] + int(sample / divisor)
-                mixed[index] = max(-32768, min(32767, value))
-        return mixed.tobytes()
 
     async def recv(self):
         if self._start is None:
@@ -171,7 +114,7 @@ class DiscordInputAudioTrack(AudioStreamTrack):
             if delay > 0:
                 await asyncio.sleep(delay)
         frame = av.AudioFrame(format="s16", layout="mono", samples=FRAME_SAMPLES)
-        frame.planes[0].update(self._mixed_frame())
+        frame.planes[0].update(bytes(FRAME_SAMPLES * 2))
         frame.pts = self._timestamp
         frame.sample_rate = SAMPLE_RATE
         frame.time_base = fractions.Fraction(1, SAMPLE_RATE)
@@ -189,7 +132,13 @@ class DiscordCallAdapter:
         self.conv_id = str(conv_id)
         self.call_id = str(call_id)
         self.log = log
-        self.input_track = DiscordInputAudioTrack(on_speakers=self._publish_speakers)
+        self.input_track = DiscordInputAudioTrack()
+        self.utterance_queue = queue.Queue()
+        self.utterance_thread = None
+        self.segmenter = DiscordUtteranceSegmenter(
+            on_utterance=self._queue_utterance,
+            on_speakers=self._publish_speakers,
+        )
         self.loop = None
         self.thread = None
         self.peer = None
@@ -201,6 +150,12 @@ class DiscordCallAdapter:
     def start(self, timeout=30):
         if self.thread:
             return
+        self.utterance_thread = threading.Thread(
+            target=self._publish_utterances,
+            name="discord-call-utterances",
+            daemon=True,
+        )
+        self.utterance_thread.start()
         self.thread = threading.Thread(target=self._thread_main, name="discord-call-webrtc", daemon=True)
         self.thread.start()
         if not self.started.wait(timeout):
@@ -210,7 +165,38 @@ class DiscordCallAdapter:
 
     def push_pcm(self, user_id: str, pcm: bytes, sample_rate: int, channels: int):
         if not self.stopping:
-            self.input_track.push_pcm(user_id, pcm, sample_rate, channels)
+            normalized = _apply_s16_gain(_mono_48k(pcm, sample_rate, channels), INPUT_GAIN)
+            self.segmenter.push_pcm(user_id, normalized)
+
+    def _queue_utterance(self, participant_id, wav, started_at, ended_at):
+        self.utterance_queue.put((
+            str(uuid.uuid4()),
+            str(participant_id),
+            bytes(wav),
+            int(started_at),
+            int(ended_at),
+        ))
+
+    def _publish_utterances(self):
+        while True:
+            item = self.utterance_queue.get()
+            try:
+                if item is None:
+                    return
+                utterance_id, participant_id, wav, started_at, ended_at = item
+                self.exocortex.submit_utterance(
+                    self.conv_id,
+                    self.call_id,
+                    utterance_id=utterance_id,
+                    participant_id=participant_id,
+                    audio=wav,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                )
+            except Exception as exc:
+                self.log(f"Could not publish Discord call utterance: {exc}")
+            finally:
+                self.utterance_queue.task_done()
 
     def _publish_speakers(self, participant_ids, observed_at):
         if self.stopping or self.exocortex is None:
@@ -226,6 +212,7 @@ class DiscordCallAdapter:
             self.log(f"Could not publish Discord call speakers: {exc}")
 
     def stop(self):
+        self.segmenter.flush()
         self.stopping = True
         loop = self.loop
         if loop and loop.is_running():
@@ -238,6 +225,10 @@ class DiscordCallAdapter:
         if self.thread and self.thread is not threading.current_thread():
             self.thread.join(timeout=3)
         self.thread = None
+        self.utterance_queue.put(None)
+        if self.utterance_thread and self.utterance_thread is not threading.current_thread():
+            self.utterance_thread.join(timeout=5)
+        self.utterance_thread = None
 
     def _thread_main(self):
         loop = asyncio.new_event_loop()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+import base64
 import json
 import os
 from pathlib import Path
@@ -185,6 +186,31 @@ class ExocortexCallClient:
                 "participantIds": list(participant_ids),
                 "observedAt": int(observed_at),
             },
+        })
+
+    def submit_utterance(
+        self,
+        conv_id: str,
+        call_id: str,
+        *,
+        utterance_id: str,
+        participant_id: str,
+        audio: bytes,
+        started_at: int,
+        ended_at: int,
+        mime_type: str = "audio/wav",
+    ):
+        """Queue one platform-separated speaker utterance without blocking media."""
+        self.send({
+            "type": "submit_call_utterance",
+            "convId": str(conv_id),
+            "callId": str(call_id),
+            "utteranceId": str(utterance_id),
+            "participantId": str(participant_id),
+            "audioBase64": base64.b64encode(bytes(audio)).decode("ascii"),
+            "mimeType": str(mime_type),
+            "startedAt": int(started_at),
+            "endedAt": int(ended_at),
         })
 
     def attach_media(self, conv_id: str, call_id: str, offer_sdp: str) -> str:

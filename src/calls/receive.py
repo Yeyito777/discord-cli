@@ -836,13 +836,8 @@ class VoiceReceiveMedia:
         ssrc = int(ssrc)
         user_id = str(user_id)
         previous = self.ssrc_to_user_id.get(ssrc)
-        stale_user_ssrcs = [mapped_ssrc for mapped_ssrc, mapped_user in self.ssrc_to_user_id.items() if mapped_user == user_id and mapped_ssrc != ssrc]
-        if stale_user_ssrcs:
-            self._reset_user_media_state(user_id)
-            for mapped_ssrc in stale_user_ssrcs:
-                self.ssrc_to_user_id.pop(mapped_ssrc, None)
-                self.dave.ssrc_to_user_id.pop(mapped_ssrc, None)
-                self.dave.ssrc_to_decryptor.pop(mapped_ssrc, None)
+        if previous is not None and previous != user_id:
+            self._reset_stream_media_state(ssrc)
         self.ssrc_to_user_id[ssrc] = user_id
         self.fallback_user_ids.add(user_id)
         self.dave.add_ssrc_mapping(ssrc, user_id)
@@ -858,19 +853,19 @@ class VoiceReceiveMedia:
         for ssrc, mapped_user in list(self.ssrc_to_user_id.items()):
             if mapped_user == user_id:
                 del self.ssrc_to_user_id[ssrc]
-        self._reset_user_media_state(user_id)
+                self._reset_stream_media_state(ssrc)
 
-    def _reset_user_media_state(self, user_id):
-        user_id = str(user_id)
-        decoder = self.decoders.pop(user_id, None)
+    def _reset_stream_media_state(self, ssrc):
+        ssrc = int(ssrc)
+        decoder = self.decoders.pop(ssrc, None)
         if hasattr(decoder, "close"):
             try:
                 decoder.close()
             except Exception:
                 pass
-        self.resamplers.pop(user_id, None)
-        self.pre_dave_jitter_buffers.pop(user_id, None)
-        self.jitter_buffers.pop(user_id, None)
+        self.resamplers.pop(ssrc, None)
+        self.pre_dave_jitter_buffers.pop(ssrc, None)
+        self.jitter_buffers.pop(ssrc, None)
 
     def handle_session_description(self, data: dict):
         self.dave.handle_session_description(data)
@@ -898,14 +893,20 @@ class VoiceReceiveMedia:
 
     def _flush_stale(self, *, flush_jitter: bool = False):
         if flush_jitter:
-            for user_id, jitter in list(self.pre_dave_jitter_buffers.items()):
+            for ssrc, jitter in list(self.pre_dave_jitter_buffers.items()):
+                user_id = self.ssrc_to_user_id.get(ssrc)
+                if not user_id:
+                    continue
                 for item in jitter.flush():
-                    self._handle_ordered_pre_dave_item(user_id, item)
-            for user_id, jitter in list(self.jitter_buffers.items()):
+                    self._handle_ordered_pre_dave_item(ssrc, user_id, item)
+            for ssrc, jitter in list(self.jitter_buffers.items()):
+                user_id = self.ssrc_to_user_id.get(ssrc)
+                if not user_id:
+                    continue
                 for item in jitter.flush():
                     if item is None:
                         self.jitter_missing_count += 1
-                        self._decode_and_emit(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter"})
+                        self._decode_and_emit(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter", "ssrc": ssrc})
                     else:
                         opus_payload, traced_packet = item
                         if opus_payload is None:
@@ -945,16 +946,14 @@ class VoiceReceiveMedia:
         self.packet_count += 1
         user_id = self.ssrc_to_user_id.get(parsed["ssrc"])
         if not user_id:
-            # Infer only a participant that has no mapped audio stream yet. A
-            # second unknown SSRC may belong to a bot or an old DAVE epoch; tying
-            # every unknown stream to the sole participant makes two SSRCs steal
-            # one identity back and forth, resetting decryptors and audio state.
-            mapped_users = set(self.ssrc_to_user_id.values())
-            unmapped_users = self.fallback_user_ids - mapped_users
-            user_id = next(iter(unmapped_users)) if len(unmapped_users) == 1 else None
+            # Guess only in a true one-participant call. Multi-party calls wait
+            # for Discord's authoritative speaking opcode so identity can never
+            # be assigned by roster order or by whichever packet arrived first.
+            user_id = next(iter(self.fallback_user_ids)) if len(self.fallback_user_ids) == 1 else None
         if user_id:
-            self.add_ssrc_mapping(parsed["ssrc"], user_id)
-            self.log(f"Discord media inferred SSRC {parsed['ssrc']} for {self.name_for_user(user_id)}")
+            if self.ssrc_to_user_id.get(parsed["ssrc"]) != user_id:
+                self.add_ssrc_mapping(parsed["ssrc"], user_id)
+                self.log(f"Discord media inferred SSRC {parsed['ssrc']} for {self.name_for_user(user_id)}")
         if not user_id:
             self.unknown_ssrc_count += 1
             self._buffer_unknown_ssrc_packet(parsed, packet)
@@ -1002,20 +1001,21 @@ class VoiceReceiveMedia:
             payload = payload[ext_len:]
         if not payload:
             return
-        jitter = self.pre_dave_jitter_buffers.get(user_id)
+        ssrc = int(parsed["ssrc"])
+        jitter = self.pre_dave_jitter_buffers.get(ssrc)
         if jitter is None:
             jitter = RtpJitterBuffer(
                 max_packets=env_int("DISCORD_CALL_MEDIA_PRE_DAVE_JITTER_PACKETS", DEFAULT_JITTER_PACKETS),
                 max_resync_gap=env_int("DISCORD_CALL_MEDIA_JITTER_RESYNC_GAP", DEFAULT_JITTER_RESYNC_GAP),
             )
-            self.pre_dave_jitter_buffers[user_id] = jitter
+            self.pre_dave_jitter_buffers[ssrc] = jitter
         for item in jitter.add(parsed["sequence"], (dict(parsed), payload)):
-            self._handle_ordered_pre_dave_item(user_id, item)
+            self._handle_ordered_pre_dave_item(ssrc, user_id, item)
 
-    def _handle_ordered_pre_dave_item(self, user_id: str, item):
+    def _handle_ordered_pre_dave_item(self, ssrc: int, user_id: str, item):
         if item is None:
             self.jitter_missing_count += 1
-            self._decode_and_emit(user_id, None, packet_info={"missing": True, "stage": "pre_dave_jitter"})
+            self._decode_and_emit(user_id, None, packet_info={"missing": True, "stage": "pre_dave_jitter", "ssrc": ssrc})
             return
         parsed, payload = item
         pre_dave_payload = payload
@@ -1024,13 +1024,13 @@ class VoiceReceiveMedia:
         else:
             self.pre_dave_opus_invalid_count += 1
         payload = self.dave.decode_incoming_opus(parsed["ssrc"], payload)
-        jitter = self.jitter_buffers.get(user_id)
+        jitter = self.jitter_buffers.get(ssrc)
         if jitter is None:
             jitter = RtpJitterBuffer(
                 max_packets=env_int("DISCORD_CALL_MEDIA_JITTER_PACKETS", DEFAULT_JITTER_PACKETS),
                 max_resync_gap=env_int("DISCORD_CALL_MEDIA_JITTER_RESYNC_GAP", DEFAULT_JITTER_RESYNC_GAP),
             )
-            self.jitter_buffers[user_id] = jitter
+            self.jitter_buffers[ssrc] = jitter
         if not payload:
             self.dave_drop_count += 1
             packet_info = {
@@ -1048,7 +1048,7 @@ class VoiceReceiveMedia:
             for item in jitter.add(parsed["sequence"], (None, packet_info)):
                 if item is None:
                     self.jitter_missing_count += 1
-                    self._decode_and_emit(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter"})
+                    self._decode_and_emit(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter", "ssrc": ssrc})
                 else:
                     opus_payload, traced_packet = item
                     if opus_payload is None:
@@ -1073,7 +1073,7 @@ class VoiceReceiveMedia:
         for item in jitter.add(parsed["sequence"], (payload, packet_info)):
             if item is None:
                 self.jitter_missing_count += 1
-                self._decode_and_emit(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter"})
+                self._decode_and_emit(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter", "ssrc": ssrc})
             else:
                 opus_payload, traced_packet = item
                 if opus_payload is None:
@@ -1081,10 +1081,11 @@ class VoiceReceiveMedia:
                 self._decode_and_emit(user_id, opus_payload, packet_info=traced_packet)
 
     def _decode_and_emit(self, user_id: str, opus_payload: bytes | None, *, packet_info: dict | None = None):
-        decoder = self.decoders.get(user_id)
+        stream_id = int((packet_info or {}).get("ssrc") or 0)
+        decoder = self.decoders.get(stream_id)
         if decoder is None:
             decoder = self._create_decoder()
-            self.decoders[user_id] = decoder
+            self.decoders[stream_id] = decoder
         if isinstance(decoder, LibOpusPcmDecoder):
             decoded = decoder.decode(opus_payload)
             if decoded is None:
@@ -1105,7 +1106,7 @@ class VoiceReceiveMedia:
             return
         for frame in frames:
             self.decode_frame_count += 1
-            for pcm, sample_rate, channels in self._frame_to_pcm16_mono_48k(user_id, frame):
+            for pcm, sample_rate, channels in self._frame_to_pcm16_mono_48k(stream_id, user_id, frame):
                 self._emit_pcm(user_id, pcm, sample_rate, channels, packet_info=packet_info)
 
     def _log_invalid_opus(self, user_id: str, parsed: dict, payload: bytes):
@@ -1140,11 +1141,11 @@ class VoiceReceiveMedia:
         if pcm:
             self.pcm_sink(user_id, pcm, sample_rate, channels)
 
-    def _frame_to_pcm16_mono_48k(self, user_id: str, frame):
-        resampler = self.resamplers.get(user_id)
+    def _frame_to_pcm16_mono_48k(self, stream_id: int, user_id: str, frame):
+        resampler = self.resamplers.get(stream_id)
         if resampler is None:
             resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=48000)
-            self.resamplers[user_id] = resampler
+            self.resamplers[stream_id] = resampler
         try:
             frames = resampler.resample(frame)
         except Exception as exc:

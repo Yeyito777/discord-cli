@@ -8,60 +8,23 @@ from src.calls.adapter import DiscordCallAdapter, DiscordInputAudioTrack, FRAME_
 
 
 class DiscordCallAdapterTests(unittest.IsolatedAsyncioTestCase):
-    async def test_track_applies_fifty_percent_input_gain(self):
+    async def test_webrtc_input_track_is_silent_to_avoid_duplicate_model_turns(self):
         track = DiscordInputAudioTrack()
-        samples = array("h", [1200]) * FRAME_SAMPLES
-        track.push_pcm("speaker-a", samples.tobytes(), SAMPLE_RATE, 1)
-
         frame = await track.recv()
         output = array("h")
         output.frombytes(bytes(frame.planes[0])[: FRAME_SAMPLES * 2])
         self.assertEqual(len(output), FRAME_SAMPLES)
-        self.assertEqual(set(output), {1800})
+        self.assertEqual(set(output), {0})
         track.stop()
 
-    async def test_track_mixes_simultaneous_speakers_into_one_realtime_frame(self):
-        track = DiscordInputAudioTrack()
-        first = array("h", [1000]) * FRAME_SAMPLES
-        second = array("h", [2000]) * FRAME_SAMPLES
-        track.push_pcm("speaker-a", first.tobytes(), SAMPLE_RATE, 1)
-        track.push_pcm("speaker-b", second.tobytes(), SAMPLE_RATE, 1)
-
-        frame = await track.recv()
+    def test_adapter_applies_fifty_percent_gain_before_per_speaker_segmentation(self):
+        adapter = DiscordCallAdapter(Mock(), Mock(), "conv", "call", log=lambda _message: None)
+        adapter.segmenter = Mock()
+        samples = array("h", [1200]) * FRAME_SAMPLES
+        adapter.push_pcm("speaker-a", samples.tobytes(), SAMPLE_RATE, 1)
         output = array("h")
-        output.frombytes(bytes(frame.planes[0])[: FRAME_SAMPLES * 2])
-        # sqrt(2) headroom prevents ordinary overlap from clipping.
-        self.assertTrue(all(3170 <= value <= 3195 for value in output))
-        track.stop()
-
-    def test_track_reports_only_speaker_set_boundaries_with_overlap_and_hangover(self):
-        monotonic = [10.0]
-        wall_clock = [100.0]
-        events = []
-        track = DiscordInputAudioTrack(
-            on_speakers=lambda speakers, observed_at: events.append((speakers, observed_at)),
-            monotonic=lambda: monotonic[0],
-            wall_clock=lambda: wall_clock[0],
-        )
-        speech = (array("h", [4000]) * FRAME_SAMPLES).tobytes()
-
-        track.push_pcm("speaker-a", speech, SAMPLE_RATE, 1)
-        track._mixed_frame()
-        track.push_pcm("speaker-a", speech, SAMPLE_RATE, 1)
-        track._mixed_frame()
-        track.push_pcm("speaker-b", speech, SAMPLE_RATE, 1)
-        track._mixed_frame()
-
-        monotonic[0] += 0.4
-        wall_clock[0] += 0.4
-        track._mixed_frame()
-
-        self.assertEqual(events, [
-            (("speaker-a",), 100000),
-            (("speaker-a", "speaker-b"), 100000),
-            ((), 100400),
-        ])
-        track.stop()
+        output.frombytes(adapter.segmenter.push_pcm.call_args.args[1])
+        self.assertEqual(set(output), {1800})
 
     def test_stereo_input_is_downmixed_without_changing_duration(self):
         stereo = array("h")
