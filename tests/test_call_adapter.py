@@ -1,12 +1,13 @@
 from array import array
 import unittest
+from unittest.mock import Mock
 
 import av
 
-from src.calls.bidi import DiscordInputAudioTrack, FRAME_SAMPLES, SAMPLE_RATE, _frame_rms_db, _mono_48k
+from src.calls.adapter import DiscordCallAdapter, DiscordInputAudioTrack, FRAME_SAMPLES, SAMPLE_RATE, _frame_rms_db, _mono_48k
 
 
-class DiscordBidiAudioTests(unittest.IsolatedAsyncioTestCase):
+class DiscordCallAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_track_preserves_one_speaker_pcm(self):
         track = DiscordInputAudioTrack()
         samples = array("h", [1200]) * FRAME_SAMPLES
@@ -49,6 +50,23 @@ class DiscordBidiAudioTests(unittest.IsolatedAsyncioTestCase):
         speech.planes[0].update((array("h", [4000, 4000]) * FRAME_SAMPLES).tobytes())
         self.assertLess(_frame_rms_db(silence), -58)
         self.assertGreater(_frame_rms_db(speech), -58)
+
+    async def test_output_track_uses_the_worker_media_send_contract(self):
+        worker = Mock()
+        worker.running = True
+        worker.self_mute = False
+        adapter = DiscordCallAdapter(worker, None, "conv", "call", log=lambda _message: None)
+        speech = av.AudioFrame(format="s16", layout="stereo", samples=FRAME_SAMPLES)
+        speech.planes[0].update((array("h", [4000, 4000]) * FRAME_SAMPLES).tobytes())
+        speech.sample_rate = SAMPLE_RATE
+
+        class OneFrameTrack:
+            async def recv(self):
+                worker.running = False
+                return speech
+
+        await adapter._consume_output(OneFrameTrack())
+        worker.send_call_opus.assert_called()
 
 
 if __name__ == "__main__":

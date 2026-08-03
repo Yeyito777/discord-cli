@@ -1,4 +1,4 @@
-"""WebRTC bridge between Discord voice media and an Exocortex Bidi call."""
+"""Discord media adapter for an Exocortex realtime call."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import math
 import threading
 import time
 
-try:  # Optional until Bidi mode is selected.
+try:  # Optional until a call adapter is started.
     import av  # type: ignore
     from aiortc import AudioStreamTrack, RTCPeerConnection, RTCSessionDescription  # type: ignore
 except Exception:  # pragma: no cover - deployment dependency validation
@@ -47,7 +47,7 @@ def _mono_48k(pcm: bytes, sample_rate: int, channels: int) -> bytes:
             mono.append(int(sum(samples[offset:offset + channels]) / channels))
         return mono.tobytes()
     if av is None:
-        raise RuntimeError("PyAV is required to resample Discord Bidi audio")
+        raise RuntimeError("PyAV is required to resample Discord call audio")
     layout = "mono" if channels == 1 else "stereo"
     sample_count = len(pcm) // (2 * channels)
     frame = av.AudioFrame(format="s16", layout=layout, samples=sample_count)
@@ -130,12 +130,12 @@ class DiscordInputAudioTrack(AudioStreamTrack):
         return frame
 
 
-class DiscordBidiBridge:
+class DiscordCallAdapter:
     """Own one aiortc peer and route its audio through an active Discord worker."""
 
     def __init__(self, worker, exocortex, conv_id: str, call_id: str, *, log=print):
         if RTCPeerConnection is None or av is None:
-            raise RuntimeError("aiortc and PyAV are required for Discord Bidi calls")
+            raise RuntimeError("aiortc and PyAV are required for Discord calls")
         self.worker = worker
         self.exocortex = exocortex
         self.conv_id = str(conv_id)
@@ -153,10 +153,10 @@ class DiscordBidiBridge:
     def start(self, timeout=30):
         if self.thread:
             return
-        self.thread = threading.Thread(target=self._thread_main, name="discord-bidi-webrtc", daemon=True)
+        self.thread = threading.Thread(target=self._thread_main, name="discord-call-webrtc", daemon=True)
         self.thread.start()
         if not self.started.wait(timeout):
-            raise TimeoutError("Timed out starting the Discord Bidi media adapter")
+            raise TimeoutError("Timed out starting the Discord media adapter")
         if self.start_error:
             raise self.start_error
 
@@ -212,7 +212,7 @@ class DiscordBidiBridge:
         @peer.on("connectionstatechange")
         async def on_connection_state_change():
             state = peer.connectionState
-            self.log(f"Discord Bidi WebRTC state: {state}")
+            self.log(f"Discord call WebRTC state: {state}")
             if state in {"failed", "closed"} and not self.stopping:
                 self.worker.running = False
 
@@ -221,7 +221,7 @@ class DiscordBidiBridge:
         await self._wait_for_ice(peer)
         local = peer.localDescription
         if not local or not local.sdp:
-            raise RuntimeError("Discord Bidi WebRTC did not produce an SDP offer")
+            raise RuntimeError("Discord call WebRTC did not produce an SDP offer")
         answer = await asyncio.to_thread(
             self.exocortex.attach_media,
             self.conv_id,
@@ -260,6 +260,11 @@ class DiscordBidiBridge:
             while not self.stopping and self.worker.running:
                 frame = await track.recv()
                 for output in resampler.resample(frame):
+                    if self.worker.self_mute:
+                        if speaking:
+                            self.worker._send_speaking(False)
+                            speaking = False
+                        continue
                     now = time.monotonic()
                     if _frame_rms_db(output) >= OUTPUT_SILENCE_THRESHOLD_DB:
                         last_audible_at = now
@@ -272,10 +277,10 @@ class DiscordBidiBridge:
                         self.worker._send_speaking(True)
                         speaking = True
                     for packet in codec.encode(output):
-                        self.worker.send_bidi_opus(bytes(packet))
+                        self.worker.send_call_opus(bytes(packet))
         except Exception as error:
             if not self.stopping:
-                self.log(f"Discord Bidi output stopped: {error}")
+                self.log(f"Discord call output stopped: {error}")
                 self.worker.running = False
         finally:
             if speaking:

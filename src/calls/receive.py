@@ -1,10 +1,4 @@
-"""Receive Discord voice audio and asynchronously transcribe speaker segments.
-
-This module deliberately does not implement speech-to-text itself.  It receives
-Discord RTP/Opus media, segments decoded PCM by speaker using the same RMS
-speaking gate as Record's call widget, writes finalized WAV files, and
-delegates ASR to `exo transcribe` so exocortexd owns OpenAI auth.
-"""
+"""Receive, decrypt, decode, and emit Discord voice media."""
 
 from __future__ import annotations
 
@@ -12,19 +6,11 @@ from collections import deque
 import base64
 import ctypes
 import ctypes.util
-import json
-import math
 import os
-from pathlib import Path
-import queue
-import shutil
 import socket
 import struct
-import subprocess
-import tempfile
 import threading
 import time
-import wave
 
 try:  # Optional runtime dependencies; callers can degrade cleanly.
     import av  # type: ignore
@@ -43,36 +29,13 @@ except Exception:  # pragma: no cover - depends on deployment venv
 
 OPUS_PAYLOAD_TYPE = 120
 RTP_HEADER_LENGTH = 12
-TRANSCRIBE_WORKERS = 2
-# Coupled with Record's call-widget speaking gate.  If this transcription
-# start/stop/idle logic changes, mirror the intent in:
-# /home/yeyito/Workspace/active-development/record/src/voice/audio-ffmpeg.ts
-DEFAULT_SPEECH_START_THRESHOLD_DB = -45.0
-DEFAULT_SPEECH_STOP_THRESHOLD_DB = -55.0
-DEFAULT_SILENCE_MS = 700
-DEFAULT_MIN_SPEECH_MS = 450
-DEFAULT_MAX_SEGMENT_MS = 0
-DEFAULT_PRE_ROLL_MS = 250
-DEFAULT_MAX_QUEUE = 24
 DEFAULT_JITTER_PACKETS = 12
 DEFAULT_JITTER_RESYNC_GAP = 120
 DEFAULT_UNKNOWN_SSRC_BUFFER_PACKETS = 750
-DEFAULT_REMOTE_SPEAKING_IDLE_MS = 1500
 OPUS_SAMPLE_RATE = 48_000
-TRANSCRIBE_SAMPLE_RATE = 16_000
 OPUS_FRAME_SAMPLES = 960  # 20 ms at 48 kHz.
 OPUS_MAX_FRAME_SAMPLES = 5_760
 OPUS_SILENCE_FRAME = b"\xf8\xff\xfe"
-
-
-def env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
 
 
 def env_int(name: str, default: int) -> int:
@@ -83,41 +46,6 @@ def env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
-
-
-def db_to_linear(db: float) -> float:
-    return 10 ** (db / 20.0)
-
-
-def format_ms(seconds: float | None) -> str:
-    if not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
-        return "n/a"
-    return f"{seconds * 1000:.0f}ms"
-
-
-def elapsed_since(start: float | None, end: float | None = None) -> float | None:
-    if not isinstance(start, (int, float)) or start <= 0:
-        return None
-    if end is None:
-        end = time.time()
-    if not isinstance(end, (int, float)) or end <= 0:
-        return None
-    return max(0.0, end - start)
-
-
-def pcm16_rms(samples: bytes) -> float:
-    if len(samples) < 2:
-        return 0.0
-    usable = len(samples) - (len(samples) % 2)
-    if usable <= 0:
-        return 0.0
-    count = usable // 2
-    total = 0.0
-    for (sample,) in struct.iter_unpack("<h", samples[:usable]):
-        value = sample / 32768.0
-        total += value * value
-    return math.sqrt(total / count) if count else 0.0
-
 
 _OPUS_LIB = None
 _OPUS_LOAD_ATTEMPTED = False
@@ -285,7 +213,7 @@ class DavePassthroughDecryptor:
     davey exposes a convenient session.decrypt(user_id, payload) API, but in
     practice it leaves some encrypted/padded packets in the media path. Endcord
     uses dave-py Session + one Decryptor per SSRC and transitions each decryptor
-    onto the sender's key ratchet; mirror that shape here so transcription sees
+    onto the sender's key ratchet; mirror that shape here so the media adapter sees
     real Opus once instead of attempting heuristic recovery after decode damage.
     """
 
@@ -676,7 +604,7 @@ class RtpJitterBuffer:
                     # Large jumps happen at join/DAVE transition boundaries and
                     # after Discord drops idle/DTX packets.  Backfilling the whole
                     # gap with PLC creates seconds of synthetic silence, delaying
-                    # or suppressing the real speech segment.  Treat those jumps
+                    # or suppressing real speech. Treat those jumps
                     # as a stream boundary instead of as thousands of lost frames.
                     self.expected = next_sequence
                     self.resync_count += 1
@@ -709,7 +637,7 @@ class LibOpusPcmDecoder:
             raise RuntimeError("libopus is not available")
         self.lib = lib
         if channels is None:
-            channels = env_int("DISCORD_CALL_TRANSCRIBE_OPUS_CHANNELS", 1)
+            channels = env_int("DISCORD_CALL_MEDIA_OPUS_CHANNELS", 1)
         self.channels = max(1, min(2, int(channels)))
         error = ctypes.c_int(0)
         self.ptr = lib.opus_decoder_create(OPUS_SAMPLE_RATE, self.channels, ctypes.byref(error))
@@ -796,664 +724,19 @@ def probe_libopus_payload(payload: bytes | None) -> str:
     return " ".join(parts)
 
 
-class VoicePacketTrace:
-    def __init__(self, *, max_packets: int | None = None):
-        self.max_packets = env_int("DISCORD_CALL_TRANSCRIBE_TRACE_PACKETS", 2_000) if max_packets is None else int(max_packets)
-        self.items = []
-        self.dropped = 0
-
-    def append(self, info: dict | None):
-        if info is None:
-            return
-        if self.max_packets <= 0:
-            return
-        if len(self.items) >= self.max_packets:
-            self.dropped += 1
-            return
-        item = dict(info)
-        payload = item.pop("payload", None)
-        if payload is not None:
-            item["payload_b64"] = base64.b64encode(bytes(payload)).decode("ascii")
-        self.items.append(item)
-
-    def snapshot(self) -> dict:
-        return {"packets": list(self.items), "dropped": self.dropped}
-
-    def clear(self):
-        self.items.clear()
-        self.dropped = 0
-
-
-class SpeakerSegmenter:
-    def __init__(self, user_id: str, name_for_user, submit_segment, *, sample_rate=16000, channels=1):
-        self.user_id = str(user_id)
-        self.name_for_user = name_for_user
-        self.submit_segment = submit_segment
-        self.sample_rate = sample_rate
-        self.channels = channels
-        legacy_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_THRESHOLD_DB", DEFAULT_SPEECH_START_THRESHOLD_DB)
-        record_threshold_db = env_float("RECORD_VOICE_SPEAKING_THRESHOLD_DB", legacy_threshold_db)
-        self.start_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_START_THRESHOLD_DB", record_threshold_db)
-        default_stop_threshold_db = env_float("RECORD_VOICE_SPEAKING_STOP_THRESHOLD_DB", DEFAULT_SPEECH_STOP_THRESHOLD_DB)
-        self.stop_threshold_db = env_float("DISCORD_CALL_TRANSCRIBE_STOP_THRESHOLD_DB", default_stop_threshold_db)
-        if self.stop_threshold_db > self.start_threshold_db:
-            self.stop_threshold_db = self.start_threshold_db
-        self.start_threshold = db_to_linear(self.start_threshold_db)
-        self.stop_threshold = db_to_linear(self.stop_threshold_db)
-        self.silence_seconds = env_int("DISCORD_CALL_TRANSCRIBE_SILENCE_MS", DEFAULT_SILENCE_MS) / 1000.0
-        self.min_speech_seconds = env_int("DISCORD_CALL_TRANSCRIBE_MIN_SPEECH_MS", DEFAULT_MIN_SPEECH_MS) / 1000.0
-        self.max_segment_seconds = max(0, env_int("DISCORD_CALL_TRANSCRIBE_MAX_SEGMENT_MS", DEFAULT_MAX_SEGMENT_MS)) / 1000.0
-        pre_roll_frames = max(0, int((env_int("DISCORD_CALL_TRANSCRIBE_PRE_ROLL_MS", DEFAULT_PRE_ROLL_MS) / 1000.0) * sample_rate))
-        self.pre_roll = deque(maxlen=pre_roll_frames * channels * 2)
-        pre_roll_packets = max(0, int(math.ceil(env_int("DISCORD_CALL_TRANSCRIBE_PRE_ROLL_MS", DEFAULT_PRE_ROLL_MS) / 20)))
-        self.pre_roll_packet_trace = deque(maxlen=pre_roll_packets)
-        self.packet_trace = VoicePacketTrace()
-        self.active = False
-        self.frames = bytearray()
-        self.speech_seconds = 0.0
-        self.silence_seconds_seen = 0.0
-        self.segment_started_at = 0.0
-        self.last_speech_at = 0.0
-        self.max_rms = 0.0
-        self.last_audio_at = time.time()
-        self.external_speaking_start_pending = False
-
-    def set_external_speaking(self, speaking: bool):
-        if speaking:
-            # Discord/Record SPEAKING=true is a start hint, not a sticky gate.
-            # In practice Discord does not always relay SPEAKING=false, so if we
-            # treat true as persistent the segment can stay open forever.  Use it
-            # to force segment start, then let decoded audio hysteresis/silence
-            # close the segment; an explicit false still closes immediately.
-            self.external_speaking_start_pending = True
-        else:
-            self.external_speaking_start_pending = False
-            # Remote Discord SPEAKING=false is emitted by Record only after its
-            # own idle hold has expired, so close immediately instead of adding
-            # another transcription-side hold and delaying the transcript.
-            self.finish_or_discard()
-
-    def add_pcm(self, pcm: bytes, duration: float, packet_info: dict | None = None):
-        now = time.time()
-        self.last_audio_at = now
-        rms = pcm16_rms(pcm)
-        if rms > self.max_rms:
-            self.max_rms = rms
-        # Keep this start/stop hysteresis aligned with Record's
-        # FfmpegRtpVoiceAudioBackend so Exo's transcription gate and Record's
-        # green talking state behave similarly for the same audio.
-        external_start = self.external_speaking_start_pending and not self.active
-        if external_start:
-            self.external_speaking_start_pending = False
-        speaking = external_start or rms >= (self.stop_threshold if self.active else self.start_threshold)
-        if speaking:
-            if not self.active:
-                self.active = True
-                self.frames = bytearray(self.pre_roll)
-                self.packet_trace.clear()
-                for traced in self.pre_roll_packet_trace:
-                    self.packet_trace.append(traced)
-                self.speech_seconds = 0.0
-                self.silence_seconds_seen = 0.0
-                self.segment_started_at = now
-                self.last_speech_at = now
-                self.max_rms = rms
-            self.last_speech_at = now
-            self.speech_seconds += duration
-            self.silence_seconds_seen = 0.0
-        elif self.active:
-            self.silence_seconds_seen += duration
-
-        if self.active:
-            self.frames.extend(pcm)
-            self.packet_trace.append(packet_info)
-            current_len_seconds = len(self.frames) / (self.sample_rate * self.channels * 2)
-            if self.silence_seconds_seen >= self.silence_seconds:
-                self.finish_or_discard()
-            elif self.max_segment_seconds > 0 and current_len_seconds >= self.max_segment_seconds:
-                self.finalize()
-        else:
-            self.pre_roll.extend(pcm)
-            if packet_info is not None:
-                self.pre_roll_packet_trace.append(packet_info)
-
-    def flush_if_stale(self, stale_after=2.5):
-        if self.active and time.time() - self.last_audio_at >= stale_after:
-            self.finish_or_discard()
-
-    def finish_or_discard(self):
-        if not self.active:
-            return
-        if self.speech_seconds >= self.min_speech_seconds:
-            self.finalize()
-        else:
-            self._reset_segment()
-
-    def finalize(self):
-        if not self.active:
-            return
-        finalized_at = time.time()
-        frames = bytes(self.frames)
-        speech_seconds = self.speech_seconds
-        max_rms = self.max_rms
-        speech_started_at = self.segment_started_at
-        speech_ended_at = self.last_speech_at or finalized_at
-        duration_seconds = len(frames) / (self.sample_rate * self.channels * 2) if frames else 0.0
-        packet_trace = self.packet_trace.snapshot()
-        self._reset_segment()
-        if speech_seconds < self.min_speech_seconds:
-            return
-        self.submit_segment(self.user_id, self.name_for_user(self.user_id), frames, self.sample_rate, self.channels, {
-            "duration_seconds": duration_seconds,
-            "speech_seconds": speech_seconds,
-            "speech_started_at": speech_started_at,
-            "speech_ended_at": speech_ended_at,
-            "finalized_at": finalized_at,
-            "max_db": 20 * math.log10(max_rms) if max_rms > 0 else -math.inf,
-            "packet_trace": packet_trace,
-        })
-
-    def _reset_segment(self):
-        self.active = False
-        self.external_speaking_start_pending = False
-        self.frames = bytearray()
-        self.speech_seconds = 0.0
-        self.silence_seconds_seen = 0.0
-        self.segment_started_at = 0.0
-        self.last_speech_at = 0.0
-        self.max_rms = 0.0
-        self.packet_trace.clear()
-        self.pre_roll.clear()
-        self.pre_roll_packet_trace.clear()
-
-
-class PcmOnlyTranscriber:
-    """No-op transcription facade used when decoded PCM goes directly to Bidi."""
-
-    enabled = False
-
-    def set_enabled(self, enabled: bool):
-        self.enabled = False
-
-    def submit(self, *args, **kwargs):
-        return None
-
-    def stop(self):
-        return None
-
-
-class VoiceTranscriber:
-    def __init__(self, *, label: str, notify, log=print, keep_audio: bool | None = None, audio_dir: str | os.PathLike | None = None):
-        self.label = label
-        self.notify = notify
-        self.log = log
-        self.enabled = True
-        self.queue = queue.Queue(maxsize=env_int("DISCORD_CALL_TRANSCRIBE_QUEUE", DEFAULT_MAX_QUEUE))
-        self.running = True
-        self.keep_audio = (os.environ.get("DISCORD_CALL_TRANSCRIBE_KEEP_AUDIO") == "1") if keep_audio is None else bool(keep_audio)
-        configured_audio_dir = audio_dir or os.environ.get("DISCORD_CALL_TRANSCRIBE_AUDIO_DIR")
-        if configured_audio_dir:
-            self.tmpdir = Path(configured_audio_dir).expanduser()
-            self.tmpdir.mkdir(parents=True, exist_ok=True)
-        else:
-            self.tmpdir = Path(tempfile.mkdtemp(prefix="discord-call-transcribe-"))
-        if self.keep_audio:
-            self.log(f"keeping transcription audio segments in {self.tmpdir}")
-        self.workers = []
-        for index in range(TRANSCRIBE_WORKERS):
-            thread = threading.Thread(target=self._worker, name=f"discord-transcribe-{index}", daemon=True)
-            thread.start()
-            self.workers.append(thread)
-
-    def set_enabled(self, enabled: bool):
-        self.enabled = bool(enabled)
-
-    def submit(self, user_id: str, name: str, pcm: bytes, sample_rate: int, channels: int, stats=None):
-        if not self.enabled or not pcm:
-            return
-        stats = stats or {}
-        queued_at = time.time()
-        stats["queued_at"] = queued_at
-        max_db = stats.get("max_db")
-        duration = stats.get("duration_seconds")
-        queue_wait = elapsed_since(stats.get("finalized_at"), queued_at)
-        speech_to_queue = elapsed_since(stats.get("speech_started_at"), queued_at)
-        self.log(
-            f"queue transcription for {name or user_id}: "
-            f"duration={duration:.2f}s max_db={max_db:.1f} "
-            f"speech_to_queue={format_ms(speech_to_queue)} finalize_to_queue={format_ms(queue_wait)}"
-            if isinstance(duration, (int, float)) and isinstance(max_db, (int, float)) and math.isfinite(max_db)
-            else f"queue transcription for {name or user_id}: speech_to_queue={format_ms(speech_to_queue)}"
-        )
-        try:
-            self.queue.put_nowait({
-                "user_id": str(user_id),
-                "name": name or str(user_id),
-                "pcm": pcm,
-                "sample_rate": sample_rate,
-                "channels": channels,
-                "stats": stats,
-                "created_at": queued_at,
-            })
-        except queue.Full:
-            self.log("Transcription queue full; dropping voice segment")
-
-    def stop(self):
-        self.running = False
-        for _ in self.workers:
-            try:
-                self.queue.put_nowait(None)
-            except queue.Full:
-                pass
-        for thread in self.workers:
-            thread.join(timeout=1)
-        if not self.keep_audio:
-            try:
-                shutil.rmtree(self.tmpdir, ignore_errors=True)
-            except Exception:
-                pass
-
-    def _worker(self):
-        while self.running:
-            try:
-                item = self.queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if item is None:
-                return
-            try:
-                self._transcribe_item(item)
-            finally:
-                self.queue.task_done()
-
-    def _transcribe_item(self, item: dict):
-        name = item["name"]
-        stats = dict(item.get("stats") or {})
-        packet_trace = stats.pop("packet_trace", None)
-        packet_trace_path = None
-        worker_started_at = time.time()
-        wav_path = self.tmpdir / f"segment-{int(time.time() * 1000)}-{os.getpid()}-{threading.get_ident()}.wav"
-        with wave.open(str(wav_path), "wb") as wf:
-            wf.setnchannels(int(item["channels"]))
-            wf.setsampwidth(2)
-            wf.setframerate(int(item["sample_rate"]))
-            wf.writeframes(item["pcm"])
-        if self.keep_audio:
-            self.log(f"saved transcription audio segment for {name}: {wav_path}")
-            packet_trace_path = self._write_packet_trace(wav_path, packet_trace)
-            if packet_trace_path:
-                self.log(f"saved transcription Opus packet trace for {name}: {packet_trace_path}")
-        transcribe_started_at = time.time()
-        try:
-            proc = subprocess.run(
-                ["exo", "transcribe", str(wav_path), "--mime-type", "audio/wav", "--timeout", "120"],
-                capture_output=True,
-                text=True,
-                timeout=150,
-            )
-            transcript_ready_at = time.time()
-            timing = self._build_timing(stats, worker_started_at, transcribe_started_at, transcript_ready_at)
-            if proc.returncode != 0:
-                err = (proc.stderr or proc.stdout or "exo transcribe failed").strip().splitlines()[-1:]
-                self.log(f"exo transcribe failed for {name}: {err[0] if err else proc.returncode}; {self._format_timing(timing)}")
-                return
-            text = (proc.stdout or "").strip()
-            if not text:
-                self.log(f"exo transcribe empty for {name}; {self._format_timing(timing)}")
-                return
-            self.log(f"exo transcribe ready for {name}; {self._format_timing(timing)}")
-            if self.keep_audio:
-                self._write_sidecar(wav_path, item, text, timing, packet_trace_path=packet_trace_path)
-            self.notify(f"🎙 {name}: {text}", prefix="Discord Voice", timing=timing)
-        except subprocess.TimeoutExpired:
-            timed_out_at = time.time()
-            timing = self._build_timing(stats, worker_started_at, transcribe_started_at, timed_out_at)
-            self.log(f"exo transcribe timed out for {name}; {self._format_timing(timing)}")
-        except Exception as exc:
-            failed_at = time.time()
-            timing = self._build_timing(stats, worker_started_at, transcribe_started_at, failed_at)
-            self.log(f"exo transcribe failed for {name}: {exc}; {self._format_timing(timing)}")
-        finally:
-            if not self.keep_audio:
-                try:
-                    wav_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-    def _write_packet_trace(self, wav_path: Path, packet_trace) -> Path | None:
-        if not packet_trace or not isinstance(packet_trace, dict):
-            return None
-        packets = packet_trace.get("packets") or []
-        if not packets:
-            return None
-        path = wav_path.with_suffix(".packets.jsonl")
-        try:
-            with path.open("w", encoding="utf-8") as fh:
-                header = {"type": "header", "dropped": packet_trace.get("dropped", 0), "packet_count": len(packets)}
-                fh.write(json.dumps(header, sort_keys=True) + "\n")
-                for packet in packets:
-                    fh.write(json.dumps(packet, sort_keys=True) + "\n")
-            return path
-        except Exception as exc:
-            self.log(f"failed to write transcription Opus packet trace for {wav_path}: {exc}")
-            return None
-
-    def _write_sidecar(self, wav_path: Path, item: dict, text: str, timing: dict, *, packet_trace_path: Path | None = None):
-        sidecar = wav_path.with_suffix(".json")
-        try:
-            stats = dict(item.get("stats") or {})
-            stats.pop("packet_trace", None)
-            payload = {
-                "wav": str(wav_path),
-                "user_id": item.get("user_id"),
-                "name": item.get("name"),
-                "sample_rate": item.get("sample_rate"),
-                "channels": item.get("channels"),
-                "stats": stats,
-                "packet_trace": str(packet_trace_path) if packet_trace_path else None,
-                "timing": timing,
-                "transcript": text,
-            }
-            sidecar.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        except Exception as exc:
-            self.log(f"failed to write transcription audio sidecar for {wav_path}: {exc}")
-
-    def _build_timing(self, stats: dict, worker_started_at: float, transcribe_started_at: float, transcript_ready_at: float):
-        speech_started_at = stats.get("speech_started_at")
-        speech_ended_at = stats.get("speech_ended_at")
-        finalized_at = stats.get("finalized_at")
-        queued_at = stats.get("queued_at") or stats.get("created_at")
-        return {
-            "speech_started_at": speech_started_at,
-            "speech_ended_at": speech_ended_at,
-            "finalized_at": finalized_at,
-            "queued_at": queued_at,
-            "worker_started_at": worker_started_at,
-            "transcribe_started_at": transcribe_started_at,
-            "transcript_ready_at": transcript_ready_at,
-            "speech_start_to_ready_ms": self._elapsed_ms(speech_started_at, transcript_ready_at),
-            "speech_end_to_ready_ms": self._elapsed_ms(speech_ended_at, transcript_ready_at),
-            "finalize_to_ready_ms": self._elapsed_ms(finalized_at, transcript_ready_at),
-            "queue_wait_ms": self._elapsed_ms(queued_at, worker_started_at),
-            "asr_ms": self._elapsed_ms(transcribe_started_at, transcript_ready_at),
-        }
-
-    def _format_timing(self, timing: dict) -> str:
-        return (
-            f"speech_start_to_ready={self._format_timing_ms(timing.get('speech_start_to_ready_ms'))} "
-            f"speech_end_to_ready={self._format_timing_ms(timing.get('speech_end_to_ready_ms'))} "
-            f"finalize_to_ready={self._format_timing_ms(timing.get('finalize_to_ready_ms'))} "
-            f"queue_wait={self._format_timing_ms(timing.get('queue_wait_ms'))} "
-            f"asr={self._format_timing_ms(timing.get('asr_ms'))}"
-        )
-
-    @staticmethod
-    def _elapsed_ms(start, end) -> int | None:
-        seconds = elapsed_since(start, end)
-        return int(round(seconds * 1000)) if seconds is not None else None
-
-    @staticmethod
-    def _format_timing_ms(value) -> str:
-        if not isinstance(value, (int, float)) or not math.isfinite(value):
-            return "n/a"
-        return f"{int(round(value))}ms"
-
-
-
-def _read_wav_metrics(path: Path) -> dict:
-    try:
-        with wave.open(str(path), "rb") as wf:
-            channels = wf.getnchannels()
-            sample_rate = wf.getframerate()
-            frames = wf.getnframes()
-            pcm = wf.readframes(frames)
-    except Exception as exc:
-        return {"path": str(path), "error": str(exc)}
-    sample_count = len(pcm) // 2
-    if sample_count <= 0:
-        return {"path": str(path), "channels": channels, "sample_rate": sample_rate, "duration_seconds": 0.0}
-    samples = struct.unpack("<" + "h" * sample_count, pcm[:sample_count * 2])
-    rms = math.sqrt(sum((sample / 32768.0) ** 2 for sample in samples) / sample_count)
-    peak = max(abs(sample) for sample in samples) / 32768.0
-    clipped = sum(1 for sample in samples if abs(sample) >= 32760) / sample_count
-    zero_crossing = 0.0
-    diff_rms = 0.0
-    if sample_count > 1:
-        zero_crossing = sum(1 for a, b in zip(samples, samples[1:]) if (a < 0 <= b) or (a >= 0 > b)) / (sample_count - 1)
-        diff_rms = math.sqrt(sum(((b - a) / 32768.0) ** 2 for a, b in zip(samples, samples[1:])) / (sample_count - 1))
-    return {
-        "path": str(path),
-        "channels": channels,
-        "sample_rate": sample_rate,
-        "duration_seconds": frames / sample_rate if sample_rate else 0.0,
-        "rms_db": 20 * math.log10(rms) if rms > 0 else -math.inf,
-        "peak_db": 20 * math.log10(peak) if peak > 0 else -math.inf,
-        "clipped_percent": clipped * 100,
-        "zero_crossing_rate": zero_crossing,
-        "diff_rms_db": 20 * math.log10(diff_rms) if diff_rms > 0 else -math.inf,
-    }
-
-
-def _format_metric_db(value) -> str:
-    if not isinstance(value, (int, float)) or not math.isfinite(value):
-        return "n/a"
-    return f"{value:.1f}dB"
-
-
-def _format_wav_metrics(metrics: dict) -> str:
-    if metrics.get("error"):
-        return f"error={metrics['error']}"
-    return (
-        f"{metrics.get('duration_seconds', 0):.2f}s {metrics.get('sample_rate')}Hz/{metrics.get('channels')}ch "
-        f"rms={_format_metric_db(metrics.get('rms_db'))} peak={_format_metric_db(metrics.get('peak_db'))} "
-        f"clip={metrics.get('clipped_percent', 0):.3f}% zc={metrics.get('zero_crossing_rate', 0):.3f} "
-        f"diff={_format_metric_db(metrics.get('diff_rms_db'))}"
-    )
-
-
-def _default_packet_trace_path(path: Path) -> Path:
-    if path.suffix == ".json":
-        try:
-            data = json.loads(path.read_text(errors="replace"))
-            trace = data.get("packet_trace")
-            if trace:
-                return Path(trace)
-            wav = data.get("wav")
-            if wav:
-                return Path(wav).with_suffix(".packets.jsonl")
-        except Exception:
-            pass
-    if path.suffix == ".jsonl":
-        return path
-    return path.with_suffix(".packets.jsonl")
-
-
-def _default_wav_path(path: Path) -> Path:
-    if path.suffix == ".json":
-        try:
-            data = json.loads(path.read_text(errors="replace"))
-            wav = data.get("wav")
-            if wav:
-                return Path(wav)
-        except Exception:
-            pass
-    if path.suffix == ".jsonl" and path.name.endswith(".packets.jsonl"):
-        return Path(str(path)[:-len(".packets.jsonl")] + ".wav")
-    return path
-
-
-def _iter_packet_trace(path: Path):
-    with path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            item = json.loads(line)
-            if item.get("type") == "header":
-                yield item
-                continue
-            payload_b64 = item.get("payload_b64")
-            if payload_b64:
-                item["payload"] = base64.b64decode(payload_b64)
-            yield item
-
-
-def _try_decode_with_trim(payload: bytes, channels: int):
-    for trim in range(1, min(32, len(payload)) + 1):
-        trimmed = payload[:-trim]
-        decoder = LibOpusPcmDecoder(channels=channels)
-        decoded = decoder.decode(trimmed)
-        decoder.close()
-        if decoded is not None:
-            return decoded, f"tail:{trim}"
-    for trim in range(1, min(16, len(payload)) + 1):
-        trimmed = payload[trim:]
-        decoder = LibOpusPcmDecoder(channels=channels)
-        decoded = decoder.decode(trimmed)
-        decoder.close()
-        if decoded is not None:
-            return decoded, f"head:{trim}"
-    return None, None
-
-
-def _decode_packet_trace_to_wav(trace_path: Path, out_path: Path, *, channels: int = 1, salvage: bool = False, drop_dave_encrypted: bool = False) -> dict:
-    decoder = LibOpusPcmDecoder(channels=channels)
-    pcm_parts = []
-    packet_count = 0
-    missing = 0
-    errors = 0
-    salvaged = 0
-    dropped_dave_encrypted = 0
-    first_errors = []
-    try:
-        for item in _iter_packet_trace(trace_path):
-            if item.get("type") == "header":
-                continue
-            packet_count += 1
-            payload = item.get("payload")
-            if item.get("missing") or item.get("dave_drop") or payload is None:
-                missing += 1
-                decoded = decoder.decode_missing()
-            elif drop_dave_encrypted and is_dave_encrypted_payload(payload):
-                dropped_dave_encrypted += 1
-                decoded = decoder.decode_missing()
-            else:
-                decoded = decoder.decode(payload)
-                if decoded is None and salvage:
-                    decoded, how = _try_decode_with_trim(payload, channels)
-                    if decoded is not None:
-                        salvaged += 1
-                        if len(first_errors) < 5:
-                            first_errors.append({"sequence": item.get("sequence"), "salvage": how, "probe": probe_libopus_payload(payload)})
-                if decoded is None:
-                    errors += 1
-                    if len(first_errors) < 5:
-                        first_errors.append({"sequence": item.get("sequence"), "probe": probe_libopus_payload(payload)})
-                    decoded = decoder.decode_missing()
-            if decoded is None:
-                continue
-            pcm, sample_rate, out_channels = decoded
-            pcm_parts.append(pcm)
-        pcm = b"".join(pcm_parts)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(out_path), "wb") as wf:
-            wf.setnchannels(channels)
-            wf.setsampwidth(2)
-            wf.setframerate(OPUS_SAMPLE_RATE)
-            wf.writeframes(pcm)
-        metrics = _read_wav_metrics(out_path)
-        return {
-            "path": str(out_path),
-            "packets": packet_count,
-            "missing": missing,
-            "decode_errors": errors,
-            "salvaged": salvaged,
-            "dropped_dave_encrypted": dropped_dave_encrypted,
-            "first_errors": first_errors,
-            "metrics": metrics,
-        }
-    finally:
-        decoder.close()
-
-
-def diagnose_saved_voice_segment(path: str | os.PathLike, *, write_variants: bool = True) -> str:
-    input_path = Path(path).expanduser()
-    wav_path = _default_wav_path(input_path)
-    trace_path = _default_packet_trace_path(input_path)
-    lines = [f"segment: {wav_path}"]
-    metrics = _read_wav_metrics(wav_path)
-    lines.append(f"wav: {_format_wav_metrics(metrics)}")
-    sidecar = wav_path.with_suffix(".json")
-    if sidecar.exists():
-        try:
-            data = json.loads(sidecar.read_text(errors="replace"))
-            transcript = str(data.get("transcript") or "").replace("\n", " ")
-            if transcript:
-                lines.append(f"transcript: {transcript}")
-        except Exception:
-            pass
-    if not trace_path.exists():
-        lines.append(f"packet trace: missing ({trace_path})")
-        return "\n".join(lines)
-    try:
-        header = None
-        packet_rows = []
-        for item in _iter_packet_trace(trace_path):
-            if item.get("type") == "header":
-                header = item
-            else:
-                packet_rows.append(item)
-        dave_drops = sum(1 for item in packet_rows if item.get("dave_drop"))
-        missing_packets = sum(1 for item in packet_rows if item.get("missing"))
-        invalid_parser = sum(1 for item in packet_rows if not item.get("dave_drop") and not item.get("missing") and int(item.get("opus_frames") or -1) <= 0)
-        sample_counts = {}
-        lengths = {}
-        for item in packet_rows:
-            sample_counts[item.get("opus_samples", item.get("pre_dave_opus_samples"))] = sample_counts.get(item.get("opus_samples", item.get("pre_dave_opus_samples")), 0) + 1
-            lengths[item.get("payload_len", item.get("pre_dave_payload_len"))] = lengths.get(item.get("payload_len", item.get("pre_dave_payload_len")), 0) + 1
-        top_samples = ", ".join(f"{k}:{v}" for k, v in sorted(sample_counts.items(), key=lambda kv: (-kv[1], str(kv[0])))[:5])
-        top_lengths = ", ".join(f"{k}:{v}" for k, v in sorted(lengths.items(), key=lambda kv: (-kv[1], str(kv[0])))[:5])
-        lines.append(f"packet trace: {trace_path}")
-        lines.append(f"packets={len(packet_rows)} dropped={(header or {}).get('dropped', 0)} missing={missing_packets} dave_drop={dave_drops} parser_invalid={invalid_parser} opus_samples={top_samples} payload_lens={top_lengths}")
-    except Exception as exc:
-        lines.append(f"packet trace read failed: {exc}")
-        return "\n".join(lines)
-    if write_variants:
-        stem = wav_path.with_suffix("")
-        variants = [
-            (1, False, False, ".diag-libopus-1ch.wav"),
-            (2, False, False, ".diag-libopus-2ch.wav"),
-            (1, True, False, ".diag-libopus-1ch-salvage.wav"),
-            (2, True, False, ".diag-libopus-2ch-salvage.wav"),
-            (1, False, True, ".diag-drop-dave-padded.wav"),
-        ]
-        for channels, salvage, drop_dave, suffix in variants:
-            result = _decode_packet_trace_to_wav(trace_path, Path(str(stem) + suffix), channels=channels, salvage=salvage, drop_dave_encrypted=drop_dave)
-            lines.append(
-                f"variant: {result['path']} packets={result['packets']} missing={result['missing']} "
-                f"errors={result['decode_errors']} salvaged={result['salvaged']} dave_dropped={result['dropped_dave_encrypted']} {_format_wav_metrics(result['metrics'])}"
-            )
-            for err in result.get("first_errors") or []:
-                lines.append(f"  decode_issue seq={err.get('sequence')} {err.get('salvage', 'reject')} {err.get('probe')}")
-    return "\n".join(lines)
-
-
-
-class VoiceReceiveTranscription:
+class VoiceReceiveMedia:
     @staticmethod
     def advertised_dave_protocol_version_static():
         return int(dave.get_max_supported_protocol_version()) if dave is not None else 0
 
-    def __init__(self, *, udp=None, mode: str | None = None, secret_key=None, self_user_id: str, channel_id: str, label: str, send_json, send_binary, notify, name_for_user, log=print, keep_audio: bool | None = None, audio_dir: str | os.PathLike | None = None, pcm_sink=None):
+    def __init__(self, *, udp=None, mode: str | None = None, secret_key=None, self_user_id: str, channel_id: str, send_json, send_binary, name_for_user, pcm_sink, log=print):
         self.udp = udp
         self.mode = mode
         self.secret_key = bytes(secret_key or b"")
         self.self_user_id = str(self_user_id)
         self.channel_id = str(channel_id)
-        self.label = label
         self.send_json = send_json
         self.send_binary = send_binary
-        self.notify = notify
         self.name_for_user = name_for_user
         self.log = log
         self.pcm_sink = pcm_sink
@@ -1462,15 +745,11 @@ class VoiceReceiveTranscription:
         self.ssrc_to_user_id = {}
         self.fallback_user_ids = set()
         self.unknown_ssrc_buffers = {}
-        self.unknown_ssrc_buffer_limit = env_int("DISCORD_CALL_TRANSCRIBE_UNKNOWN_SSRC_BUFFER_PACKETS", DEFAULT_UNKNOWN_SSRC_BUFFER_PACKETS)
-        self.segmenters = {}
+        self.unknown_ssrc_buffer_limit = env_int("DISCORD_CALL_MEDIA_UNKNOWN_SSRC_BUFFER_PACKETS", DEFAULT_UNKNOWN_SSRC_BUFFER_PACKETS)
         self.decoders = {}
         self.resamplers = {}
         self.pre_dave_jitter_buffers = {}
         self.jitter_buffers = {}
-        self.user_speaking_state = {}
-        self.user_speaking_last_at = {}
-        self.remote_speaking_idle_seconds = env_int("DISCORD_CALL_REMOTE_SPEAKING_IDLE_MS", DEFAULT_REMOTE_SPEAKING_IDLE_MS) / 1000.0
         self.jitter_missing_count = 0
         self.packet_count = 0
         self.unknown_ssrc_count = 0
@@ -1492,13 +771,6 @@ class VoiceReceiveTranscription:
         self.last_decode_error_log_at = 0.0
         self.last_invalid_opus_log_at = 0.0
         self.last_stats_at = time.time()
-        self.transcriber = PcmOnlyTranscriber() if pcm_sink is not None else VoiceTranscriber(
-            label=label,
-            notify=notify,
-            log=log,
-            keep_audio=keep_audio,
-            audio_dir=audio_dir,
-        )
         self.dave = DavePassthroughDecryptor(
             user_id=self.self_user_id,
             channel_id=self.channel_id,
@@ -1520,63 +792,34 @@ class VoiceReceiveTranscription:
         if self.running:
             return
         if not self.udp or not self.mode or not self.secret_key:
-            self.log("Voice transcription waiting for Discord media session")
+            self.log("Discord media receiver waiting for a voice session")
             return
         if not has_opus_decoder() and av is None:
-            self.log("Voice transcription disabled: neither libopus nor PyAV is available")
+            self.log("Discord media receiver disabled: neither libopus nor PyAV is available")
             return
         if nacl is None:
-            self.log("Voice transcription disabled: PyNaCl is not installed")
-            return
-        if self.pcm_sink is None and not shutil.which("exo"):
-            self.log("Voice transcription disabled: exo CLI is not in PATH")
+            self.log("Discord media receiver disabled: PyNaCl is not installed")
             return
         self.running = True
         self.thread = threading.Thread(target=self._recv_loop, name="discord-voice-receive", daemon=True)
         self.thread.start()
-        self.log("Discord Bidi media receiver started" if self.pcm_sink is not None else "Voice transcription receiver started")
+        self.log("Discord media receiver started")
 
     def stop(self):
         self.running = False
         if self.thread:
             self.thread.join(timeout=1)
             self.thread = None
-        for segmenter in list(self.segmenters.values()):
-            segmenter.finalize()
-        self.transcriber.stop()
-
-    def set_enabled(self, enabled: bool):
-        self.transcriber.set_enabled(enabled)
-        if not enabled:
-            for segmenter in list(self.segmenters.values()):
-                segmenter.finalize()
-
     def set_active_remote_users(self, user_ids):
         self.fallback_user_ids = {str(user_id) for user_id in (user_ids or []) if user_id is not None and str(user_id) != self.self_user_id}
-        for user_id in list(self.user_speaking_state.keys()):
-            if user_id not in self.fallback_user_ids:
-                self.user_speaking_state.pop(user_id, None)
-                self.user_speaking_last_at.pop(user_id, None)
-                segmenter = self.segmenters.get(user_id)
-                if segmenter:
-                    segmenter.set_external_speaking(False)
         self.dave.add_known_users(self.fallback_user_ids)
 
     def set_user_speaking(self, user_id, speaking):
         if user_id is None or str(user_id) == self.self_user_id:
             return
         user_id = str(user_id)
-        speaking = bool(speaking)
-        self.user_speaking_state[user_id] = speaking
-        if speaking:
-            self.user_speaking_last_at[user_id] = time.time()
-        else:
-            self.user_speaking_last_at.pop(user_id, None)
         self.fallback_user_ids.add(user_id)
         self.dave.add_known_users([user_id])
-        segmenter = self.segmenters.get(user_id)
-        if segmenter:
-            segmenter.set_external_speaking(speaking)
 
     def set_self_ssrc(self, ssrc):
         self.dave.set_self_ssrc(ssrc)
@@ -1595,7 +838,7 @@ class VoiceReceiveTranscription:
         previous = self.ssrc_to_user_id.get(ssrc)
         stale_user_ssrcs = [mapped_ssrc for mapped_ssrc, mapped_user in self.ssrc_to_user_id.items() if mapped_user == user_id and mapped_ssrc != ssrc]
         if stale_user_ssrcs:
-            self._reset_user_media_state(user_id, finalize_segment=True)
+            self._reset_user_media_state(user_id)
             for mapped_ssrc in stale_user_ssrcs:
                 self.ssrc_to_user_id.pop(mapped_ssrc, None)
                 self.dave.ssrc_to_user_id.pop(mapped_ssrc, None)
@@ -1604,29 +847,21 @@ class VoiceReceiveTranscription:
         self.fallback_user_ids.add(user_id)
         self.dave.add_ssrc_mapping(ssrc, user_id)
         if previous != user_id:
-            self.log(f"Voice transcription mapped SSRC {ssrc} to {self.name_for_user(user_id)}")
+            self.log(f"Discord media mapped SSRC {ssrc} to {self.name_for_user(user_id)}")
         if previous != user_id:
             self._drain_unknown_ssrc_buffer(ssrc, user_id)
 
     def remove_user(self, user_id):
         user_id = str(user_id)
         self.fallback_user_ids.discard(user_id)
-        self.user_speaking_state.pop(user_id, None)
-        self.user_speaking_last_at.pop(user_id, None)
         self.dave.remove_known_user(user_id)
         for ssrc, mapped_user in list(self.ssrc_to_user_id.items()):
             if mapped_user == user_id:
                 del self.ssrc_to_user_id[ssrc]
-        self._reset_user_media_state(user_id, finalize_segment=True)
+        self._reset_user_media_state(user_id)
 
-    def _reset_user_media_state(self, user_id, *, finalize_segment=False):
+    def _reset_user_media_state(self, user_id):
         user_id = str(user_id)
-        segmenter = self.segmenters.pop(user_id, None)
-        if segmenter:
-            if finalize_segment:
-                segmenter.finalize()
-            else:
-                segmenter.finish_or_discard()
         decoder = self.decoders.pop(user_id, None)
         if hasattr(decoder, "close"):
             try:
@@ -1670,21 +905,18 @@ class VoiceReceiveTranscription:
                 for item in jitter.flush():
                     if item is None:
                         self.jitter_missing_count += 1
-                        self._decode_and_segment(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter"})
+                        self._decode_and_emit(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter"})
                     else:
                         opus_payload, traced_packet = item
                         if opus_payload is None:
                             self.jitter_missing_count += 1
-                        self._decode_and_segment(user_id, opus_payload, packet_info=traced_packet)
-        for segmenter in list(self.segmenters.values()):
-            segmenter.flush_if_stale()
-        self._expire_remote_speaking_state()
+                        self._decode_and_emit(user_id, opus_payload, packet_info=traced_packet)
         now = time.time()
         if now - self.last_stats_at >= 10:
             self.last_stats_at = now
             if self.packet_count or self.decrypt_count or self.decode_frame_count or self.ssrc_to_user_id:
                 self.log(
-                    f"Voice transcription stats: packets={self.packet_count} unknown_ssrc={self.unknown_ssrc_count} "
+                    f"Discord media stats: packets={self.packet_count} unknown_ssrc={self.unknown_ssrc_count} "
                     f"unknown_buffered={self.unknown_ssrc_buffered_count}/{self.unknown_ssrc_replayed_count}/{self.unknown_ssrc_dropped_count} "
                     f"self={self.self_packet_count} transport_fail={self.transport_decrypt_fail_count} "
                     f"ext={self.extension_packet_count}/{self.extension_bytes_total}B decrypted={self.decrypt_count} "
@@ -1697,26 +929,8 @@ class VoiceReceiveTranscription:
                     f"frames={self.decode_frame_count} decode_errors={self.decode_error_count} "
                     f"jitter_missing={self.jitter_missing_count} "
                     f"jitter_resync={self._pre_dave_jitter_resync_count()}/{self._post_dave_jitter_resync_count()} "
-                    f"speakers={len(self.segmenters)} active_segments={sum(1 for segmenter in self.segmenters.values() if segmenter.active)} "
-                    f"remote_speaking={sum(1 for value in self.user_speaking_state.values() if value)} "
                     f"ssrcs={len(self.ssrc_to_user_id)}"
                 )
-
-    def _expire_remote_speaking_state(self):
-        now = time.time()
-        for user_id, speaking in list(self.user_speaking_state.items()):
-            if not speaking:
-                continue
-            segmenter = self.segmenters.get(user_id)
-            if segmenter and segmenter.active:
-                self.user_speaking_last_at[user_id] = now
-                continue
-            last_at = self.user_speaking_last_at.get(user_id, now)
-            if now - last_at >= self.remote_speaking_idle_seconds:
-                self.user_speaking_state[user_id] = False
-                self.user_speaking_last_at.pop(user_id, None)
-                if segmenter:
-                    segmenter.set_external_speaking(False)
 
     def _pre_dave_jitter_resync_count(self) -> int:
         return sum(getattr(jitter, "resync_count", 0) for jitter in self.pre_dave_jitter_buffers.values())
@@ -1733,7 +947,7 @@ class VoiceReceiveTranscription:
         if not user_id and len(self.fallback_user_ids) == 1:
             user_id = next(iter(self.fallback_user_ids))
             self.add_ssrc_mapping(parsed["ssrc"], user_id)
-            self.log(f"Voice transcription inferred SSRC {parsed['ssrc']} for {self.name_for_user(user_id)}")
+            self.log(f"Discord media inferred SSRC {parsed['ssrc']} for {self.name_for_user(user_id)}")
         if not user_id:
             self.unknown_ssrc_count += 1
             self._buffer_unknown_ssrc_packet(parsed, packet)
@@ -1760,7 +974,7 @@ class VoiceReceiveTranscription:
             return
         count = len(buffer)
         self.unknown_ssrc_replayed_count += count
-        self.log(f"Voice transcription replaying {count} buffered packet(s) for {self.name_for_user(user_id)} after SSRC {ssrc} mapping")
+        self.log(f"Discord media replaying {count} buffered packet(s) for {self.name_for_user(user_id)} after SSRC {ssrc} mapping")
         for parsed, packet in buffer:
             self._handle_mapped_packet(parsed, packet, user_id)
 
@@ -1784,8 +998,8 @@ class VoiceReceiveTranscription:
         jitter = self.pre_dave_jitter_buffers.get(user_id)
         if jitter is None:
             jitter = RtpJitterBuffer(
-                max_packets=env_int("DISCORD_CALL_TRANSCRIBE_PRE_DAVE_JITTER_PACKETS", DEFAULT_JITTER_PACKETS),
-                max_resync_gap=env_int("DISCORD_CALL_TRANSCRIBE_JITTER_RESYNC_GAP", DEFAULT_JITTER_RESYNC_GAP),
+                max_packets=env_int("DISCORD_CALL_MEDIA_PRE_DAVE_JITTER_PACKETS", DEFAULT_JITTER_PACKETS),
+                max_resync_gap=env_int("DISCORD_CALL_MEDIA_JITTER_RESYNC_GAP", DEFAULT_JITTER_RESYNC_GAP),
             )
             self.pre_dave_jitter_buffers[user_id] = jitter
         for item in jitter.add(parsed["sequence"], (dict(parsed), payload)):
@@ -1794,7 +1008,7 @@ class VoiceReceiveTranscription:
     def _handle_ordered_pre_dave_item(self, user_id: str, item):
         if item is None:
             self.jitter_missing_count += 1
-            self._decode_and_segment(user_id, None, packet_info={"missing": True, "stage": "pre_dave_jitter"})
+            self._decode_and_emit(user_id, None, packet_info={"missing": True, "stage": "pre_dave_jitter"})
             return
         parsed, payload = item
         pre_dave_payload = payload
@@ -1806,8 +1020,8 @@ class VoiceReceiveTranscription:
         jitter = self.jitter_buffers.get(user_id)
         if jitter is None:
             jitter = RtpJitterBuffer(
-                max_packets=env_int("DISCORD_CALL_TRANSCRIBE_JITTER_PACKETS", DEFAULT_JITTER_PACKETS),
-                max_resync_gap=env_int("DISCORD_CALL_TRANSCRIBE_JITTER_RESYNC_GAP", DEFAULT_JITTER_RESYNC_GAP),
+                max_packets=env_int("DISCORD_CALL_MEDIA_JITTER_PACKETS", DEFAULT_JITTER_PACKETS),
+                max_resync_gap=env_int("DISCORD_CALL_MEDIA_JITTER_RESYNC_GAP", DEFAULT_JITTER_RESYNC_GAP),
             )
             self.jitter_buffers[user_id] = jitter
         if not payload:
@@ -1827,12 +1041,12 @@ class VoiceReceiveTranscription:
             for item in jitter.add(parsed["sequence"], (None, packet_info)):
                 if item is None:
                     self.jitter_missing_count += 1
-                    self._decode_and_segment(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter"})
+                    self._decode_and_emit(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter"})
                 else:
                     opus_payload, traced_packet = item
                     if opus_payload is None:
                         self.jitter_missing_count += 1
-                    self._decode_and_segment(user_id, opus_payload, packet_info=traced_packet)
+                    self._decode_and_emit(user_id, opus_payload, packet_info=traced_packet)
             return
         if opus_packet_is_valid(payload):
             self.post_dave_opus_valid_count += 1
@@ -1852,14 +1066,14 @@ class VoiceReceiveTranscription:
         for item in jitter.add(parsed["sequence"], (payload, packet_info)):
             if item is None:
                 self.jitter_missing_count += 1
-                self._decode_and_segment(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter"})
+                self._decode_and_emit(user_id, None, packet_info={"missing": True, "stage": "post_dave_jitter"})
             else:
                 opus_payload, traced_packet = item
                 if opus_payload is None:
                     self.jitter_missing_count += 1
-                self._decode_and_segment(user_id, opus_payload, packet_info=traced_packet)
+                self._decode_and_emit(user_id, opus_payload, packet_info=traced_packet)
 
-    def _decode_and_segment(self, user_id: str, opus_payload: bytes | None, *, packet_info: dict | None = None):
+    def _decode_and_emit(self, user_id: str, opus_payload: bytes | None, *, packet_info: dict | None = None):
         decoder = self.decoders.get(user_id)
         if decoder is None:
             decoder = self._create_decoder()
@@ -1872,7 +1086,7 @@ class VoiceReceiveTranscription:
             if decoded is None:
                 return
             self.decode_frame_count += 1
-            self._segment_pcm(user_id, *decoded, packet_info=packet_info)
+            self._emit_pcm(user_id, *decoded, packet_info=packet_info)
             return
 
         if opus_payload is None:
@@ -1884,8 +1098,8 @@ class VoiceReceiveTranscription:
             return
         for frame in frames:
             self.decode_frame_count += 1
-            for pcm, sample_rate, channels in self._frame_to_pcm16_mono_16k(user_id, frame):
-                self._segment_pcm(user_id, pcm, sample_rate, channels, packet_info=packet_info)
+            for pcm, sample_rate, channels in self._frame_to_pcm16_mono_48k(user_id, frame):
+                self._emit_pcm(user_id, pcm, sample_rate, channels, packet_info=packet_info)
 
     def _log_invalid_opus(self, user_id: str, parsed: dict, payload: bytes):
         now = time.time()
@@ -1915,25 +1129,14 @@ class VoiceReceiveTranscription:
             self.last_decode_error_log_at = now
             self.log(f"Opus decode failed for {self.name_for_user(user_id)} ({self.decode_error_count} total): {error}")
 
-    def _segment_pcm(self, user_id: str, pcm: bytes, sample_rate: int, channels: int, *, packet_info: dict | None = None):
-        if not pcm:
-            return
-        if self.pcm_sink is not None:
+    def _emit_pcm(self, user_id: str, pcm: bytes, sample_rate: int, channels: int, *, packet_info: dict | None = None):
+        if pcm:
             self.pcm_sink(user_id, pcm, sample_rate, channels)
-        if not self.transcriber.enabled:
-            return
-        duration = len(pcm) / (sample_rate * channels * 2)
-        segmenter = self.segmenters.get(user_id)
-        if segmenter is None:
-            segmenter = SpeakerSegmenter(user_id, self.name_for_user, self.transcriber.submit, sample_rate=sample_rate, channels=channels)
-            segmenter.set_external_speaking(self.user_speaking_state.get(str(user_id), False))
-            self.segmenters[user_id] = segmenter
-        segmenter.add_pcm(pcm, duration, packet_info=packet_info)
 
-    def _frame_to_pcm16_mono_16k(self, user_id: str, frame):
+    def _frame_to_pcm16_mono_48k(self, user_id: str, frame):
         resampler = self.resamplers.get(user_id)
         if resampler is None:
-            resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=16000)
+            resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=48000)
             self.resamplers[user_id] = resampler
         try:
             frames = resampler.resample(frame)
@@ -1942,7 +1145,7 @@ class VoiceReceiveTranscription:
             frames = [frame]
         result = []
         for out in frames:
-            sample_rate = int(getattr(out, "sample_rate", None) or getattr(out, "rate", None) or 16000)
+            sample_rate = int(getattr(out, "sample_rate", None) or getattr(out, "rate", None) or 48000)
             channels = 1
             valid_bytes = int(out.samples or 0) * channels * 2
             plane = bytes(out.planes[0])

@@ -14,7 +14,6 @@ _ACCOUNT_DIR = selected_alias(required=False) or "legacy"
 CALL_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "discord-cli" / "accounts" / _ACCOUNT_DIR / "calls"
 CALL_LOG_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "discord-cli" / "accounts" / _ACCOUNT_DIR / "calls"
 CALL_META_ENV = "DISCORD_CALL_META_PATH"
-CALL_NOTIFY_TARGETS_ENV = "DISCORD_CALL_NOTIFY_TARGETS"
 
 
 def pid_alive(pid):
@@ -41,7 +40,6 @@ def call_paths(channel_id):
     return {
         "meta": CALL_STATE_DIR / f"{safe}.json",
         "log": CALL_LOG_DIR / f"{safe}.log",
-        "segments": CALL_LOG_DIR / f"{safe}.segments",
     }
 
 

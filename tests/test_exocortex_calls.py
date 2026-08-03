@@ -75,10 +75,11 @@ class ExocortexCallClientTests(unittest.TestCase):
                 client.connect()
                 conv_id = client.create_conversation("Discord call · #voice")
                 adapter = {
-                    "type": "discord",
-                    "id": "paramount:123",
+                    "type": "external",
+                    "id": "discord:paramount:123",
+                    "toolName": "discord",
                     "accountAlias": "paramount",
-                    "channelId": "123",
+                    "endpointId": "123",
                     "label": "#voice",
                 }
                 call_id, state = client.start_call(conv_id, adapter, voice="cove")
@@ -97,6 +98,7 @@ class ExocortexCallClientTests(unittest.TestCase):
                 [item["type"] for item in seen],
                 ["new_conversation", "subscribe", "start_call", "attach_call_media", "stop_call"],
             )
+            self.assertEqual(seen[2]["adapter"]["toolName"], "discord")
             self.assertEqual(seen[2]["adapter"]["accountAlias"], "paramount")
             self.assertEqual(seen[4]["callId"], "call-discord")
 

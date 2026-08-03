@@ -20,11 +20,11 @@ import websocket
 from src import api
 from src.accounts import selected_account
 from src.auth import get_token
-from src.calls.receive import VoiceReceiveTranscription
-from src.calls.send import send_audio_file, send_outgoing_opus_payload
-from src.calls.bidi import DiscordBidiBridge
+from src.calls.receive import VoiceReceiveMedia
+from src.calls.send import send_outgoing_opus_payload
+from src.calls.adapter import DiscordCallAdapter
 from src.calls.exocortex import ExocortexCallClient
-from src.calls.state import CALL_META_ENV, CALL_NOTIFY_TARGETS_ENV, update_call_meta_env as _update_call_meta_env, write_call_meta as _write_call_meta
+from src.calls.state import CALL_META_ENV, update_call_meta_env as _update_call_meta_env, write_call_meta as _write_call_meta
 from src.calls.transport import OPUS_PAYLOAD_TYPE, select_encryption_mode, udp_discovery
 
 GATEWAY_HOST = "discord.com"
@@ -100,24 +100,13 @@ def _gateway_url():
     return data["url"]
 
 
-def _timing_delta_ms(start, end=None):
-    try:
-        start = float(start)
-        end = time.time() if end is None else float(end)
-    except (TypeError, ValueError):
-        return "n/a"
-    if start <= 0 or end <= 0:
-        return "n/a"
-    return f"{max(0, int(round((end - start) * 1000)))}ms"
-
-
 def _record_style_display_name(user):
     """Return the same user-facing display name scheme Record uses.
 
     Record intentionally ignores guild/server nicknames and formats Discord
     users as global display name when present, falling back to username.  Keep
-    call transcript/call-state notifications aligned with that behavior so a
-    guild voice speaker is identified by their Discord display name rather than
+    call participant identity aligned with that behavior so a guild voice
+    speaker is identified by their Discord display name rather than
     a per-server nickname.
     """
     if not isinstance(user, dict):
@@ -125,21 +114,16 @@ def _record_style_display_name(user):
     return user.get("global_name") or user.get("display_name") or user.get("username")
 
 
-class NoAudioCallJoiner:
-    def __init__(self, channel_id, *, guild_id=None, label=None, self_mute=True, self_deaf=False, ring_recipient_ids=None, transcribe=True, save_audio=False, audio_dir=None, notify_audio_state=False, bidi=False, exocortex_conversation=None, exocortex_socket=None, bidi_voice=None):
+class DiscordCallWorker:
+    def __init__(self, channel_id, *, guild_id=None, label=None, self_mute=False, self_deaf=False, ring_recipient_ids=None, exocortex_conversation=None, exocortex_socket=None, call_voice=None):
         self.channel_id = channel_id
         self.guild_id = guild_id
         self.label = label or channel_id
         self.self_mute = self_mute
         self.self_deaf = self_deaf
-        self.transcribe_enabled = bool(transcribe and not self_deaf)
-        self.save_audio = bool(save_audio)
-        self.audio_dir = str(audio_dir) if audio_dir else None
-        self.notify_audio_state = bool(notify_audio_state)
-        self.bidi_enabled = bool(bidi)
         self.exocortex_conversation = str(exocortex_conversation).strip() if exocortex_conversation else None
         self.exocortex_socket = str(exocortex_socket).strip() if exocortex_socket else None
-        self.bidi_voice = str(bidi_voice).strip() if bidi_voice else None
+        self.call_voice = str(call_voice).strip() if call_voice else None
         self.ring_recipient_ids = [str(user_id) for user_id in (ring_recipient_ids or []) if user_id]
         self.token = get_token()
         self.account_alias = selected_account()["alias"]
@@ -170,23 +154,18 @@ class NoAudioCallJoiner:
         self._send_sequence = random.randrange(0, 0x10000)
         self._send_timestamp = random.randrange(0, 0x100000000)
         self._send_counter = 0
-        self._say_ids_seen = set()
-        self._say_lock = threading.Lock()
         self._requested_leave = False
         self._participant_names = {}
         self._active_participant_ids = set()
-        self._participant_audio_states = {}
-        self._notified_leave_ids = set()
-        self._participants_seeded = False
         self._control_seq = 0
-        self._voice_transcription = None
+        self._voice_media = None
         self._ssrc_cache = []
         self._speaking_cache = {}
         self._pending_voice_session_description = None
-        self._bidi_client = None
-        self._bidi_bridge = None
-        self._bidi_call_id = None
-        self._bidi_monitor_thread = None
+        self._call_client = None
+        self._call_adapter = None
+        self._call_id = None
+        self._call_monitor_thread = None
         self._voice_send_lock = threading.Lock()
 
     def run(self):
@@ -198,9 +177,8 @@ class NoAudioCallJoiner:
             self._connect_app_gateway()
             self._request_voice_state(self.channel_id)
             print(
-                f"Joining {self.label} {'muted' if self.self_mute else 'unmuted'}/{'deafened' if self.self_deaf else 'undeafened'} "
-                f"({'transcribing' if self.transcribe_enabled else 'not transcribing'}"
-                f"{', saving audio' if self.save_audio else ''})…",
+                f"Joining {self.label} {'muted' if self.self_mute else 'unmuted'}/"
+                f"{'deafened' if self.self_deaf else 'undeafened'}…",
                 flush=True,
             )
 
@@ -220,8 +198,7 @@ class NoAudioCallJoiner:
             print(f"Joined {self.label}. Press Ctrl+C to leave.", flush=True)
             if self.ring_recipient_ids:
                 self._ring_recipients()
-            if self.bidi_enabled:
-                self._start_bidi()
+            self._start_exocortex_call()
 
             while self.running:
                 self._pump_app_gateway_once()
@@ -231,7 +208,7 @@ class NoAudioCallJoiner:
                     self._pump_voice_gateway_once()
         finally:
             self.running = False
-            self._stop_bidi()
+            self._stop_exocortex_call()
             self._leave_voice()
             self._close()
             signal.signal(signal.SIGINT, old_int)
@@ -267,45 +244,11 @@ class NoAudioCallJoiner:
             next_deaf = bool(meta.get("self_deaf"))
             if self.self_deaf != next_deaf:
                 self.self_deaf = next_deaf
-                self.transcribe_enabled = not self.self_deaf and bool(meta.get("transcribe", True))
-                self._set_transcription_enabled(self.transcribe_enabled)
                 changed = True
-        if "transcribe" in meta:
-            next_transcribe = bool(meta.get("transcribe")) and not self.self_deaf
-            if self.transcribe_enabled != next_transcribe:
-                self.transcribe_enabled = next_transcribe
-                self._set_transcription_enabled(self.transcribe_enabled)
-        self._poll_say_queue(meta)
         if changed:
             self._request_voice_state(self.channel_id)
             _update_call_meta_env(status="joined" if self.voice_ready else "joining", updated_at=time.time())
             print(f"Voice state: {'muted' if self.self_mute else 'unmuted'}/{'deafened' if self.self_deaf else 'undeafened'}", flush=True)
-
-    def _poll_say_queue(self, meta):
-        queue_items = meta.get("say_queue")
-        if not isinstance(queue_items, list) or not queue_items:
-            return
-        meta_path = os.environ.get(CALL_META_ENV)
-        pending = []
-        for item in queue_items:
-            if not isinstance(item, dict):
-                continue
-            request_id = str(item.get("id") or "")
-            path = str(item.get("path") or "")
-            if not request_id or request_id in self._say_ids_seen or not path:
-                continue
-            self._say_ids_seen.add(request_id)
-            pending.append((request_id, path))
-        if meta_path:
-            try:
-                current = json.loads(Path(meta_path).read_text())
-                current["say_queue"] = []
-                current["updated_at"] = time.time()
-                _write_call_meta(Path(meta_path), current)
-            except Exception:
-                pass
-        for request_id, path in pending:
-            threading.Thread(target=self._send_audio_file, daemon=True, args=(request_id, path)).start()
 
     # ─── App gateway ──────────────────────────────────────────────────────────
 
@@ -462,14 +405,9 @@ class NoAudioCallJoiner:
             self._handle_call_voice_states(data.get("voice_states") or [])
             return
         if event_type == "CALL_DELETE" and data.get("channel_id") == self.channel_id:
-            self._participants_seeded = True
             for user_id in sorted(self._active_participant_ids):
-                if user_id not in self._notified_leave_ids:
-                    self._notified_leave_ids.add(user_id)
-                    self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} left {self.label}")
-                self._remove_transcription_user(user_id)
+                self._remove_media_user(user_id)
             self._active_participant_ids.clear()
-            self._participant_audio_states.clear()
             print("Call ended by Discord.", flush=True)
             self.running = False
 
@@ -502,36 +440,6 @@ class NoAudioCallJoiner:
             self._participant_names[user_id] = name
         return user_id
 
-    def _voice_audio_state_from_state(self, state):
-        audio = {}
-        if "self_mute" in state or "mute" in state:
-            audio["muted"] = bool(state.get("self_mute") or state.get("mute"))
-        if "self_deaf" in state or "deaf" in state:
-            audio["deafened"] = bool(state.get("self_deaf") or state.get("deaf"))
-        return audio
-
-    def _remember_participant_audio_state(self, user_id, state):
-        if not user_id or user_id == str(self.my_id):
-            return
-        audio = self._voice_audio_state_from_state(state)
-        if not audio:
-            return
-        user_id = str(user_id)
-        previous = self._participant_audio_states.get(user_id, {})
-        current = dict(previous)
-        changes = []
-        for key, value in audio.items():
-            old_value = previous.get(key)
-            current[key] = value
-            if old_value is not None and old_value != value:
-                if key == "muted":
-                    changes.append("muted" if value else "unmuted")
-                elif key == "deafened":
-                    changes.append("deafened" if value else "undeafened")
-        self._participant_audio_states[user_id] = current
-        if changes and self.notify_audio_state:
-            self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} {' and '.join(changes)} in {self.label}")
-
     def _handle_voice_state_update(self, data):
         user_id = self._remember_voice_state_name(data)
         if not user_id:
@@ -544,7 +452,6 @@ class NoAudioCallJoiner:
             return
 
         if data.get("channel_id") == self.channel_id:
-            self._remember_participant_audio_state(user_id, data)
             current = set(self._active_participant_ids)
             current.add(user_id)
             self._sync_call_participants(current)
@@ -552,11 +459,7 @@ class NoAudioCallJoiner:
 
         if user_id in self._active_participant_ids:
             self._active_participant_ids.discard(user_id)
-            self._participant_audio_states.pop(user_id, None)
-            self._remove_transcription_user(user_id)
-            if user_id not in self._notified_leave_ids:
-                self._notified_leave_ids.add(user_id)
-                self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} left {self.label}")
+            self._remove_media_user(user_id)
 
     def _handle_call_voice_states(self, states):
         current = set()
@@ -568,138 +471,72 @@ class NoAudioCallJoiner:
             user_id = self._remember_voice_state_name(state)
             if user_id and user_id != str(self.my_id):
                 current.add(user_id)
-                self._remember_participant_audio_state(user_id, state)
         if saw_voice_state:
             self._sync_call_participants(current)
 
     def _sync_call_participants(self, current):
         current = set(current)
-        if not self._participants_seeded:
-            self._participants_seeded = True
-            # For a plain `join`, the first CALL_UPDATE/VOICE_STATE_UPDATE is a
-            # baseline and should not announce existing participants. For
-            # `start`/`ring`, however, the first remote participant we observe is
-            # the callee answering our outbound call; announce it instead of
-            # swallowing it as baseline.
-            if self.ring_recipient_ids and current:
-                for user_id in sorted(current):
-                    self._notified_leave_ids.discard(user_id)
-                    self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} joined {self.label}")
-            self._active_participant_ids = current
-            self._notified_leave_ids.difference_update(current)
-            self._sync_transcription_participants()
-            return
-        joined = current - self._active_participant_ids
         removed = self._active_participant_ids - current
-        for user_id in sorted(joined):
-            self._notified_leave_ids.discard(user_id)
-            self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} joined {self.label}")
         for user_id in sorted(removed):
-            self._participant_audio_states.pop(user_id, None)
-            self._remove_transcription_user(user_id)
-            if user_id not in self._notified_leave_ids:
-                self._notified_leave_ids.add(user_id)
-                self._notify_call_event(f"☎ {self._display_name_for_user(user_id)} left {self.label}")
+            self._remove_media_user(user_id)
         self._active_participant_ids = current
-        self._notified_leave_ids.difference_update(current)
-        self._sync_transcription_participants()
+        self._sync_media_participants()
 
-    def _sync_transcription_participants(self):
-        if self._voice_transcription:
-            self._voice_transcription.set_active_remote_users(self._active_participant_ids)
+    def _sync_media_participants(self):
+        if self._voice_media:
+            self._voice_media.set_active_remote_users(self._active_participant_ids)
 
-    def _notify_call_event(self, message):
-        self._notify_exo(message, prefix=f"Discord/{self.account_alias} Call")
+    def _log_voice_media(self, message):
+        print(f"[voice-media] {message}", flush=True)
 
-    def _notify_voice_transcript(self, message, prefix="Discord Voice", timing=None):
-        if prefix.startswith("Discord"):
-            prefix = prefix.replace("Discord", f"Discord/{self.account_alias}", 1)
-        self._notify_exo(message, prefix=prefix, timing=timing)
-
-    def _notify_exo(self, message, *, prefix, timing=None):
-        targets = [target for target in os.environ.get(CALL_NOTIFY_TARGETS_ENV, "").split(",") if target]
-        if not targets:
-            return
-        print(message, flush=True)
-        for target in targets:
-            threading.Thread(target=self._send_notification, args=(target, prefix, message, timing), daemon=True).start()
-
-    def _send_notification(self, target, prefix, message, timing=None):
-        send_started_at = time.time()
-        try:
-            payload = f"[{prefix}] {message}"
-            proc = subprocess.run(
-                ["exo", "send", "-c", target, "--timeout", "600", "--no-notify"],
-                input=payload,
-                capture_output=True,
-                text=True,
-                timeout=660,
-            )
-            send_finished_at = time.time()
-            if timing and prefix.endswith(" Voice"):
-                self._log_voice_transcription(
-                    "notification timing: "
-                    f"target={target} returncode={proc.returncode} "
-                    f"speech_start_to_exo_return={_timing_delta_ms(timing.get('speech_started_at'), send_finished_at)} "
-                    f"speech_end_to_exo_return={_timing_delta_ms(timing.get('speech_ended_at'), send_finished_at)} "
-                    f"transcript_ready_to_exo_return={_timing_delta_ms(timing.get('transcript_ready_at'), send_finished_at)} "
-                    f"exo_send={_timing_delta_ms(send_started_at, send_finished_at)}"
-                )
-        except Exception as exc:
-            if timing and prefix.endswith(" Voice"):
-                self._log_voice_transcription(f"notification timing failed: target={target} error={exc}")
-
-    def _log_voice_transcription(self, message):
-        print(f"[voice-transcribe] {message}", flush=True)
-
-    def _receive_bidi_pcm(self, user_id, pcm, sample_rate, channels):
-        bridge = self._bidi_bridge
+    def _receive_call_pcm(self, user_id, pcm, sample_rate, channels):
+        bridge = self._call_adapter
         if bridge:
             bridge.push_pcm(user_id, pcm, sample_rate, channels)
 
-    def send_bidi_opus(self, opus_payload):
-        transcription = self._voice_transcription
-        if not transcription or not transcription.can_encode_outgoing():
+    def send_call_opus(self, opus_payload):
+        media = self._voice_media
+        if self.self_mute or not media or not media.can_encode_outgoing():
             return False
         with self._voice_send_lock:
-            return send_outgoing_opus_payload(self, opus_payload, transcription)
+            return send_outgoing_opus_payload(self, opus_payload, media)
 
-    def _start_bidi(self):
+    def _start_exocortex_call(self):
         client = ExocortexCallClient(self.exocortex_socket)
         client.connect()
         conv_id = self.exocortex_conversation or client.create_conversation(f"Discord call · {self.label}")
         adapter = {
-            "type": "discord",
-            "id": f"{self.account_alias}:{self.channel_id}",
+            "type": "external",
+            "id": f"discord:{self.account_alias}:{self.channel_id}",
+            "toolName": "discord",
             "accountAlias": self.account_alias,
-            "channelId": str(self.channel_id),
+            "endpointId": str(self.channel_id),
             "label": self.label,
         }
-        call_id, _state = client.start_call(conv_id, adapter, voice=self.bidi_voice)
-        bridge = DiscordBidiBridge(self, client, conv_id, call_id, log=self._log_voice_transcription)
-        self._bidi_client = client
-        self._bidi_bridge = bridge
-        self._bidi_call_id = call_id
+        call_id, _state = client.start_call(conv_id, adapter, voice=self.call_voice)
+        bridge = DiscordCallAdapter(self, client, conv_id, call_id, log=self._log_voice_media)
+        self._call_client = client
+        self._call_adapter = bridge
+        self._call_id = call_id
         self.exocortex_conversation = conv_id
         bridge.start()
         self.update_call_meta(
-            bidi=True,
             exocortex_conversation=conv_id,
             exocortex_call_id=call_id,
             updated_at=time.time(),
         )
-        self._bidi_monitor_thread = threading.Thread(
-            target=self._monitor_bidi,
-            name="discord-bidi-control",
+        self._call_monitor_thread = threading.Thread(
+            target=self._monitor_exocortex_call,
+            name="discord-call-control",
             daemon=True,
         )
-        self._bidi_monitor_thread.start()
-        print(f"Discord Bidi attached to Exocortex conversation {conv_id} (call {call_id}).", flush=True)
+        self._call_monitor_thread.start()
+        print(f"Discord media attached to Exocortex conversation {conv_id} (call {call_id}).", flush=True)
 
-    def _monitor_bidi(self):
-        client = self._bidi_client
-        call_id = self._bidi_call_id
-        while self.running and client is self._bidi_client:
+    def _monitor_exocortex_call(self):
+        client = self._call_client
+        call_id = self._call_id
+        while self.running and client is self._call_client:
             try:
                 event = client.receive(timeout=1)
             except TimeoutError:
@@ -713,12 +550,12 @@ class NoAudioCallJoiner:
                     self.running = False
                     return
 
-    def _stop_bidi(self):
-        bridge, self._bidi_bridge = self._bidi_bridge, None
+    def _stop_exocortex_call(self):
+        bridge, self._call_adapter = self._call_adapter, None
         if bridge:
             bridge.stop()
-        client, self._bidi_client = self._bidi_client, None
-        call_id, self._bidi_call_id = self._bidi_call_id, None
+        client, self._call_client = self._call_client, None
+        call_id, self._call_id = self._call_id, None
         if client:
             if call_id and self.exocortex_conversation:
                 try:
@@ -732,13 +569,9 @@ class NoAudioCallJoiner:
                     pass
             client.close()
 
-    def _set_transcription_enabled(self, enabled):
-        if self._voice_transcription:
-            self._voice_transcription.set_enabled(enabled)
-
-    def _remove_transcription_user(self, user_id):
-        if self._voice_transcription:
-            self._voice_transcription.remove_user(user_id)
+    def _remove_media_user(self, user_id):
+        if self._voice_media:
+            self._voice_media.remove_user(user_id)
 
     def _ring_recipients(self):
         try:
@@ -804,7 +637,7 @@ class NoAudioCallJoiner:
     def _connect_voice_gateway(self):
         self.voice_ready = False
         self._voice_sequence = 0
-        self._ensure_voice_transcription_object()
+        self._ensure_voice_media_object()
         endpoint = re.sub(r"^wss?://", "", self.voice_endpoint or "")
         self.voice_ws = websocket.WebSocket()
         self.voice_ws.settimeout(1)
@@ -836,7 +669,7 @@ class NoAudioCallJoiner:
                 sequence = int.from_bytes(data[:2], "big")
                 self._voice_sequence = max(self._voice_sequence, sequence)
                 opcode = data[2]
-                if self._voice_transcription and self._voice_transcription.handle_binary_opcode(opcode, data[3:]):
+                if self._voice_media and self._voice_media.handle_binary_opcode(opcode, data[3:]):
                     return
             try:
                 data = data.decode("utf-8")
@@ -873,16 +706,16 @@ class NoAudioCallJoiner:
             data = payload.get("d") or {}
             if isinstance(data, dict):
                 user_ids = [str(user_id) for user_id in data.get("user_ids") or [] if user_id]
-                if self._voice_transcription:
-                    self._voice_transcription.dave.add_known_users(user_ids)
+                if self._voice_media:
+                    self._voice_media.dave.add_known_users(user_ids)
         elif op == 13:
             data = payload.get("d") or {}
             if isinstance(data, dict) and data.get("user_id"):
-                self._remove_transcription_user(str(data.get("user_id")))
+                self._remove_media_user(str(data.get("user_id")))
         elif op == 9:
             self._recover_voice_gateway("invalidated the session")
-        elif self._voice_transcription:
-            self._voice_transcription.handle_json_opcode(op, payload.get("d"))
+        elif self._voice_media:
+            self._voice_media.handle_json_opcode(op, payload.get("d"))
 
     def _parse_voice_gateway_close(self, data):
         code = getattr(self.voice_ws, "status", None)
@@ -922,7 +755,7 @@ class NoAudioCallJoiner:
         attempt = self._voice_reconnect_attempts
         print(f"Discord voice gateway {reason}; reconnecting (attempt {attempt})…", flush=True)
         _update_call_meta_env(status="reconnecting", updated_at=time.time())
-        self._reset_voice_gateway_state(stop_transcription=True)
+        self._reset_voice_gateway_state(stop_media=True)
         if attempt % VOICE_GATEWAY_APP_RECONNECT_EVERY == 0:
             try:
                 self._reconnect_app_gateway(f"refreshing after voice {reason}")
@@ -933,7 +766,7 @@ class NoAudioCallJoiner:
             self._request_voice_state(self.channel_id)
         time.sleep(min(VOICE_GATEWAY_RECONNECT_DELAY * attempt, VOICE_GATEWAY_RECONNECT_MAX_DELAY))
 
-    def _reset_voice_gateway_state(self, *, stop_transcription: bool):
+    def _reset_voice_gateway_state(self, *, stop_media: bool):
         self._voice_hb_gen += 1
         ws = self.voice_ws
         self.voice_ws = None
@@ -954,12 +787,12 @@ class NoAudioCallJoiner:
         self._send_sequence = random.randrange(0, 0x10000)
         self._send_timestamp = random.randrange(0, 0x100000000)
         self._send_counter = 0
-        if stop_transcription and self._voice_transcription:
+        if stop_media and self._voice_media:
             try:
-                self._voice_transcription.stop()
+                self._voice_media.stop()
             except Exception:
                 pass
-            self._voice_transcription = None
+            self._voice_media = None
         self._pending_voice_session_description = None
         self.voice_ready = False
         self.voice_token = None
@@ -990,7 +823,7 @@ class NoAudioCallJoiner:
     def _voice_identify(self):
         advertised_dave = DAVE_PROTOCOL_VERSION
         try:
-            advertised_dave = max(advertised_dave, int(VoiceReceiveTranscription.advertised_dave_protocol_version_static()))
+            advertised_dave = max(advertised_dave, int(VoiceReceiveMedia.advertised_dave_protocol_version_static()))
         except Exception:
             pass
         self._send_voice({
@@ -1018,7 +851,7 @@ class NoAudioCallJoiner:
         udp, address, discovered_port = udp_discovery(ip, int(port), int(ssrc))
         udp.settimeout(0.5)
         self.voice_udp = udp
-        self._ensure_voice_transcription()
+        self._ensure_voice_media()
         self._send_voice({
             "op": 1,
             "d": {
@@ -1034,34 +867,29 @@ class NoAudioCallJoiner:
         if not isinstance(data, dict):
             return
         self._pending_voice_session_description = data
-        self._ensure_voice_transcription()
+        self._ensure_voice_media()
 
-    def _ensure_voice_transcription_object(self):
-        if self._voice_transcription or not self.my_id:
-            return self._voice_transcription
-        self._voice_transcription = VoiceReceiveTranscription(
+    def _ensure_voice_media_object(self):
+        if self._voice_media or not self.my_id:
+            return self._voice_media
+        self._voice_media = VoiceReceiveMedia(
             self_user_id=str(self.my_id),
             channel_id=str(self.channel_id),
-            label=self.label,
             send_json=self._send_voice,
             send_binary=self._send_voice_binary,
-            notify=self._notify_voice_transcript,
             name_for_user=self._display_name_for_user,
-            log=self._log_voice_transcription,
-            keep_audio=self.save_audio,
-            audio_dir=self.audio_dir,
-            pcm_sink=self._receive_bidi_pcm if self.bidi_enabled else None,
+            log=self._log_voice_media,
+            pcm_sink=self._receive_call_pcm,
         )
-        self._voice_transcription.set_enabled(self.transcribe_enabled and not self.bidi_enabled)
-        self._sync_transcription_participants()
+        self._sync_media_participants()
         for ssrc, user_id in self._ssrc_cache:
-            self._voice_transcription.add_ssrc_mapping(ssrc, user_id)
+            self._voice_media.add_ssrc_mapping(ssrc, user_id)
         self._ssrc_cache.clear()
         for user_id, speaking in self._speaking_cache.items():
-            self._voice_transcription.set_user_speaking(user_id, speaking)
-        return self._voice_transcription
+            self._voice_media.set_user_speaking(user_id, speaking)
+        return self._voice_media
 
-    def _ensure_voice_transcription(self):
+    def _ensure_voice_media(self):
         data = self._pending_voice_session_description
         if not isinstance(data, dict) or not self.voice_udp:
             return
@@ -1071,14 +899,13 @@ class NoAudioCallJoiner:
             return
         self.voice_secret_key = bytes(secret_key)
         self.voice_mode = str(mode)
-        transcription = self._ensure_voice_transcription_object()
-        if not transcription:
+        media = self._ensure_voice_media_object()
+        if not media:
             return
-        transcription.configure_media(udp=self.voice_udp, mode=str(mode), secret_key=bytes(secret_key))
-        transcription.set_self_ssrc(self.voice_ssrc)
-        transcription.handle_session_description(data)
-        transcription.set_enabled(self.transcribe_enabled)
-        transcription.start()
+        media.configure_media(udp=self.voice_udp, mode=str(mode), secret_key=bytes(secret_key))
+        media.set_self_ssrc(self.voice_ssrc)
+        media.handle_session_description(data)
+        media.start()
 
     def _handle_voice_speaking(self, data):
         if not isinstance(data, dict):
@@ -1090,9 +917,9 @@ class NoAudioCallJoiner:
             return
         item = (int(ssrc), str(user_id))
         self._speaking_cache[str(user_id)] = speaking
-        if self._voice_transcription:
-            self._voice_transcription.set_user_speaking(str(user_id), speaking)
-            self._voice_transcription.add_ssrc_mapping(*item)
+        if self._voice_media:
+            self._voice_media.set_user_speaking(str(user_id), speaking)
+            self._voice_media.add_ssrc_mapping(*item)
         else:
             self._ssrc_cache.append(item)
 
@@ -1115,17 +942,6 @@ class NoAudioCallJoiner:
         except Exception:
             pass
 
-    # ─── Outgoing one-shot audio ────────────────────────────────────────────────
-
-    def _send_audio_file(self, request_id, path):
-        with self._say_lock:
-            path = str(path)
-            try:
-                send_audio_file(self, path)
-                print(f"Finished call audio send: {path}", flush=True)
-            except Exception as exc:
-                print(f"Failed to send call audio {path}: {exc}", flush=True)
-
     def update_call_meta(self, **updates):
         _update_call_meta_env(**updates)
 
@@ -1139,12 +955,12 @@ class NoAudioCallJoiner:
         self._send_voice({"op": 5, "d": {"speaking": 1 if speaking else 0, "delay": 0, "ssrc": int(self.voice_ssrc)}})
 
     def _close(self):
-        if self._voice_transcription:
+        if self._voice_media:
             try:
-                self._voice_transcription.stop()
+                self._voice_media.stop()
             except Exception:
                 pass
-            self._voice_transcription = None
+            self._voice_media = None
         self._pending_voice_session_description = None
         if self.voice_ws:
             try:
