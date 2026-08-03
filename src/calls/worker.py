@@ -26,6 +26,7 @@ from src.calls.adapter import DiscordCallAdapter
 from src.calls.exocortex import ExocortexCallClient
 from src.calls.state import CALL_META_ENV, update_call_meta_env as _update_call_meta_env, write_call_meta as _write_call_meta
 from src.calls.transport import OPUS_PAYLOAD_TYPE, select_encryption_mode, udp_discovery
+from src.notify import get_labels
 
 GATEWAY_HOST = "discord.com"
 ZLIB_SUFFIX = b"\x00\x00\xff\xff"
@@ -440,6 +441,35 @@ class DiscordCallWorker:
             self._participant_names[user_id] = name
         return user_id
 
+    def _call_participants(self):
+        labels = get_labels()
+        participants = []
+        for user_id in sorted(self._active_participant_ids):
+            entry = labels.get(str(user_id), {}) if isinstance(labels, dict) else {}
+            raw_label = entry.get("label", "") if isinstance(entry, dict) else entry
+            normalized_label = str(raw_label or "").strip().lower()
+            trust = normalized_label if normalized_label in {"owner", "friend"} else "untrusted"
+            participants.append({
+                "id": str(user_id),
+                "displayName": self._display_name_for_user(user_id),
+                "trust": trust,
+            })
+        return participants
+
+    def _publish_call_participants(self):
+        client = self._call_client
+        call_id = self._call_id
+        if not client or not call_id or not self.exocortex_conversation:
+            return
+        try:
+            client.update_participants(
+                self.exocortex_conversation,
+                call_id,
+                self._call_participants(),
+            )
+        except Exception as exc:
+            self._log_voice_media(f"Could not publish Discord call participants: {exc}")
+
     def _handle_voice_state_update(self, data):
         user_id = self._remember_voice_state_name(data)
         if not user_id:
@@ -458,8 +488,9 @@ class DiscordCallWorker:
             return
 
         if user_id in self._active_participant_ids:
-            self._active_participant_ids.discard(user_id)
-            self._remove_media_user(user_id)
+            current = set(self._active_participant_ids)
+            current.discard(user_id)
+            self._sync_call_participants(current)
 
     def _handle_call_voice_states(self, states):
         current = set()
@@ -481,6 +512,7 @@ class DiscordCallWorker:
             self._remove_media_user(user_id)
         self._active_participant_ids = current
         self._sync_media_participants()
+        self._publish_call_participants()
 
     def _sync_media_participants(self):
         if self._voice_media:
@@ -513,7 +545,12 @@ class DiscordCallWorker:
             "endpointId": str(self.channel_id),
             "label": self.label,
         }
-        call_id, _state = client.start_call(conv_id, adapter, voice=self.call_voice)
+        call_id, _state = client.start_call(
+            conv_id,
+            adapter,
+            voice=self.call_voice,
+            participants=self._call_participants(),
+        )
         bridge = DiscordCallAdapter(self, client, conv_id, call_id, log=self._log_voice_media)
         self._call_client = client
         self._call_adapter = bridge

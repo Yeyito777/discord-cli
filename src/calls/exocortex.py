@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import threading
 import time
 import uuid
 
@@ -34,6 +35,7 @@ class ExocortexCallClient:
         self.sock: socket.socket | None = None
         self.buffer = b""
         self.pending = deque()
+        self.send_lock = threading.Lock()
 
     def connect(self):
         if self.sock is not None:
@@ -54,7 +56,11 @@ class ExocortexCallClient:
     def send(self, message: dict):
         if self.sock is None:
             raise RuntimeError("Exocortex call client is not connected")
-        self.sock.sendall(json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n")
+        payload = json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
+        with self.send_lock:
+            if self.sock is None:
+                raise RuntimeError("Exocortex call client is not connected")
+            self.sock.sendall(payload)
 
     def receive(self, *, timeout: float | None = None) -> dict:
         if self.pending:
@@ -122,7 +128,7 @@ class ExocortexCallClient:
             raise RuntimeError("Exocortex did not return a conversation ID")
         return conv_id
 
-    def start_call(self, conv_id: str, adapter: dict, *, voice: str | None = None) -> tuple[str, str]:
+    def start_call(self, conv_id: str, adapter: dict, *, voice: str | None = None, participants=None) -> tuple[str, str]:
         self.request({"type": "subscribe", "convId": conv_id})
         req_id = f"discord-call-start-{uuid.uuid4()}"
         command = {
@@ -133,6 +139,8 @@ class ExocortexCallClient:
         }
         if voice:
             command["voice"] = voice
+        if participants:
+            command["participants"] = list(participants)
         self.send(command)
         acked = False
         call_id = None
@@ -159,6 +167,25 @@ class ExocortexCallClient:
         finally:
             self.pending.extendleft(reversed(deferred))
         return call_id, state or "starting"
+
+    def update_participants(self, conv_id: str, call_id: str, participants):
+        self.send({
+            "type": "update_call_participants",
+            "convId": conv_id,
+            "callId": call_id,
+            "participants": list(participants),
+        })
+
+    def update_speakers(self, conv_id: str, call_id: str, participant_ids, observed_at: int):
+        self.send({
+            "type": "update_call_speakers",
+            "convId": conv_id,
+            "callId": call_id,
+            "speakers": {
+                "participantIds": list(participant_ids),
+                "observedAt": int(observed_at),
+            },
+        })
 
     def attach_media(self, conv_id: str, call_id: str, offer_sdp: str) -> str:
         req_id = f"discord-call-media-{uuid.uuid4()}"

@@ -34,6 +34,35 @@ class DiscordCallAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(2100 <= value <= 2130 for value in output))
         track.stop()
 
+    def test_track_reports_only_speaker_set_boundaries_with_overlap_and_hangover(self):
+        monotonic = [10.0]
+        wall_clock = [100.0]
+        events = []
+        track = DiscordInputAudioTrack(
+            on_speakers=lambda speakers, observed_at: events.append((speakers, observed_at)),
+            monotonic=lambda: monotonic[0],
+            wall_clock=lambda: wall_clock[0],
+        )
+        speech = (array("h", [4000]) * FRAME_SAMPLES).tobytes()
+
+        track.push_pcm("speaker-a", speech, SAMPLE_RATE, 1)
+        track._mixed_frame()
+        track.push_pcm("speaker-a", speech, SAMPLE_RATE, 1)
+        track._mixed_frame()
+        track.push_pcm("speaker-b", speech, SAMPLE_RATE, 1)
+        track._mixed_frame()
+
+        monotonic[0] += 0.4
+        wall_clock[0] += 0.4
+        track._mixed_frame()
+
+        self.assertEqual(events, [
+            (("speaker-a",), 100000),
+            (("speaker-a", "speaker-b"), 100000),
+            ((), 100400),
+        ])
+        track.stop()
+
     def test_stereo_input_is_downmixed_without_changing_duration(self):
         stereo = array("h")
         for _ in range(FRAME_SAMPLES):

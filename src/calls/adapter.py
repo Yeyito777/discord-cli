@@ -28,6 +28,8 @@ FRAME_SECONDS = FRAME_SAMPLES / SAMPLE_RATE
 MAX_QUEUED_FRAMES_PER_USER = 12
 OUTPUT_SILENCE_THRESHOLD_DB = -58.0
 OUTPUT_SPEECH_HANGOVER_SECONDS = 0.3
+INPUT_SILENCE_THRESHOLD_DB = -52.0
+INPUT_SPEECH_HANGOVER_SECONDS = 0.35
 
 
 def _mono_48k(pcm: bytes, sample_rate: int, channels: int) -> bytes:
@@ -72,16 +74,30 @@ def _frame_rms_db(frame) -> float:
     return 20 * math.log10(max(mean_square ** 0.5, 1e-6))
 
 
+def _pcm_rms_db(pcm: bytes) -> float:
+    samples = array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+    if not samples:
+        return -120.0
+    mean_square = sum((sample / 32768.0) ** 2 for sample in samples) / len(samples)
+    return 20 * math.log10(max(mean_square ** 0.5, 1e-6))
+
+
 class DiscordInputAudioTrack(AudioStreamTrack):
     """Paced mono track mixing one 20 ms frame from every Discord speaker."""
 
     kind = "audio"
 
-    def __init__(self):
+    def __init__(self, *, on_speakers=None, monotonic=time.monotonic, wall_clock=time.time):
         super().__init__()
         self._lock = threading.Lock()
         self._queues = defaultdict(lambda: deque(maxlen=MAX_QUEUED_FRAMES_PER_USER))
         self._remainders = defaultdict(bytearray)
+        self._last_audible_at = {}
+        self._reported_speakers = frozenset()
+        self._on_speakers = on_speakers
+        self._monotonic = monotonic
+        self._wall_clock = wall_clock
         self._start = None
         self._timestamp = 0
 
@@ -95,12 +111,32 @@ class DiscordInputAudioTrack(AudioStreamTrack):
             remainder.extend(normalized)
             queue = self._queues[str(user_id)]
             while len(remainder) >= frame_bytes:
-                queue.append(bytes(remainder[:frame_bytes]))
+                chunk = bytes(remainder[:frame_bytes])
+                queue.append(chunk)
+                if _pcm_rms_db(chunk) >= INPUT_SILENCE_THRESHOLD_DB:
+                    self._last_audible_at[str(user_id)] = self._monotonic()
                 del remainder[:frame_bytes]
 
     def _mixed_frame(self) -> bytes:
+        changed = None
         with self._lock:
             chunks = [queue.popleft() for queue in self._queues.values() if queue]
+            now = self._monotonic()
+            active = frozenset(
+                user_id for user_id, audible_at in self._last_audible_at.items()
+                if now - audible_at <= INPUT_SPEECH_HANGOVER_SECONDS
+            )
+            for user_id in set(self._last_audible_at) - set(active):
+                self._last_audible_at.pop(user_id, None)
+            if active != self._reported_speakers:
+                self._reported_speakers = active
+                changed = tuple(sorted(active))
+        if changed is not None and self._on_speakers:
+            try:
+                self._on_speakers(changed, int(self._wall_clock() * 1000))
+            except Exception:
+                # Speaker metadata is advisory; never break the media clock.
+                pass
         if not chunks:
             return bytes(FRAME_SAMPLES * 2)
         mixed = array("h", [0]) * FRAME_SAMPLES
@@ -141,7 +177,7 @@ class DiscordCallAdapter:
         self.conv_id = str(conv_id)
         self.call_id = str(call_id)
         self.log = log
-        self.input_track = DiscordInputAudioTrack()
+        self.input_track = DiscordInputAudioTrack(on_speakers=self._publish_speakers)
         self.loop = None
         self.thread = None
         self.peer = None
@@ -163,6 +199,16 @@ class DiscordCallAdapter:
     def push_pcm(self, user_id: str, pcm: bytes, sample_rate: int, channels: int):
         if not self.stopping:
             self.input_track.push_pcm(user_id, pcm, sample_rate, channels)
+
+    def _publish_speakers(self, participant_ids, observed_at):
+        if self.stopping or self.exocortex is None:
+            return
+        self.exocortex.update_speakers(
+            self.conv_id,
+            self.call_id,
+            participant_ids,
+            observed_at,
+        )
 
     def stop(self):
         self.stopping = True

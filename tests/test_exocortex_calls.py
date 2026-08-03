@@ -49,6 +49,12 @@ class ExocortexCallClientTests(unittest.TestCase):
                     })
                     send_line(conn, {"type": "ack", "reqId": start["reqId"], "convId": "conv-discord"})
 
+                    participants = recv_line(file)
+                    seen.append(participants)
+
+                    speakers = recv_line(file)
+                    seen.append(speakers)
+
                     attach = recv_line(file)
                     seen.append(attach)
                     send_line(conn, {
@@ -82,7 +88,15 @@ class ExocortexCallClientTests(unittest.TestCase):
                     "endpointId": "123",
                     "label": "#voice",
                 }
-                call_id, state = client.start_call(conv_id, adapter, voice="cove")
+                participant_list = [{"id": "310", "displayName": "Owner", "trust": "owner"}]
+                call_id, state = client.start_call(
+                    conv_id,
+                    adapter,
+                    voice="cove",
+                    participants=participant_list,
+                )
+                client.update_participants(conv_id, call_id, participant_list)
+                client.update_speakers(conv_id, call_id, ["310"], 1234)
                 answer = client.attach_media(conv_id, call_id, "v=0\r\no=offer")
                 client.stop_call(conv_id, call_id)
             finally:
@@ -96,11 +110,21 @@ class ExocortexCallClientTests(unittest.TestCase):
             )
             self.assertEqual(
                 [item["type"] for item in seen],
-                ["new_conversation", "subscribe", "start_call", "attach_call_media", "stop_call"],
+                [
+                    "new_conversation",
+                    "subscribe",
+                    "start_call",
+                    "update_call_participants",
+                    "update_call_speakers",
+                    "attach_call_media",
+                    "stop_call",
+                ],
             )
             self.assertEqual(seen[2]["adapter"]["toolName"], "discord")
             self.assertEqual(seen[2]["adapter"]["accountAlias"], "paramount")
-            self.assertEqual(seen[4]["callId"], "call-discord")
+            self.assertEqual(seen[2]["participants"], participant_list)
+            self.assertEqual(seen[4]["speakers"]["participantIds"], ["310"])
+            self.assertEqual(seen[6]["callId"], "call-discord")
 
 
 if __name__ == "__main__":
