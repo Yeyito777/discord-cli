@@ -24,6 +24,8 @@ commands:
   pins         Get pinned messages
   threads      List active threads in a server
   thread       Create a thread                         (subcommand: create)
+  commands     List Discord application commands
+  command      Invoke a Discord application command
   members      List or search server members
   me           Show current user info
   send         Send a message
@@ -116,6 +118,8 @@ case "$cmd" in
         exec "$PYTHON" -c "import sys; from src.downloading import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     send|reply|edit|delete|del|react|unreact|thread)
         exec "$PYTHON" -c "import sys; from src.writing import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
+    commands|command)
+        exec "$PYTHON" -c "import sys; from src.application_commands import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     call|voice|join-call)
         exec "$PYTHON" -c "import sys; from src.calls.cli import dispatch; dispatch('$cmd', sys.argv[1:])" "$@" ;;
     listen|unlisten|listeners)

@@ -314,7 +314,8 @@ def _maybe_retry_with_vimbrowser_captcha(
 
 
 def _request(method, path, body=None, body_bytes=None, token=None, params=None,
-             extra_headers=None, allow_captcha_fallback=True):
+             extra_headers=None, allow_captcha_fallback=True,
+             retry_connection_failure=True):
     """Make an API request with connection pooling. Returns parsed JSON."""
     if body is not None and body_bytes is not None:
         raise ValueError("Provide either body or body_bytes, not both")
@@ -338,7 +339,19 @@ def _request(method, path, body=None, body_bytes=None, token=None, params=None,
             conn.request(method, url, data, headers)
             resp = conn.getresponse()
             raw = resp.read()
-        except (BrokenPipeError, ConnectionResetError, http.client.RemoteDisconnected, TimeoutError):
+        except (BrokenPipeError, ConnectionResetError, http.client.RemoteDisconnected, TimeoutError) as e:
+            if not retry_connection_failure:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                with _pool_lock:
+                    if entry in _pool:
+                        _pool.remove(entry)
+                raise RuntimeError(
+                    "Network failure after sending a non-idempotent Discord request; "
+                    "Discord may have accepted it. Verify before retrying."
+                ) from e
             # Server closed keepalive — reconnect
             try:
                 conn.close()
@@ -418,6 +431,17 @@ def get(path, **kwargs):
 
 def post(path, body=None, **kwargs):
     return _request("POST", path, body=body, **kwargs)
+
+
+def post_once(path, body=None, **kwargs):
+    """POST without an ambiguous automatic retry after a connection failure."""
+    return _request(
+        "POST",
+        path,
+        body=body,
+        retry_connection_failure=False,
+        **kwargs,
+    )
 
 
 def put(path, body=None, **kwargs):
