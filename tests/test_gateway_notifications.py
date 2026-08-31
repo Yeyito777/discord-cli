@@ -153,6 +153,23 @@ class GatewayNotificationTests(unittest.TestCase):
         self.assertEqual(queued["msg_id"], "message-1")
         self.assertEqual(queued["type"], "dm")
 
+    def test_pinned_message_system_notice_is_not_queued(self):
+        listener = object.__new__(GatewayListener)
+        listener.my_id = "me"
+        listener._write = Mock()
+        listener._queue_notification = Mock()
+
+        listener._on_notify("MESSAGE_CREATE", {
+            "id": "pin-notice-1",
+            "type": 6,
+            "channel_id": "ch-1",
+            "author": {"id": "friend-1", "username": "friend"},
+            "mentions": [],
+        })
+
+        listener._write.assert_not_called()
+        listener._queue_notification.assert_not_called()
+
     def test_structured_dm_data_preserves_multiline_content_and_reply_fields(self):
         listener = object.__new__(GatewayListener)
         listener.account = {"alias": "paramount"}

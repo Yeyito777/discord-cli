@@ -476,6 +476,8 @@ class GatewayListener:
             return
         if event_type != "MESSAGE_CREATE":
             return
+        if d.get("type") == 6:  # CHANNEL_PINNED_MESSAGE system notice
+            return
         if d.get("author", {}).get("id") == self.my_id:
             return
 
