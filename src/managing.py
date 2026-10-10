@@ -2,7 +2,7 @@
 
 import argparse
 
-from src import api
+from src import api, typing_keeper
 from src.private_channels import private_channel_close_message
 from src.resolve import resolve_dm, resolve_guild
 from src.invite import join_server
@@ -49,12 +49,32 @@ def leave(argv):
 
 
 def typing(argv):
-    p = argparse.ArgumentParser(prog="discord typing", description="Trigger typing indicator.")
+    p = argparse.ArgumentParser(
+        prog="discord typing",
+        description="Show the typing indicator until this account's next send in the channel, or a timeout.",
+    )
     p.add_argument("channel", help="Channel ID")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--for", dest="seconds", type=float, metavar="SECONDS",
+                      help=f"keep typing for at most SECONDS (default {typing_keeper.DEFAULT_SECONDS}, "
+                           f"max {typing_keeper.MAX_SECONDS})")
+    mode.add_argument("--once", action="store_true", help="trigger once (~10 s) without a keeper")
+    mode.add_argument("--stop", action="store_true", help="stop typing in this channel without sending")
     args = p.parse_args(argv)
 
-    api.trigger_typing(args.channel)
-    print("Typing indicator sent.")
+    if args.stop:
+        stopped = typing_keeper.stop(args.channel)
+        print("Typing stopped." if stopped else "No typing indicator was running.")
+        return
+    if args.once:
+        api.trigger_typing(args.channel)
+        print("Typing indicator sent.")
+        return
+    seconds = typing_keeper.DEFAULT_SECONDS if args.seconds is None else args.seconds
+    if not 0 < seconds <= typing_keeper.MAX_SECONDS:
+        p.error(f"--for must be between 0 and {typing_keeper.MAX_SECONDS} seconds")
+    typing_keeper.start(args.channel, seconds)
+    print(f"Typing until the next send here, or {seconds:g}s.")
 
 
 def read(argv):

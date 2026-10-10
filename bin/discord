@@ -41,7 +41,7 @@ commands:
   notify       Manage notifications                   (subscribe/unsubscribe/list/start/stop; --channel ID [--guild NAME])
   join         Join a server via invite link
   leave        Leave a server
-  typing       Trigger typing indicator
+  typing       Show typing until your next send here (--for SECONDS, --once, --stop)
   read         Mark channel as read
   accounts     List configured Discord accounts
   account      Manage named accounts                  (list, add, migrate, default, access, notify, remove)

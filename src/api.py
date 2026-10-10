@@ -544,8 +544,15 @@ def get_message(channel_id, message_id):
     return get(f"/channels/{channel_id}/messages/{message_id}")
 
 
+def _stop_typing(channel_id):
+    """End a `discord typing` keeper first so the indicator can't outlive this message."""
+    from src.typing_keeper import stop_quietly
+    stop_quietly(channel_id)
+
+
 def send_message(channel_id, content, reply_to=None, tts=False):
     """Send a message to a channel."""
+    _stop_typing(channel_id)
     body = {"content": content, "tts": tts}
     if reply_to:
         body["message_reference"] = {"message_id": reply_to}
@@ -559,6 +566,7 @@ def send_message_with_files(channel_id, file_paths, content=None, reply_to=None,
       - A 'payload_json' part with the message body (application/json)
       - One or more 'files[N]' parts with the actual file data
     """
+    _stop_typing(channel_id)
     import mimetypes
     import os
 
