@@ -51,6 +51,60 @@ def notification_source(account=None):
     }
 
 
+def channel_notification_source(channel_id, account=None):
+    """A channel source never includes the account-wide DM/mention route."""
+    account = account or selected_account()
+    alias = account.get("alias") or selected_alias(required=False) or "legacy"
+    return {
+        "id": f"account:{alias}:channel:{channel_id}:messages",
+        "label": f"{account_label(account)} · channel {channel_id} · new posts",
+        "description": "New incoming posts in this exact server channel; no edits, history, threads, or self-authored posts.",
+    }
+
+
+def _channel_options(parser):
+    parser.add_argument("--channel", help="Exact server channel ID or name (names require --guild)")
+    parser.add_argument("--guild", "-g", help="Exact server name or ID")
+
+
+def _resolve_notification_channel(target, guild=None, *, validate=False):
+    """Do not use the CLI's fuzzy resolver for durable subscriptions."""
+    from src import api
+
+    def exact(items, value, kind):
+        matches = [item for item in items if item.get("name") == value]
+        if len(matches) != 1:
+            raise RuntimeError(f"Expected one exact {kind} named {value!r}; use its ID.")
+        return matches[0]
+
+    guild_id = None
+    if guild:
+        guild_id = guild if re.fullmatch(r"\d{17,20}", guild) else exact(api.get_guilds(), guild, "server")["id"]
+    if re.fullmatch(r"\d{17,20}", target):
+        if not validate and not guild:
+            return target  # removal/listing must work after access is lost
+        channel = api.get_channel(target)
+    else:
+        if not guild_id:
+            raise RuntimeError("Channel names require --guild; alternatively use a channel ID.")
+        channel = exact(api.get_guild_channels(guild_id), target.removeprefix("#"), "channel")
+    if not channel.get("guild_id") or channel.get("type") not in (0, 5, 10, 11, 12):
+        raise RuntimeError("Select a server text/announcement channel or an exact thread ID.")
+    if guild_id and channel.get("guild_id") != guild_id:
+        raise RuntimeError("Channel does not belong to the specified server.")
+    return str(channel["id"])
+
+
+def _source_for_args(args, parser, *, validate=False):
+    if args.guild and not args.channel:
+        parser.error("--guild requires --channel")
+    if args.channel:
+        return channel_notification_source(
+            _resolve_notification_channel(args.channel, args.guild, validate=validate)
+        )
+    return notification_source()
+
+
 def _load_config():
     if CONFIG_FILE.exists():
         try:
@@ -288,9 +342,10 @@ def _subscribe(argv, *, prog="discord notify subscribe"):
         "--delivery", choices=("wake", "inbox"), default="wake",
         help="Delivery mode (default: wake)",
     )
+    _channel_options(p)
     args = p.parse_args(argv)
 
-    source = notification_source()
+    source = _source_for_args(args, p, validate=True)
     subscription = subscribe_external_notification(
         TOOL_NAME,
         source["id"],
@@ -301,6 +356,8 @@ def _subscribe(argv, *, prog="discord notify subscribe"):
     subscription_id = subscription.get("id") or subscription.get("subscriptionId")
     suffix = f" [{subscription_id}]" if subscription_id else ""
     print(f"  Subscribed {args.conv_id} ({args.delivery}){suffix}")
+    if args.channel:
+        print(f"  Start/verify collection: discord notify start --channel {source['id'].split(':')[3]}")
 
 
 def subscribe(argv):
@@ -318,11 +375,12 @@ def _unsubscribe(argv, *, prog="discord notify unsubscribe"):
     )
     p.add_argument("conv_id", nargs="?", help="Exocortex conversation ID")
     p.add_argument("--subscription-id", help="Remove a subscription by registry ID")
+    _channel_options(p)
     args = p.parse_args(argv)
     if bool(args.conv_id) == bool(args.subscription_id):
         p.error("specify exactly one conversation ID or --subscription-id")
 
-    source = notification_source()
+    source = _source_for_args(args, p)
     if args.subscription_id:
         account_subscriptions = list_external_notification_subscriptions(
             tool_name=TOOL_NAME, source_id=source["id"]
@@ -401,15 +459,19 @@ def list_config(argv):
         prog="discord notify list",
         description="Show core subscriptions and local Discord sender labels.",
     )
-    p.parse_args(argv)
+    _channel_options(p)
+    args = p.parse_args(argv)
 
-    source = notification_source()
+    source = _source_for_args(args, p)
     subscriptions = list_external_notification_subscriptions(
         tool_name=TOOL_NAME, source_id=source["id"]
     )
     labels = get_labels()
 
     print(f"  Source: {source['label']} ({source['id']})")
+    if args.channel:
+        from src.channel_notifications import listener_status
+        print(f"  Listener: {listener_status(source['id'].split(':')[3])}")
     print("  Subscriptions:")
     if subscriptions:
         for subscription in sorted(
@@ -444,7 +506,13 @@ def start(argv):
     p = argparse.ArgumentParser(
         prog="discord notify start", description="Start the notification listener."
     )
-    p.parse_args(argv)
+    _channel_options(p)
+    args = p.parse_args(argv)
+    source = _source_for_args(args, p, validate=True)
+    if args.channel:
+        from src.channel_notifications import start_listener
+        start_listener(source["id"].split(":")[3])
+        return
 
     alias = selected_alias()
     if alias == supervised_notify_alias():
@@ -459,7 +527,13 @@ def stop(argv):
     p = argparse.ArgumentParser(
         prog="discord notify stop", description="Stop the notification listener."
     )
-    p.parse_args(argv)
+    _channel_options(p)
+    args = p.parse_args(argv)
+    source = _source_for_args(args, p)
+    if args.channel:
+        from src.channel_notifications import stop_listener
+        stop_listener(source["id"].split(":")[3])
+        return
 
     alias = selected_alias()
     if alias == supervised_notify_alias():
@@ -524,6 +598,8 @@ def _print_help():
     print("  label USER_ID [LABEL]                     Manage local sender labels")
     print("  start | stop                              Manage the notification gateway")
     print("  add | remove                              Aliases for subscribe/unsubscribe")
+    print("  subscribe/unsubscribe/list/start/stop: --channel ID|NAME [--guild ID|NAME]")
+    print("  No --channel: existing account-wide DMs/@mentions. Channel start is explicit.")
 
 
 def dispatch(cmd, argv):

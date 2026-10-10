@@ -24,7 +24,7 @@ from src.accounts import selected_alias
 
 
 DEFAULT_TIMEOUT_SECS = 300
-_REQUIRED_IPC_COMMAND = "open-context-tab"
+_REQUIRED_IPC_COMMAND = "open-background-context-tab"
 
 
 class VimbrowserCaptchaError(RuntimeError):
@@ -187,11 +187,22 @@ class VimbrowserIpc:
             )
 
     def open_context_tab(self, context: str, url: str) -> int:
-        payload = self.send_json(f"open-context-tab {context} {url}")
-        tab_id = payload.get("active_tabid")
-        if not isinstance(tab_id, int) or tab_id <= 0:
-            raise VimbrowserCaptchaError("vimbrowser did not return the new tab ID")
-        return tab_id
+        before = self.send_json("tabs")
+        old_ids = {tab.get("id") for tab in before.get("tabs", [])}
+        self.send_json(f"open-background-context-tab {context} {url}")
+        after = self.send_json("tabs")
+        matches = [
+            tab for tab in after.get("tabs", [])
+            if tab.get("id") not in old_ids
+            and tab.get("context") == context
+            and isinstance(tab.get("id"), int)
+            and tab["id"] > 0
+        ]
+        if len(matches) != 1:
+            raise VimbrowserCaptchaError(
+                "could not identify exactly one new isolated background tab"
+            )
+        return matches[0]["id"]
 
     def network_clear(self, tab_id: int) -> None:
         self.send_json(f"network {tab_id} clear")

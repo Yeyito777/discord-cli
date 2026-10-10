@@ -88,6 +88,14 @@ class GatewayListener:
         self.account = selected_account()
 
         self.notification_source = None
+        self.notification_channel = None
+        self._channel_notify_paths = None
+        from src.channel_notifications import PREFIX, paths
+        if self.channel_id.startswith(PREFIX):
+            self.notification_channel = self.channel_id[len(PREFIX):]
+            self._channel_notify_paths = paths(self.notification_channel)
+            from src.notify import channel_notification_source
+            self.notification_source = channel_notification_source(self.notification_channel, self.account)
         if self.channel_id == "__notify__":
             from src.notify import notification_source
             self.notification_source = notification_source(self.account)
@@ -118,7 +126,7 @@ class GatewayListener:
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
 
-        if self.channel_id == "__notify__":
+        if self.notification_source:
             self._acquire_notify_singleton()
 
     def _shutdown(self, signum=None, frame=None):
@@ -131,14 +139,17 @@ class GatewayListener:
 
     def _acquire_notify_singleton(self):
         NOTIFY_LISTENER_DIR.mkdir(parents=True, exist_ok=True)
-        lock_fd = os.open(NOTIFY_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
+        files = getattr(self, "_channel_notify_paths", None)
+        lock_path = files["lock"] if files else NOTIFY_LOCK_PATH
+        pid_path = files["pid"] if files else NOTIFY_PID_PATH
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(lock_fd)
             existing_pid = "?"
             try:
-                existing_pid = NOTIFY_PID_PATH.read_text().strip() or "?"
+                existing_pid = pid_path.read_text().strip() or "?"
             except OSError:
                 pass
             raise SystemExit(f"Notify listener already running (PID {existing_pid})")
@@ -146,15 +157,17 @@ class GatewayListener:
         os.ftruncate(lock_fd, 0)
         os.write(lock_fd, f"{os.getpid()}\n".encode())
         self._notify_lock_fd = lock_fd
-        NOTIFY_PID_PATH.write_text(f"{os.getpid()}\n")
+        pid_path.write_text(f"{os.getpid()}\n")
         atexit.register(self._release_notify_singleton)
 
     def _release_notify_singleton(self):
+        files = getattr(self, "_channel_notify_paths", None)
+        pid_path = files["pid"] if files else NOTIFY_PID_PATH
         try:
-            if NOTIFY_PID_PATH.exists():
-                current = NOTIFY_PID_PATH.read_text().strip()
+            if pid_path.exists():
+                current = pid_path.read_text().strip()
                 if current == str(os.getpid()):
-                    NOTIFY_PID_PATH.unlink(missing_ok=True)
+                    pid_path.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -198,16 +211,25 @@ class GatewayListener:
 
     def run(self):
         """Register the source, then connect and run until stopped."""
-        if self.channel_id == "__notify__":
-            self._register_notification_source()
         while self.running:
             try:
+                self._channel_notify_state("connecting")
+                if self.notification_source:
+                    self._register_notification_source()
                 self._connect()
                 self._receive_loop()
             except Exception as e:
                 self._log(f"Error: {e}")
+            self._channel_notify_state("reconnecting" if self.running else "stopped")
             if self.running:
                 time.sleep(random.uniform(1, 5))
+
+    def _channel_notify_state(self, status):
+        files = getattr(self, "_channel_notify_paths", None)
+        if files:
+            tmp = files["state"].with_suffix(".state.tmp")
+            tmp.write_text(json.dumps({"pid": os.getpid(), "status": status}))
+            tmp.replace(files["state"])
 
     # ─── Connection ──────────────────────────────────────────────────────────
 
@@ -410,6 +432,9 @@ class GatewayListener:
                     self._on_dispatch(event.get("t"), event.get("d", {}))
                 except Exception as e:
                     self._log(f"Event error ({event.get('t')}): {e}")
+                    if (getattr(self, "notification_channel", None)
+                            and event.get("t") in {"READY", "RESUMED"}):
+                        raise  # retry activation rather than staying silently unready
 
     def _on_dispatch(self, event_type, d):
         if not isinstance(d, dict):
@@ -420,6 +445,10 @@ class GatewayListener:
             self.resume_url = d.get("resume_gateway_url")
             self.my_id = d["user"]["id"]
             name = d["user"].get("global_name") or d["user"]["username"]
+            if getattr(self, "notification_channel", None):
+                self._build_name_maps(d)
+                self._subscribe_notification_channel()
+                self._channel_notify_state("ready")
 
             if self.channel_id == "__notify__":
                 self._build_name_maps(d)
@@ -432,12 +461,34 @@ class GatewayListener:
             return
 
         if event_type == "RESUMED":
+            if getattr(self, "notification_channel", None):
+                self._subscribe_notification_channel()
+            self._channel_notify_state("ready")
             return
 
-        if self.channel_id == "__notify__":
+        if self.channel_id == "__notify__" or getattr(self, "notification_channel", None):
             self._on_notify(event_type, d)
         else:
             self._on_channel(event_type, d)
+
+    def _subscribe_notification_channel(self):
+        """Enable the user Gateway guild stream on identify and resume.
+
+        This is a session-local Gateway subscription, not a Discord permission,
+        channel follow, read acknowledgement, or account notification setting.
+        """
+        from src import api
+        channel = api.get_channel(self.notification_channel)
+        guild_id = channel.get("guild_id")
+        if not guild_id:
+            raise RuntimeError("Notification channel is not a server channel")
+        self._channels[self.notification_channel] = {"name": channel.get("name", "?")}
+        # Send directly: a failed send must not be reported as ready.
+        self.ws.send(json.dumps({
+            "op": 14,
+            "d": {"guild_id": guild_id, "typing": False, "activities": False,
+                  "threads": True, "channels": {self.notification_channel: [[0, 99]]}},
+        }))
 
     def _on_channel(self, event_type, d):
         """Handle events for a specific channel listener."""
@@ -456,6 +507,12 @@ class GatewayListener:
 
     def _on_notify(self, event_type, d):
         """Handle events for the notification listener — DMs and @mentions."""
+        channel_scope = getattr(self, "notification_channel", None)
+        if channel_scope and (
+            event_type != "MESSAGE_CREATE" or d.get("channel_id") != channel_scope
+            or not d.get("guild_id") or not d.get("id")
+        ):
+            return
         if event_type in {"CHANNEL_CREATE", "CHANNEL_UPDATE"}:
             if d.get("type") in (1, 3):
                 self._remember_private_channel(d)
@@ -490,7 +547,7 @@ class GatewayListener:
             m.get("id") == self.my_id for m in d.get("mentions", [])
         )
 
-        if not is_dm and not mentions_me:
+        if not is_dm and not mentions_me and not channel_scope:
             return
 
         author = d.get("author", {})
@@ -499,7 +556,7 @@ class GatewayListener:
         private_type = priv.get("channel_type") or ("dm" if is_dm else None)
         notif = {
             "ts": d.get("timestamp", ""),
-            "type": private_type if is_dm else "mention",
+            "type": private_type if is_dm else ("channel_message" if channel_scope else "mention"),
             "channel_type": private_type if is_dm else "guild_text",
             "is_group_dm": bool(is_dm and private_type == "group_dm"),
             "author_id": author.get("id", ""),
@@ -510,6 +567,16 @@ class GatewayListener:
             "channel_id": channel_id,
             "msg_id": d.get("id", ""),
         }
+        if channel_scope:
+            # Keep actionable attachment IDs/names, never expiring signed URLs.
+            notif["attachments"] = [
+                {key: attachment[key] for key in ("id", "filename", "size", "content_type")
+                 if key in attachment}
+                for attachment in d.get("attachments", []) if isinstance(attachment, dict)
+            ]
+            reference = d.get("message_reference") or {}
+            if reference.get("message_id"):
+                notif["reply_to"] = {"msg_id": reference["message_id"]}
 
         if is_dm:
             if priv.get("channel_name"):
@@ -817,7 +884,7 @@ class GatewayListener:
             "guild": {
                 "id": str(notif.get("guild_id") or ""),
                 "name": str(notif.get("guild_name") or ""),
-            } if event_type == "mention" else None,
+            } if event_type in {"mention", "channel_message"} else None,
             "messageId": str(notif.get("msg_id") or ""),
             "author": {
                 "id": str(notif.get("author_id") or ""),
@@ -828,6 +895,8 @@ class GatewayListener:
             "mentionsAssistant": bool(notif.get("mentions_assistant")),
             "replyTo": reply_data,
         })
+        if event_type == "channel_message":
+            data["attachments"] = notif.get("attachments", [])
         return data
 
     def _notification_actor(self, user_id, display_name, labels):
@@ -891,6 +960,11 @@ class GatewayListener:
             author_id = n.get("author_id", "")
             actor = self._notification_actor(author_id, name, labels)
             content = n.get("content") or "[message]"
+            if n.get("attachments"):
+                content += "\n" + "\n".join(
+                    f"[attachment:{a.get('id', '?')}] {a.get('filename', 'file')}"
+                    for a in n["attachments"]
+                )
             msg_id = n.get("msg_id", "")
             id_line = f"\n[msg:{msg_id}]" if msg_id else ""
             reply_marker = self._notification_reply_marker(n.get("reply_to"))
@@ -918,9 +992,12 @@ class GatewayListener:
                     current_seen = self._get_notification_seen_ids(channel_id)
                     local_seen[channel_id] = current_seen
 
-                history_lines, shown_history_ids = self._fetch_channel_history(
-                    channel_id, msg_id, history_cache, labels, seen_ids=current_seen
-                )
+                if n.get("type") == "channel_message":
+                    history_lines, shown_history_ids = [], set()
+                else:
+                    history_lines, shown_history_ids = self._fetch_channel_history(
+                        channel_id, msg_id, history_cache, labels, seen_ids=current_seen
+                    )
                 if shown_history_ids:
                     current_seen.update(shown_history_ids)
                     seen_updates[channel_id].update(shown_history_ids)

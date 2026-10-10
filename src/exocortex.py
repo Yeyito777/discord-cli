@@ -33,6 +33,9 @@ def _detect_worktree_name():
 
 
 def _socket_path():
+    override = os.environ.get("EXOCORTEX_SOCKET", "").strip()
+    if override:
+        return Path(override)
     worktree = _detect_worktree_name()
     runtime_dir = CONFIG_ROOT / "runtime"
     if worktree:
