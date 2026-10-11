@@ -14,6 +14,7 @@ import os
 import random
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -101,6 +102,8 @@ class GatewayListener:
             self.notification_source = notification_source(self.account)
 
         self.running = True
+        # Set from the signal handler so waits end at once on shutdown.
+        self._stopping = threading.Event()
         self.ws = None
         self.sequence = None
         self.session_id = None
@@ -133,9 +136,18 @@ class GatewayListener:
         sig_name = signal.Signals(signum).name if signum else "?"
         self._log(f"Received {sig_name}, shutting down")
         self.running = False
+        self._stopping.set()
         # Don't close ws here — we may be inside recv_data() on the main
-        # thread and ws.close() can deadlock.  The 1s socket timeout will
-        # break us out of recv, the loop checks self.running, and exits.
+        # thread and ws.close() can deadlock.  Shutting the raw socket down is
+        # one syscall: the pending recv then returns at once instead of after
+        # its 1s timeout (which held up every Exocortex daemon restart), and
+        # the loop sees self.running and exits.
+        sock = getattr(self.ws, "sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def _acquire_notify_singleton(self):
         NOTIFY_LISTENER_DIR.mkdir(parents=True, exist_ok=True)
@@ -222,7 +234,7 @@ class GatewayListener:
                 self._log(f"Error: {e}")
             self._channel_notify_state("reconnecting" if self.running else "stopped")
             if self.running:
-                time.sleep(random.uniform(1, 5))
+                self._stopping.wait(random.uniform(1, 5))
 
     def _channel_notify_state(self, status):
         files = getattr(self, "_channel_notify_paths", None)

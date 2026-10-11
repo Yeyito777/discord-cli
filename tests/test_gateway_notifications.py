@@ -1,6 +1,13 @@
+import os
+import signal
+import socket
+import time
+import threading
 import unittest
 from collections import defaultdict
 from unittest.mock import Mock, patch
+
+import websocket
 
 from src.gateway import GatewayListener
 
@@ -345,3 +352,40 @@ class GatewayNotificationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GatewayShutdownTests(unittest.TestCase):
+    def test_sigterm_interrupts_a_blocked_receive_without_waiting_for_its_timeout(self):
+        listener = object.__new__(GatewayListener)
+        listener._log = Mock()
+        listener.running = True
+        listener._stopping = threading.Event()
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        listener.ws = websocket.WebSocket()
+        listener.ws.sock = ours
+        listener.ws.connected = True
+        listener.ws.settimeout(1)
+
+        previous = signal.signal(signal.SIGTERM, listener._shutdown)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        child = os.fork()
+        if child == 0:
+            time.sleep(0.2)
+            os.kill(os.getppid(), signal.SIGTERM)
+            os._exit(0)
+        started = time.monotonic()
+        while listener.running:
+            try:
+                listener.ws.recv_data()
+            except websocket.WebSocketTimeoutException:
+                continue
+            except (ConnectionError, websocket.WebSocketException, OSError):
+                break
+        elapsed = time.monotonic() - started
+        os.waitpid(child, 0)
+
+        self.assertLess(elapsed, 0.6)
+        self.assertFalse(listener.running)
+        self.assertTrue(listener._stopping.is_set())
