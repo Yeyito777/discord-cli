@@ -37,6 +37,8 @@ exist still embed, but a made-up or mistyped ID will not.
 
 ### Learned library
 
+Learning GIFs from chat context was zosa's idea.
+
 The library is a plain JSON file at `config/gifs.json`. All accounts share it,
 and it stores only URLs, tags and notes. Writes are atomic and use a lock file.
 
