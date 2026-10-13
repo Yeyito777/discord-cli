@@ -50,12 +50,39 @@ discord gifs save https://klipy.com/gifs/this-fine-4 \
     --source CHANNEL_ID/MESSAGE_ID
 # Reuse later
 discord gifs find coping chaos        # ranks by number of matching tags/title/note words
-discord gifs list | discord gifs tags | discord gifs remove URL
+discord gifs list | discord gifs tags | discord gifs check | discord gifs remove URL
 ```
 
 `learn` is read-only and does not mark the channel as read. By default it hides
 GIFs that are already saved; `--all` shows them along with their saved tags.
-`learn` picks up `gifv` embeds (Klipy, Tenor, Giphy) and `.gif` image embeds.
-If a GIF link has no embed, it is marked `[no embed: may be dead]`. Uploaded
-`.gif` attachments are skipped because their CDN URLs are signed and expire.
-Saving a URL that is already in the library merges its tags.
+`learn` picks up `gifv` embeds (Klipy, Tenor, Giphy), `.gif` image embeds and
+uploaded `.gif` attachments. If a GIF link has no embed, it is marked
+`[no embed: may be dead]`. Saving a URL that is already in the library merges
+its tags.
+
+### Discord uploads (`cdn.discordapp.com/attachments/...`)
+
+Fetched directly, attachment URLs stop working once their `ex`/`is`/`hm`
+signature expires (about 24h) or is missing. You get "This content is no longer
+available." Sent as message content, though, the unsigned URL still embeds as an
+animated GIF, because Discord re-signs the embed's URLs every time the message
+is read. A message whose content is an unsigned attachment `.gif` link gets an
+`image/gif` embed with freshly signed thumbnail URLs.
+
+An upload really dies only when its original message or attachment is deleted.
+So the library:
+
+- stores uploads in their canonical, unsigned form,
+  `https://cdn.discordapp.com/attachments/CHANNEL/ATTACHMENT/name.gif`
+  (`media.discordapp.net` links and query strings are normalized away);
+- refuses to `save` an upload unless it is verified alive. To verify, the tool
+  re-signs it with `POST /api/v9/attachments/refresh-urls`
+  (`{"attachment_urls": [...]}`, 1–50 per call; changes nothing and is not
+  written to the audit log) and fetches the re-signed URL. Discord signs any
+  well-formed path, even a deleted one, so the fetch is what proves it exists;
+- re-checks matched uploads in `find` and skips dead ones (`--no-check` for
+  offline use);
+- offers `discord gifs check [--prune]` to verify or remove saved uploads.
+
+Prefer provider GIFs from `gifs search` when an equivalent exists; they don't
+depend on someone else's message surviving.

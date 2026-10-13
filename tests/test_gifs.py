@@ -194,12 +194,158 @@ class GifDetectionTests(unittest.TestCase):
             "url": "https://tenor.com/view/dead-gif-123", "title": "", "provider": "", "rendered": False,
         }])
 
-    def test_uploaded_gif_attachments_are_skipped(self):
-        attachment = {
-            "id": "9", "filename": "x.gif", "size": 10, "content_type": "image/gif",
-            "url": "https://cdn.discordapp.com/attachments/1/2/x.gif?ex=1&is=2&hm=3",
-        }
-        self.assertEqual(gifs.gifs_in_message(_msg("1", attachments=[attachment])), [])
+    def test_uploaded_gif_attachments_use_canonical_unsigned_url(self):
+        attachments = [
+            {"id": "9", "filename": "x.gif", "size": 10, "content_type": "image/gif",
+             "url": "https://cdn.discordapp.com/attachments/1/2/x.gif?ex=1&is=2&hm=3&"},
+            {"id": "8", "filename": "y.png", "size": 10, "content_type": "image/png",
+             "url": "https://cdn.discordapp.com/attachments/1/3/y.png?ex=1&is=2&hm=3&"},
+        ]
+        self.assertEqual(gifs.gifs_in_message(_msg("1", attachments=attachments)), [{
+            "url": "https://cdn.discordapp.com/attachments/1/2/x.gif",
+            "title": "x.gif", "provider": "Discord upload", "rendered": True,
+        }])
+
+    def test_signed_cdn_link_embed_is_canonicalized_and_deduplicated(self):
+        signed = "https://cdn.discordapp.com/attachments/1/2/x.gif?ex=1&is=2&hm=3&"
+        msg = _msg("1", signed, embeds=[{"type": "image", "url": signed}])
+        self.assertEqual([g["url"] for g in gifs.gifs_in_message(msg)],
+                         ["https://cdn.discordapp.com/attachments/1/2/x.gif"])
+
+
+class AttachmentUrlTests(unittest.TestCase):
+    def test_canonical_attachment_url(self):
+        for url, expected in (
+            ("https://cdn.discordapp.com/attachments/1/2/a.gif?ex=1&is=2&hm=3&",
+             "https://cdn.discordapp.com/attachments/1/2/a.gif"),
+            ("https://media.discordapp.net/attachments/1/2/a.gif?width=200",
+             "https://cdn.discordapp.com/attachments/1/2/a.gif"),
+            ("https://cdn.discordapp.com/ephemeral-attachments/1/2/a.gif",
+             "https://cdn.discordapp.com/ephemeral-attachments/1/2/a.gif"),
+            ("https://cdn.discordapp.com/emojis/1.gif", None),
+            ("https://klipy.com/gifs/a", None),
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(gifs.canonical_attachment_url(url), expected)
+
+    def test_status_fetches_refreshed_url_and_treats_unsigned_as_dead(self):
+        alive = "https://cdn.discordapp.com/attachments/1/2/a.gif"
+        gone = "https://cdn.discordapp.com/attachments/1/3/b.gif"
+        refreshed = {alive: alive + "?ex=1&is=2&hm=3&", gone: None}
+        with (
+            patch.object(gifs.api, "refresh_attachment_urls", return_value=refreshed) as refresh,
+            patch.object(gifs, "_probe", return_value=True) as probe,
+        ):
+            status = gifs.attachment_status([alive, gone, alive, "https://klipy.com/gifs/a"])
+        refresh.assert_called_once_with([alive, gone])
+        probe.assert_called_once_with(alive + "?ex=1&is=2&hm=3&")
+        self.assertEqual(status, {alive: True, gone: False})
+
+    def test_status_is_unknown_when_refresh_fails(self):
+        url = "https://cdn.discordapp.com/attachments/1/2/a.gif"
+        with patch.object(gifs.api, "refresh_attachment_urls", side_effect=RuntimeError("HTTP 500")):
+            self.assertEqual(gifs.attachment_status([url]), {url: None})
+
+    def test_probe_distinguishes_gone_from_unknown(self):
+        import urllib.error
+        for code, expected in ((404, False), (410, False), (500, None), (403, None)):
+            error = urllib.error.HTTPError("u", code, "x", {}, None)
+            with self.subTest(code=code), patch.object(gifs.urllib.request, "urlopen", side_effect=error):
+                self.assertIs(gifs._probe("https://cdn.discordapp.com/attachments/1/2/a.gif?ex=1"), expected)
+        with patch.object(gifs.urllib.request, "urlopen", side_effect=gifs.urllib.error.URLError("dns")):
+            self.assertIsNone(gifs._probe("https://cdn.discordapp.com/attachments/1/2/a.gif?ex=1"))
+
+    def test_refresh_endpoint_is_batched_and_not_audited(self):
+        urls = [f"https://cdn.discordapp.com/attachments/1/{i}/a.gif" for i in range(60)]
+
+        def fake_post(path, body=None, **kwargs):
+            return {"refreshed_urls": [{"original": u, "refreshed": u + "?ex=1"} for u in body["attachment_urls"]]}
+
+        with patch.object(gifs.api, "post", side_effect=fake_post) as post:
+            result = gifs.api.refresh_attachment_urls(urls)
+        self.assertEqual([len(c.kwargs["body"]["attachment_urls"]) for c in post.call_args_list], [50, 10])
+        for call in post.call_args_list:
+            self.assertEqual(call.args, ("/attachments/refresh-urls",))
+            self.assertIs(call.kwargs["audit"], False)
+        self.assertEqual(result[urls[59]], urls[59] + "?ex=1")
+
+
+class AttachmentLibraryTests(unittest.TestCase):
+    URL = "https://cdn.discordapp.com/attachments/1/2/a.gif"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = patch.object(gifs, "LIBRARY_FILE", Path(self.tmp.name) / "gifs.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _save(self, status, url=None):
+        with patch.object(gifs, "attachment_status", side_effect=lambda urls: {u: status for u in urls}) as check:
+            out, err = _run(gifs.save, [url or self.URL + "?ex=1&is=2&hm=3&", "-t", "bleed"])
+        return out, err, check
+
+    def test_save_stores_verified_unsigned_url(self):
+        out, err, check = self._save(True)
+        check.assert_called_once_with([self.URL])
+        self.assertIn(f"Saved {self.URL}", out)
+        self.assertIn("Discord upload", err)
+        entry = gifs.load_library()["gifs"][0]
+        self.assertEqual(entry["url"], self.URL)
+        self.assertIn("verified_at", entry)
+
+    def test_save_refuses_deleted_or_unverifiable_uploads(self):
+        for status, message in ((False, "no longer available"), (None, "could not verify")):
+            with self.subTest(status=status), self.assertRaisesRegex(RuntimeError, message):
+                self._save(status)
+        self.assertFalse(gifs.LIBRARY_FILE.exists())
+
+    def test_provider_urls_are_not_checked(self):
+        with patch.object(gifs.api, "refresh_attachment_urls") as refresh:
+            _run(gifs.save, ["https://klipy.com/gifs/a", "-t", "x"])
+            _run(gifs.find, ["x"])
+        refresh.assert_not_called()
+
+    def test_find_skips_dead_uploads_and_backfills(self):
+        library = {"version": 1, "gifs": [
+            {"url": "https://cdn.discordapp.com/attachments/1/1/dead.gif", "tags": ["bleed"], "updated_at": "3"},
+            {"url": "https://cdn.discordapp.com/attachments/1/2/live.gif", "tags": ["bleed"], "updated_at": "2"},
+            {"url": "https://klipy.com/gifs/bleed", "tags": ["bleed"], "updated_at": "1"},
+        ]}
+        gifs.LIBRARY_FILE.write_text(json.dumps(library))
+        alive = {"https://cdn.discordapp.com/attachments/1/1/dead.gif": False,
+                 "https://cdn.discordapp.com/attachments/1/2/live.gif": True}
+        with patch.object(gifs, "attachment_status",
+                          side_effect=lambda urls: {u: alive[u] for u in urls if u in alive}):
+            out, err = _run(gifs.find, ["bleed", "-n", "2", "--json"])
+        self.assertEqual([g["url"] for g in json.loads(out)],
+                         ["https://cdn.discordapp.com/attachments/1/2/live.gif", "https://klipy.com/gifs/bleed"])
+        self.assertIn("dead.gif", err)
+
+        with patch.object(gifs, "attachment_status") as check:
+            out, _ = _run(gifs.find, ["bleed", "--no-check", "--json"])
+        check.assert_not_called()
+        self.assertEqual(len(json.loads(out)), 3)
+
+    def test_check_prunes_only_dead_uploads(self):
+        library = {"version": 1, "gifs": [
+            {"url": "https://cdn.discordapp.com/attachments/1/1/dead.gif", "tags": ["a"]},
+            {"url": "https://cdn.discordapp.com/attachments/1/2/unknown.gif", "tags": ["a"]},
+            {"url": "https://klipy.com/gifs/a", "tags": ["a"]},
+        ]}
+        gifs.LIBRARY_FILE.write_text(json.dumps(library))
+        status = {"https://cdn.discordapp.com/attachments/1/1/dead.gif": False,
+                  "https://cdn.discordapp.com/attachments/1/2/unknown.gif": None}
+        with patch.object(gifs, "attachment_status", return_value=status):
+            out, _ = _run(gifs.check, ["--prune"])
+        self.assertIn("Removed 1 dead upload(s)", out)
+        self.assertEqual([g["url"] for g in gifs.load_library()["gifs"]],
+                         ["https://cdn.discordapp.com/attachments/1/2/unknown.gif", "https://klipy.com/gifs/a"])
+
+    def test_remove_accepts_signed_form(self):
+        self._save(True)
+        _run(gifs.remove, [self.URL + "?ex=9&is=9&hm=9&"])
+        self.assertEqual(gifs.load_library()["gifs"], [])
 
 
 class LearnTests(unittest.TestCase):

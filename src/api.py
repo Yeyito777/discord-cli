@@ -315,8 +315,12 @@ def _maybe_retry_with_vimbrowser_captcha(
 
 def _request(method, path, body=None, body_bytes=None, token=None, params=None,
              extra_headers=None, allow_captcha_fallback=True,
-             retry_connection_failure=True):
-    """Make an API request with connection pooling. Returns parsed JSON."""
+             retry_connection_failure=True, audit=True):
+    """Make an API request with connection pooling. Returns parsed JSON.
+
+    ``audit=False`` skips the mutation receipt for non-GET requests that do not
+    change Discord state (e.g. attachment URL refreshes).
+    """
     if body is not None and body_bytes is not None:
         raise ValueError("Provide either body or body_bytes, not both")
 
@@ -366,19 +370,19 @@ def _request(method, path, body=None, body_bytes=None, token=None, params=None,
         status = resp.status
 
         if status == 204:
-            if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            if audit and method.upper() not in {"GET", "HEAD", "OPTIONS"}:
                 from src.accounts import audit_event
                 audit_event(f"discord-api:{method.upper()}", target=path)
             return None
 
         if 200 <= status < 300:
             if not raw:
-                if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+                if audit and method.upper() not in {"GET", "HEAD", "OPTIONS"}:
                     from src.accounts import audit_event
                     audit_event(f"discord-api:{method.upper()}", target=path)
                 return None
             result = json.loads(raw)
-            if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            if audit and method.upper() not in {"GET", "HEAD", "OPTIONS"}:
                 from src.accounts import audit_event
                 result_id = result.get("id") if isinstance(result, dict) else None
                 audit_event(f"discord-api:{method.upper()}", target=path, result_id=result_id)
@@ -676,6 +680,29 @@ def remove_reaction(channel_id, message_id, emoji):
 def get_pins(channel_id):
     """Get pinned messages in a channel."""
     return get(f"/channels/{channel_id}/pins")
+
+
+# ─── Attachments ──────────────────────────────────────────────────────────────
+
+def refresh_attachment_urls(urls):
+    """Re-sign CDN attachment URLs, as the client does for expired links.
+
+    Returns {original: refreshed URL or None}.  Discord signs any well-formed
+    attachment path, even for deleted files, so callers must still fetch the
+    refreshed URL to know the file exists.  Changes nothing on Discord.
+    """
+    result = {}
+    urls = list(dict.fromkeys(urls))
+    for i in range(0, len(urls), 50):  # Discord accepts 1-50 URLs per request
+        data = post(
+            "/attachments/refresh-urls",
+            body={"attachment_urls": urls[i:i + 50]},
+            audit=False,
+            allow_captcha_fallback=False,
+        )
+        for item in (data or {}).get("refreshed_urls", []):
+            result[item.get("original")] = item.get("refreshed")
+    return result
 
 
 # ─── Search ───────────────────────────────────────────────────────────────────

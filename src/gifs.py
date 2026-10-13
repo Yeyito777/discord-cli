@@ -8,6 +8,16 @@ Discord unfurls it into an animated ``gifv`` embed, so that is the URL we print.
 The library is a plain JSON file shared by all accounts.  ``learn`` scans a
 channel for GIFs other people posted and prints them with surrounding messages
 so an agent can infer their meaning and ``save`` them with tags.
+
+GIFs uploaded to Discord are stored by their canonical, unsigned CDN URL
+(``https://cdn.discordapp.com/attachments/C/A/name.gif``).  Fetched directly,
+that URL says "This content is no longer available" once its ex/is/hm
+signature is missing or expired.  Sent as message content, though, Discord still
+embeds it, and the embed's URLs are re-signed on every read.  It only dies when
+the uploader's message or attachment is deleted.  ``save`` and ``find``
+therefore check that an attachment is still alive.  To do that they re-sign it
+via ``POST /attachments/refresh-urls`` (as the client does) and fetch the
+re-signed URL.
 """
 
 from __future__ import annotations
@@ -19,7 +29,9 @@ import json
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 
 from src import api
 from src.accounts import CONFIG_ROOT, _write_secure_json
@@ -42,6 +54,46 @@ _GIF_PAGE_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_RE = re.compile(r"https?://[^\s<>|]+")
+_ATTACHMENT_RE = re.compile(
+    r"^https?://(?:cdn\.discordapp\.com|media\.discordapp\.net)/((?:ephemeral-)?attachments/\d+/\d+/[^?#\s]+)",
+    re.IGNORECASE,
+)
+
+
+# ─── Discord attachment URLs ────────────────────────────────────────────────
+
+def canonical_attachment_url(url):
+    """Unsigned cdn.discordapp.com form of a Discord attachment URL, or None."""
+    match = _ATTACHMENT_RE.match(url or "")
+    return f"https://cdn.discordapp.com/{match.group(1)}" if match else None
+
+
+def is_attachment(url):
+    return canonical_attachment_url(url) is not None
+
+
+def _probe(url):
+    """True if the URL serves content, False if it is gone, None if unknown."""
+    request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return 200 <= response.status < 300
+    except urllib.error.HTTPError as e:
+        return False if e.code in {404, 410} else None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+
+
+def attachment_status(urls):
+    """Map each attachment URL to True (alive), False (deleted) or None (unknown)."""
+    urls = [u for u in dict.fromkeys(urls) if is_attachment(u)]
+    if not urls:
+        return {}
+    try:
+        refreshed = api.refresh_attachment_urls(urls)
+    except RuntimeError:
+        return {url: None for url in urls}
+    return {url: _probe(refreshed[url]) if refreshed.get(url) else False for url in urls}
 
 
 # ─── Discord GIF picker ─────────────────────────────────────────────────────
@@ -199,6 +251,17 @@ def save(argv):
     if not tags:
         p.error("at least one non-empty tag is required")
     source = _parse_source(p, args.source)
+    attachment = canonical_attachment_url(url)
+    if attachment:
+        url = attachment  # signatures expire; Discord re-signs the unsigned form when embedding
+        status = attachment_status([url]).get(url)
+        if status is False:
+            raise RuntimeError(
+                f"{url} is no longer available (the Discord upload was deleted). "
+                "Find a durable equivalent with 'discord gifs search'."
+            )
+        if status is None:
+            raise RuntimeError(f"could not verify that {url} is still available; not saved. Try again later.")
     if not _GIF_PAGE_RE.match(url) and not urllib.parse.urlparse(url).path.lower().endswith(".gif"):
         print(f"Warning: {url} is not a known GIF page or .gif URL; Discord may not animate it.", file=sys.stderr)
 
@@ -217,15 +280,23 @@ def save(argv):
             entry["note"] = args.note.strip()
         if source is not None:
             entry["source"] = source
+        if attachment:
+            entry["verified_at"] = _now()
         entry["updated_at"] = _now()
     print(f"{verb} {url}  [{', '.join(entry['tags'])}]")
+    if attachment:
+        print(
+            "Note: Discord upload — works only while the original message exists. "
+            "A provider GIF from 'discord gifs search' is more durable.",
+            file=sys.stderr,
+        )
 
 
 def remove(argv):
     p = argparse.ArgumentParser(prog="discord gifs remove", description="Remove a GIF from the local library.")
     p.add_argument("url", help="Saved GIF URL")
     args = p.parse_args(argv)
-    url = args.url.strip()
+    url = canonical_attachment_url(args.url.strip()) or args.url.strip()
     with _locked_library() as library:
         before = len(library["gifs"])
         library["gifs"] = [g for g in library["gifs"] if g.get("url") != url]
@@ -261,6 +332,32 @@ def find_gifs(library, query_terms):
     return [entry for _, entry in ranked]
 
 
+def live_matches(ranked, limit, check=True):
+    """Take the first ``limit`` entries, skipping Discord uploads that were deleted.
+
+    Returns (entries, dead).  Uploads whose status cannot be determined are kept.
+    """
+    if not check:
+        return ranked[:limit], []
+    live, dead = [], []
+    i = 0
+    while len(live) < limit and i < len(ranked):
+        chunk = ranked[i:i + limit - len(live)]
+        i += len(chunk)
+        status = attachment_status([entry["url"] for entry in chunk])
+        for entry in chunk:
+            (dead if status.get(entry["url"]) is False else live).append(entry)
+    return live, dead
+
+
+def _report_dead(dead):
+    if dead:
+        print(f"Skipped {len(dead)} saved Discord upload(s) that no longer exist:", file=sys.stderr)
+        for entry in dead:
+            print(f"  {entry['url']}", file=sys.stderr)
+        print("Remove them with 'discord gifs check --prune'.", file=sys.stderr)
+
+
 def _format_entries(entries):
     if not entries:
         return "  No saved GIFs."
@@ -268,7 +365,8 @@ def _format_entries(entries):
     for entry in entries:
         title = f"  — {entry['title']}" if entry.get("title") else ""
         lines.append(f"  {entry['url']}{title}")
-        lines.append(f"      tags: {', '.join(entry.get('tags', []))}")
+        kind = "  (Discord upload)" if is_attachment(entry["url"]) else ""
+        lines.append(f"      tags: {', '.join(entry.get('tags', []))}{kind}")
         if entry.get("note"):
             lines.append(f"      note: {entry['note']}")
     return "\n".join(lines)
@@ -292,15 +390,41 @@ def find(argv):
     )
     p.add_argument("query", nargs="+", help="Tags or words (comma-separated or separate arguments)")
     p.add_argument("-n", "--limit", type=int, default=10, help="Max results (default: 10)")
+    p.add_argument("--no-check", action="store_true",
+                   help="Skip checking that matched Discord uploads still exist (offline)")
     p.add_argument("--json", action="store_true", help="Print JSON")
     args = p.parse_args(argv)
-    entries = find_gifs(load_library(), _terms(args.query))[:args.limit]
+    entries, dead = live_matches(find_gifs(load_library(), _terms(args.query)), args.limit, not args.no_check)
+    _report_dead(dead)
     if args.json:
         print(json.dumps(entries, indent=2))
     elif not entries:
         print("  No saved GIFs match. Try 'discord gifs search' or 'discord gifs tags'.")
     else:
         print(_format_entries(entries))
+
+
+def check(argv):
+    p = argparse.ArgumentParser(
+        prog="discord gifs check",
+        description="Check that saved Discord uploads still exist. Provider GIF pages are not checked.",
+    )
+    p.add_argument("--prune", action="store_true", help="Remove uploads that no longer exist")
+    args = p.parse_args(argv)
+    uploads = [g["url"] for g in load_library()["gifs"] if is_attachment(g["url"])]
+    status = attachment_status(uploads)
+    labels = {True: "ok     ", False: "DEAD   ", None: "unknown"}
+    for url in uploads:
+        print(f"  {labels[status.get(url)]}  {url}")
+    dead = {url for url, alive in status.items() if alive is False}
+    if args.prune and dead:
+        with _locked_library() as library:
+            library["gifs"] = [g for g in library["gifs"] if g.get("url") not in dead]
+        print(f"Removed {len(dead)} dead upload(s).")
+    elif dead:
+        print(f"{len(dead)} dead upload(s); run with --prune to remove them.")
+    elif not uploads:
+        print("  No saved Discord uploads to check.")
 
 
 def tags(argv):
@@ -322,12 +446,16 @@ def tags(argv):
 def gifs_in_message(msg):
     """Return GIFs in a raw message that can be re-sent as plain message content.
 
-    Uploaded .gif attachments are skipped: their CDN URLs are signed and expire.
+    Discord-hosted GIFs (uploads and CDN links) are returned in canonical unsigned
+    form, which Discord re-signs when embedding.
     """
     found = []
     seen = set()
 
     def add(url, title="", provider="", rendered=True):
+        canonical = canonical_attachment_url(url)
+        if canonical:
+            url, provider = canonical, "Discord upload"
         if url and url not in seen:
             seen.add(url)
             found.append({"url": url, "title": title, "provider": provider, "rendered": rendered})
@@ -339,6 +467,10 @@ def gifs_in_message(msg):
             add(url, embed.get("title") or "", provider)
         elif embed.get("type") == "image" and urllib.parse.urlparse(url).path.lower().endswith(".gif"):
             add(url, embed.get("title") or "", provider)
+    for attachment in msg.get("attachments") or []:
+        name = attachment.get("filename") or ""
+        if attachment.get("content_type") == "image/gif" or name.lower().endswith(".gif"):
+            add(attachment.get("url") or "", name)
     if found:
         return found
     for url in _URL_RE.findall(msg.get("content") or ""):
@@ -484,7 +616,11 @@ Learned GIF library (local file, shared by all accounts):
   find TERMS... [-n N] [--json]    Find saved GIFs by tag/title/note (best matches first)
   list [-n N] [--json]             List saved GIFs
   tags                             List tags with counts
+  check [--prune]                  Verify saved Discord uploads still exist
   remove URL                       Remove a saved GIF
+
+Discord uploads (cdn.discordapp.com/attachments/...) are saved unsigned and
+verified on save/find; provider GIFs from 'search' are more durable.
 
 Run 'discord gifs <subcommand> --help' for details."""
 
@@ -497,6 +633,7 @@ _COMMANDS = {
     "list": list_cmd,
     "ls": list_cmd,
     "tags": tags,
+    "check": check,
     "remove": remove,
     "rm": remove,
 }
