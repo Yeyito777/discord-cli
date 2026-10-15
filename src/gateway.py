@@ -31,7 +31,6 @@ if str(PROJECT_DIR) not in sys.path:
 import websocket
 
 from src.accounts import listener_dir, selected_account
-from src.calls.state import call_paths, read_call_meta
 
 # ─── Client fingerprint (matches api.py) ─────────────────────────────────────
 
@@ -634,8 +633,6 @@ class GatewayListener:
         channel_id = d.get("channel_id", "")
         if not channel_id or channel_id in self._notified_calls:
             return
-        if self._active_call_meta(channel_id):
-            return
         author = d.get("author") if isinstance(d.get("author"), dict) else {}
         caller = author.get("username") or author.get("global_name") or "someone"
         priv = self._ensure_private_channel_meta(channel_id)
@@ -669,13 +666,6 @@ class GatewayListener:
             return
         if time.time() < self._call_event_baseline_until:
             self._log(f"Suppressing hydrated CALL_CREATE for {channel_id}")
-            return
-        active_meta = self._active_call_meta(channel_id)
-        if active_meta:
-            # This process started/joined the call. The detached call worker has
-            # its own gateway and emits in-call joined/left notifications; the
-            # global DM notification source must not reclassify our outbound call
-            # or participant changes as an incoming call.
             return
         ringing = {str(user_id) for user_id in (d.get("ringing") or []) if user_id}
         voice_state_user_ids = set()
@@ -723,9 +713,6 @@ class GatewayListener:
         self._notified_calls.add(channel_id)
         self._write(json.dumps(notif) + "\n")
         self._queue_notification(notif)
-
-    def _active_call_meta(self, channel_id):
-        return read_call_meta(call_paths(channel_id)["meta"])
 
     def _call_caller_name(self, ringing, voice_state_user_ids, priv):
         # Prefer the non-self participant username/display name from channel metadata.
@@ -952,9 +939,6 @@ class GatewayListener:
         for n in batch:
             if n.get("type") == "call":
                 ch_id = n.get("channel_id", "")
-                if ch_id and self._active_call_meta(ch_id):
-                    self._log(f"Suppressing queued incoming-call notification for active call {ch_id}")
-                    continue
                 channel_type = n.get("channel_type") or "dm"
                 channel_name = n.get("channel_name") or n.get("channel_id", "")
                 participants = n.get("channel_participants") or []

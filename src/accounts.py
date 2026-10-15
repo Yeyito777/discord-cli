@@ -275,7 +275,7 @@ def _is_mutating(cmd: str, argv: list[str]) -> bool:
         return bool(argv and argv[0] not in {"list", "help", "-h", "--help"})
     return cmd in {
         "send", "reply", "edit", "delete", "del", "react", "unreact",
-        "call", "voice", "join-call", "listen", "unlisten", "join", "leave",
+        "listen", "unlisten", "join", "leave",
         "typing", "read", "thread",
         "command",
     }
@@ -504,7 +504,7 @@ def remove_account(argv) -> None:
     if live:
         raise AccountError(
             f"Account '{alias}' still has live process(es): {', '.join(map(str, sorted(set(live))))}. "
-            "Stop its listeners and calls before removal."
+            "Stop its listeners before removal."
         )
 
     for path in (ACCOUNTS_ROOT / alias, runtime, state_dir, cache_dir):

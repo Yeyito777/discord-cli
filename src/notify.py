@@ -131,30 +131,6 @@ def get_labels():
     return labels if isinstance(labels, dict) else {}
 
 
-def get_subscription_targets(*, delivery=None):
-    """Return conversation IDs subscribed to the selected account's source.
-
-    This compatibility helper is used by detached Discord call sessions.  New
-    gateway notification delivery is always performed by Exocortex itself.
-    """
-    source = notification_source()
-    subscriptions = list_external_notification_subscriptions(
-        tool_name=TOOL_NAME, source_id=source["id"]
-    )
-    targets = []
-    seen = set()
-    for subscription in subscriptions:
-        if not isinstance(subscription, dict):
-            continue
-        if delivery and subscription.get("delivery") != delivery:
-            continue
-        conv_id = str(subscription.get("convId") or "").strip()
-        if conv_id and conv_id not in seen:
-            targets.append(conv_id)
-            seen.add(conv_id)
-    return targets
-
-
 def _migrate_relay_targets():
     """Import legacy relay targets into core, then remove the legacy key.
 
