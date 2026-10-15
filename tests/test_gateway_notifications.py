@@ -250,7 +250,6 @@ class GatewayNotificationTests(unittest.TestCase):
         listener = object.__new__(GatewayListener)
         listener.account = {"alias": "paramount", "owner": "assistant"}
         listener.my_id = "assistant-1"
-        listener._active_call_meta = Mock(return_value=None)
         listener._get_notification_seen_ids = Mock(return_value=set())
         listener._fetch_channel_history = Mock(return_value=(
             [
