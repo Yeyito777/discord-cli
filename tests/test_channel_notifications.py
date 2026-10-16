@@ -42,7 +42,7 @@ class ChannelCliTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 notify._resolve_notification_channel(C, validate=True)
 
-    def test_subscribe_channel_and_no_implicit_listener(self):
+    def test_subscribe_channel_waits_for_daemon_listener(self):
         with (patch.object(notify, "selected_account", return_value=ACCOUNT),
               patch("src.api.get_channel", return_value=CHANNEL),
               patch.object(notify, "subscribe_external_notification", return_value={"id": "sub"}) as subscribe,
@@ -51,7 +51,25 @@ class ChannelCliTests(unittest.TestCase):
             notify.subscribe(["conv", "--channel", C, "--guild", G, "--delivery", "inbox"])
         source = notify.channel_notification_source(C, ACCOUNT)
         subscribe.assert_called_once_with("discord", source["id"], "conv", "inbox", source_label=source["label"])
-        start.assert_not_called()
+        start.assert_called_once_with(C)
+
+    def test_subscribe_succeeds_when_listener_is_not_ready_yet(self):
+        with (patch.object(notify, "selected_account", return_value=ACCOUNT),
+              patch("src.api.get_channel", return_value=CHANNEL),
+              patch.object(notify, "subscribe_external_notification", return_value={"id": "sub"}),
+              patch.object(lifecycle, "start_listener", side_effect=RuntimeError("not ready (connecting)")),
+              patch("sys.stdout", new_callable=io.StringIO) as output):
+            notify.subscribe(["conv", "--channel", C])
+        self.assertIn("Subscribed conv", output.getvalue())
+        self.assertIn("Listener: not ready", output.getvalue())
+
+    def test_unsubscribe_nudges_daemon(self):
+        with (patch.object(notify, "selected_account", return_value=ACCOUNT),
+              patch.object(notify, "unsubscribe_external_notification"),
+              patch("src.supervisor.request_reconcile") as nudge,
+              patch("sys.stdout", new_callable=io.StringIO)):
+            notify.unsubscribe(["conv", "--channel", C])
+        nudge.assert_called_once_with()
 
     def test_list_unsubscribe_by_id_need_no_discord_access(self):
         with (patch.object(notify, "selected_account", return_value=ACCOUNT),
@@ -59,6 +77,8 @@ class ChannelCliTests(unittest.TestCase):
               patch.object(notify, "unsubscribe_external_notification") as unsubscribe,
               patch.object(notify, "get_labels", return_value={}),
               patch.object(lifecycle, "listener_status", return_value="ready (PID 5)"),
+              patch.object(lifecycle, "daemon_status", return_value="supervised by the Discord daemon (PID 9)"),
+              patch("src.supervisor.request_reconcile"),
               patch("src.api.get_channel") as fetch,
               patch("sys.stdout", new_callable=io.StringIO) as output):
             notify.list_config(["--channel", C])
@@ -67,7 +87,7 @@ class ChannelCliTests(unittest.TestCase):
         listing.assert_called_once_with(tool_name="discord", source_id=source_id)
         unsubscribe.assert_called_once_with(tool_name="discord", source_id=source_id, conv_id="conv")
         fetch.assert_not_called()
-        self.assertIn("ready (PID 5)", output.getvalue())
+        self.assertIn("ready (PID 5), supervised by the Discord daemon (PID 9)", output.getvalue())
 
     def test_registry_id_cannot_remove_other_source(self):
         with (patch.object(notify, "selected_account", return_value=ACCOUNT),
@@ -80,6 +100,8 @@ class ChannelCliTests(unittest.TestCase):
     def test_channel_start_stop_do_not_manage_account_daemon(self):
         with (patch.object(notify, "selected_account", return_value=ACCOUNT),
               patch("src.api.get_channel", return_value=CHANNEL),
+              patch.object(notify, "list_external_notification_subscriptions",
+                           side_effect=[[{"id": "sub", "enabled": True}], []]),
               patch.object(lifecycle, "start_listener") as start,
               patch.object(lifecycle, "stop_listener") as stop,
               patch.object(notify, "manage_external_tool_daemon") as daemon):
@@ -88,6 +110,23 @@ class ChannelCliTests(unittest.TestCase):
         start.assert_called_once_with(C)
         stop.assert_called_once_with(C)
         daemon.assert_not_called()
+
+    def test_channel_start_requires_subscription_and_stop_requires_none(self):
+        source_id = notify.channel_notification_source(C, ACCOUNT)["id"]
+        with (patch.object(notify, "selected_account", return_value=ACCOUNT),
+              patch("src.api.get_channel", return_value=CHANNEL),
+              patch.object(notify, "list_external_notification_subscriptions",
+                           side_effect=[[{"id": "off", "enabled": False}],
+                                        [{"id": "sub", "enabled": True}]]) as listing,
+              patch.object(lifecycle, "start_listener") as start,
+              patch.object(lifecycle, "stop_listener") as stop):
+            with self.assertRaisesRegex(RuntimeError, "No enabled subscription"):
+                notify.start(["--channel", C])
+            with self.assertRaisesRegex(RuntimeError, "unsubscribe them"):
+                notify.stop(["--channel", C])
+        listing.assert_called_with(tool_name="discord", source_id=source_id)
+        start.assert_not_called()
+        stop.assert_not_called()
 
 
 class ChannelGatewayTests(unittest.TestCase):
@@ -179,6 +218,21 @@ class ChannelGatewayTests(unittest.TestCase):
         self.assertEqual(list(payload["d"]["channels"]), [C])
         listener._channel_notify_state.assert_called_with("ready")
 
+    def test_reconnects_back_off_until_activation_succeeds(self):
+        listener = self.listener()
+        listener.ws = Mock()
+        listener._channel_notify_state = Mock()
+        with patch("random.uniform", return_value=5):
+            delays = [listener._reconnect_delay() for _ in range(6)]
+        self.assertEqual(delays, [5, 10, 20, 40, 60, 60])
+        with patch("src.api.get_channel", side_effect=RuntimeError("Missing Access")):
+            with self.assertRaises(RuntimeError):
+                listener._on_dispatch("READY", {"session_id": "s", "user": {"id": "self", "username": "Me"}})
+        self.assertEqual(listener._failed_connects, 6)  # an unusable READY keeps backing off
+        with patch("src.api.get_channel", return_value=CHANNEL):
+            listener._on_dispatch("RESUMED", {})
+        self.assertEqual(listener._failed_connects, 0)
+
     def test_failed_delivery_retries_stable_event_id(self):
         listener = self.listener()
         listener._on_notify("MESSAGE_CREATE", self.message())
@@ -239,25 +293,33 @@ class ChannelLifecycleTests(unittest.TestCase):
             with patch("subprocess.check_output", return_value=expected.replace(str(files["log"]), "/other/account.log")):
                 self.assertIsNone(lifecycle.owned_pid(C))
 
-    def test_repeated_start_reuses_ready_listener_without_spawn(self):
-        with (patch.object(lifecycle, "owned_pid", return_value=123),
+    def test_start_nudges_running_daemon_and_never_spawns(self):
+        with (patch("src.supervisor.request_reconcile", return_value=77) as nudge,
+              patch("src.supervisor.supervisor_pid", return_value=77),
+              patch("src.exocortex.manage_external_tool_daemon") as daemon,
               patch.object(lifecycle, "listener_status", return_value="ready (PID 123)"),
               patch("subprocess.Popen") as spawn,
-              patch("sys.stdout", new_callable=io.StringIO)):
+              patch("sys.stdout", new_callable=io.StringIO) as output):
             lifecycle.start_listener(C)
+        nudge.assert_called_once_with()
+        daemon.assert_not_called()
         spawn.assert_not_called()
+        self.assertIn("ready (PID 123), supervised by the Discord daemon (PID 77)", output.getvalue())
 
-    def test_start_detaches_and_timeout_does_not_kill_reconnecting_worker(self):
+    def test_start_launches_stopped_daemon_and_timeout_does_not_kill_worker(self):
         with (tempfile.TemporaryDirectory() as tmp,
               patch.object(lifecycle, "listener_dir", return_value=Path(tmp)),
-              patch.object(lifecycle, "owned_pid", return_value=None),
+              patch("src.supervisor.request_reconcile", return_value=None),
+              patch("src.exocortex.manage_external_tool_daemon", return_value={"message": "started"}) as daemon,
               patch.object(lifecycle, "listener_status", return_value="connecting (PID 123)"),
-              patch("subprocess.Popen") as spawn):
+              patch("subprocess.Popen") as spawn,
+              patch("os.kill") as kill,
+              patch("sys.stdout", new_callable=io.StringIO)):
             with self.assertRaisesRegex(RuntimeError, "not ready"):
                 lifecycle.start_listener(C, timeout=0)
-        self.assertTrue(spawn.call_args.kwargs["start_new_session"])
-        self.assertEqual(spawn.call_args.args[0][2], lifecycle.PREFIX + C)
-        spawn.return_value.terminate.assert_not_called()
+        daemon.assert_called_once_with("discord", "start")
+        spawn.assert_not_called()
+        kill.assert_not_called()
 
     def test_singleton_is_independent_of_account_listener(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -280,6 +342,7 @@ class ChannelLifecycleTests(unittest.TestCase):
 
     def test_stop_only_signals_owned_channel_worker_and_retains_registry(self):
         with (patch.object(lifecycle, "owned_pid", return_value=123),
+              patch("src.supervisor.request_reconcile", return_value=None),
               patch.object(notify, "_stop_notify_pids", return_value=([123], [])) as stop,
               patch.object(notify, "unsubscribe_external_notification") as unsubscribe,
               patch("sys.stdout", new_callable=io.StringIO)):

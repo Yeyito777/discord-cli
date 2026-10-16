@@ -35,7 +35,6 @@ TOOL_NAME = "discord"
 CONFIG_DIR = account_root()
 CONFIG_FILE = CONFIG_DIR / "notify.json"
 LISTENER_DIR = listener_dir()
-PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 
 # ─── Source and config management ─────────────────────────────────────────────
@@ -242,11 +241,6 @@ def _listener_paths():
     }
 
 
-def _write_pid_hint(pid):
-    LISTENER_DIR.mkdir(parents=True, exist_ok=True)
-    _listener_paths()["pid"].write_text(f"{pid}\n")
-
-
 def _collect_notify_pids():
     """Return all live notify gateway PIDs, preferring the PID file first."""
     paths = _listener_paths()
@@ -332,8 +326,16 @@ def _subscribe(argv, *, prog="discord notify subscribe"):
     subscription_id = subscription.get("id") or subscription.get("subscriptionId")
     suffix = f" [{subscription_id}]" if subscription_id else ""
     print(f"  Subscribed {args.conv_id} ({args.delivery}){suffix}")
-    if args.channel:
-        print(f"  Start/verify collection: discord notify start --channel {source['id'].split(':')[3]}")
+    # The supervised daemon owns every subscribed Gateway; nudge it now rather
+    # than waiting for its next poll.
+    from src.channel_notifications import ensure_daemon, start_listener
+    try:
+        if args.channel:
+            start_listener(source["id"].split(":")[3])
+        else:
+            ensure_daemon()
+    except Exception as exc:
+        print(f"  Listener: {exc}")
 
 
 def subscribe(argv):
@@ -377,6 +379,8 @@ def _unsubscribe(argv, *, prog="discord notify unsubscribe"):
             tool_name=TOOL_NAME, source_id=source["id"], conv_id=args.conv_id
         )
         print(f"  Unsubscribed: {args.conv_id}")
+    from src.supervisor import request_reconcile
+    request_reconcile()  # the last unsubscribe stops a channel Gateway
 
 
 def unsubscribe(argv):
@@ -446,8 +450,8 @@ def list_config(argv):
 
     print(f"  Source: {source['label']} ({source['id']})")
     if args.channel:
-        from src.channel_notifications import listener_status
-        print(f"  Listener: {listener_status(source['id'].split(':')[3])}")
+        from src.channel_notifications import daemon_status, listener_status
+        print(f"  Listener: {listener_status(source['id'].split(':')[3])}, {daemon_status()}")
     print("  Subscriptions:")
     if subscriptions:
         for subscription in sorted(
@@ -478,6 +482,16 @@ def list_config(argv):
         print("    (none)")
 
 
+def _enabled_subscriptions(source):
+    return [
+        subscription
+        for subscription in list_external_notification_subscriptions(
+            tool_name=TOOL_NAME, source_id=source["id"]
+        )
+        if isinstance(subscription, dict) and subscription.get("enabled") is not False
+    ]
+
+
 def start(argv):
     p = argparse.ArgumentParser(
         prog="discord notify start", description="Start the notification listener."
@@ -486,6 +500,11 @@ def start(argv):
     args = p.parse_args(argv)
     source = _source_for_args(args, p, validate=True)
     if args.channel:
+        if not _enabled_subscriptions(source):
+            raise RuntimeError(
+                f"No enabled subscription for {source['id']}. Channel listeners follow "
+                "subscriptions: run 'discord notify subscribe CONV --channel ...' instead."
+            )
         from src.channel_notifications import start_listener
         start_listener(source["id"].split(":")[3])
         return
@@ -494,6 +513,10 @@ def start(argv):
     if alias == supervised_notify_alias():
         status = manage_external_tool_daemon(TOOL_NAME, "start")
         print(f"  {status.get('message', 'Requested start for supervised Discord daemon')}")
+    elif _enabled_subscriptions(source):
+        from src.channel_notifications import ensure_daemon
+        ensure_daemon()
+        print("  The Discord daemon runs this account's gateway while it has subscriptions")
     else:
         from src.listening import _start_notify_listener
         _start_notify_listener()
@@ -507,6 +530,12 @@ def stop(argv):
     args = p.parse_args(argv)
     source = _source_for_args(args, p)
     if args.channel:
+        remaining = _enabled_subscriptions(source)
+        if remaining:
+            raise RuntimeError(
+                f"{len(remaining)} subscription(s) keep this channel listener running; "
+                "unsubscribe them to stop it."
+            )
         from src.channel_notifications import stop_listener
         stop_listener(source["id"].split(":")[3])
         return
@@ -526,29 +555,21 @@ def stop(argv):
 
 
 def _run_daemon_mode(argv):
-    if len(argv) > 1:
-        raise SystemExit("usage: python -m src.notify __daemon__ [log_file]")
-    log_file = argv[0] if argv else str(LISTENER_DIR / "__notify__.log")
-    gateway_script = PROJECT_DIR / "src" / "gateway.py"
+    if argv:
+        raise SystemExit("usage: python -m src.notify __daemon__")
 
     # Complete the registry migration before starting a publisher.  On any IPC
     # failure exocortexd's supervisor retries this process, while notify.json
     # remains an authoritative migration marker.
     _migrate_relay_targets()
 
-    while True:
-        existing = [pid for pid in _find_notify_gateway_pids() if pid != os.getpid()]
-        if existing:
-            _stopped, alive = _stop_notify_pids(existing)
-            if alive:
-                _write_pid_hint(alive[0])
-                time.sleep(5)
-                continue
+    from src.accounts import LEGACY_CREDENTIALS_FILE
+    from src.supervisor import Supervisor
 
-        os.execv(
-            sys.executable,
-            [sys.executable, str(gateway_script), "__notify__", str(log_file)],
-        )
+    alias = selected_alias(required=False)
+    if alias is None and LEGACY_CREDENTIALS_FILE.exists():
+        alias = "legacy"
+    Supervisor(alias).run()
 
 
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
@@ -572,10 +593,11 @@ def _print_help():
     print("  unsubscribe CONV_ID | --subscription-id ID  Remove the account subscription")
     print("  list                                      Show subscriptions and local labels")
     print("  label USER_ID [LABEL]                     Manage local sender labels")
-    print("  start | stop                              Manage the notification gateway")
+    print("  start | stop                              Manage the notification daemon")
     print("  add | remove                              Aliases for subscribe/unsubscribe")
     print("  subscribe/unsubscribe/list/start/stop: --channel ID|NAME [--guild ID|NAME]")
-    print("  No --channel: existing account-wide DMs/@mentions. Channel start is explicit.")
+    print("  No --channel: account-wide DMs/@mentions. The Discord daemon runs a channel")
+    print("  listener while it has an enabled subscription; start only waits for it.")
 
 
 def dispatch(cmd, argv):

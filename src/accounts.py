@@ -159,18 +159,8 @@ def account_config_path(name: str, alias: str | None = None) -> Path:
     return account_root(alias) / name
 
 
-def listener_dir(alias: str | None = None) -> Path:
-    if alias is None:
-        alias = selected_alias(required=False)
-    safe = "legacy" if alias is None else normalize_alias(alias)
-    runtime_home = os.environ.get("XDG_RUNTIME_DIR", "").strip()
-    if runtime_home:
-        base = Path(runtime_home) / "discord-cli"
-    else:
-        base = Path("/tmp") / f"discord-cli-{os.getuid()}"
-    config_id = hashlib.sha256(str(CONFIG_ROOT.resolve()).encode()).hexdigest()[:12]
-    path = base / config_id / safe
-    for directory in (base, base / config_id, path):
+def _private_runtime_dirs(*directories: Path) -> None:
+    for directory in directories:
         if directory.is_symlink():
             raise AccountError(f"Refusing symlinked Discord runtime directory: {directory}")
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -178,6 +168,26 @@ def listener_dir(alias: str | None = None) -> Path:
         if stat.st_uid != os.getuid():
             raise AccountError(f"Discord runtime directory is owned by another user: {directory}")
         os.chmod(directory, 0o700)
+
+
+def runtime_root() -> Path:
+    """Private runtime directory shared by every account of this config root."""
+    runtime_home = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime_home:
+        base = Path(runtime_home) / "discord-cli"
+    else:
+        base = Path("/tmp") / f"discord-cli-{os.getuid()}"
+    config_id = hashlib.sha256(str(CONFIG_ROOT.resolve()).encode()).hexdigest()[:12]
+    _private_runtime_dirs(base, base / config_id)
+    return base / config_id
+
+
+def listener_dir(alias: str | None = None) -> Path:
+    if alias is None:
+        alias = selected_alias(required=False)
+    safe = "legacy" if alias is None else normalize_alias(alias)
+    path = runtime_root() / safe
+    _private_runtime_dirs(path)
     return path
 
 

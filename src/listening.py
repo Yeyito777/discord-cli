@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from src.accounts import listener_dir
+from src.channel_notifications import PREFIX as CHANNEL_NOTIFY_PREFIX
 from src.private_channels import (
     private_channel_label_for_type,
     private_channel_listener_label,
@@ -279,6 +280,8 @@ def _stop_all():
 
     count = 0
     for pid_file in LISTENER_DIR.glob("*.pid"):
+        if pid_file.stem.startswith(CHANNEL_NOTIFY_PREFIX):
+            continue  # owned by the Discord daemon; follows subscriptions
         pid = int(pid_file.read_text().strip())
         if not _is_our_gateway_pid(pid):
             pid_file.unlink(missing_ok=True)
@@ -376,6 +379,8 @@ def listeners(argv):
 
         if ch_type == "notify":
             label = "🔔 Notifications (DMs + @mentions)"
+        elif channel_id.startswith(CHANNEL_NOTIFY_PREFIX):
+            label = f"🔔 Channel {channel_id[len(CHANNEL_NOTIFY_PREFIX):]} (subscribed)"
         elif ch_type in {"dm", "group_dm"}:
             label = private_channel_label_for_type(ch_type, name)
         else:

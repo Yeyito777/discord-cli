@@ -118,6 +118,7 @@ class GatewayListener:
         self._notified_calls = set()  # channel IDs with an active incoming-call notification
         self._call_event_baseline_until = 0.0  # suppress call-state hydration after READY
         self._notify_lock_fd = None
+        self._failed_connects = 0  # reconnect attempts since the last READY/RESUMED
 
         # Notification IPC publisher queue (notify mode only).
         self._notification_queue = []
@@ -221,7 +222,13 @@ class GatewayListener:
     # ─── Main loop ───────────────────────────────────────────────────────────
 
     def run(self):
-        """Register the source, then connect and run until stopped."""
+        """Register the source, then connect and run until stopped.
+
+        Reconnects forever.  Consecutive attempts that never reach READY or
+        RESUMED (network down, exocortexd restarting, channel inaccessible)
+        back off up to about a minute instead of re-identifying every few
+        seconds.
+        """
         while self.running:
             try:
                 self._channel_notify_state("connecting")
@@ -233,7 +240,12 @@ class GatewayListener:
                 self._log(f"Error: {e}")
             self._channel_notify_state("reconnecting" if self.running else "stopped")
             if self.running:
-                self._stopping.wait(random.uniform(1, 5))
+                self._stopping.wait(self._reconnect_delay())
+
+    def _reconnect_delay(self):
+        failures = getattr(self, "_failed_connects", 0)
+        self._failed_connects = failures + 1
+        return min(60, random.uniform(1, 5) * 2 ** min(failures, 4))
 
     def _channel_notify_state(self, status):
         files = getattr(self, "_channel_notify_paths", None)
@@ -469,12 +481,14 @@ class GatewayListener:
                 self._write(f"--- Listening for DMs and @mentions as {name} ---\n\n")
             else:
                 self._write(f"--- Listening as {name} · channel {self.channel_id} ---\n\n")
+            self._failed_connects = 0
             return
 
         if event_type == "RESUMED":
             if getattr(self, "notification_channel", None):
                 self._subscribe_notification_channel()
             self._channel_notify_state("ready")
+            self._failed_connects = 0
             return
 
         if self.channel_id == "__notify__" or getattr(self, "notification_channel", None):
