@@ -7,6 +7,51 @@ in `config/` (override with `DISCORD_CONFIG_DIR`), which is not tracked by git.
 
 Tests: `.venv/bin/python3 -m unittest discover -s tests -t .`
 
+## Notifications
+
+Exocortex owns routing: `discord notify subscribe CONV [--channel ID --guild G]`
+creates a core subscription to one of two sources per account,
+`account:<alias>:notifications` (DMs and @mentions) or
+`account:<alias>:channel:<id>:messages` (every new post in one server channel).
+
+The supervised daemon (manifest `daemon`, `python -m src.notify __daemon__`,
+see `src/supervisor.py`) owns every Gateway that collects them. It reads the
+core subscription registry at start, every 15 s, and at once on SIGHUP (the CLI
+sends one after subscribe/unsubscribe/start). It runs:
+
+- the DMs/@mentions Gateway of the supervised account (`discord account notify`),
+  always, and of any other account while it has an enabled subscription;
+- one `__channel_notify__<id>` Gateway per subscribed channel and account,
+  stopped after the last unsubscribe.
+
+Each Gateway is a child process with its own `DISCORD_ACCOUNT` and keeps its
+per-account/channel singleton lock, so there is exactly one collector per
+source. A Gateway that exits is restarted with backoff (1 s up to 60 s), and a
+copy started outside the daemon is replaced. Gateways reconnect through network
+drops themselves, backing off while connects keep failing. exocortexd restarts
+the daemon, and kills its whole process group on stop, so nothing depends on
+the process that ran the CLI.
+
+```sh
+discord -a ALIAS notify subscribe CONV --channel ID --guild G   # waits for "ready"
+discord -a ALIAS notify list --channel ID --guild G             # Listener: ready (PID …), supervised by …
+discord -a ALIAS notify unsubscribe CONV --channel ID           # last one stops the listener
+```
+
+`notify start --channel` only nudges the daemon and waits for a subscribed
+channel to be ready; `notify stop --channel` refuses while subscriptions remain.
+`notify start|stop` without `--channel`, for the supervised account, starts or
+stops the whole daemon, channel listeners included. Runtime files (PID, lock,
+state, log, err) live in `$XDG_RUNTIME_DIR/discord-cli/<config-hash>/<alias>/`,
+and the daemon's PID in `supervisor.pid` one level up. Daemon logs go to
+`config/service.log`.
+
+Don't rely on a process started from an Exocortex turn to outlive it. Each turn
+runs in a transient systemd unit, and its whole cgroup, `setsid` children
+included, is killed when the turn ends. So `discord listen` from a turn lasts
+only as long as that turn, and a hand-run `gateway.py` is not a durable
+listener; subscribe instead.
+
 ## GIFs
 
 `discord gifs` finds GIFs the way Discord's own GIF picker does, and keeps a

@@ -61,10 +61,12 @@ class NotifyTests(unittest.TestCase):
                 "subscribe_external_notification",
                 return_value={"id": "sub-1"},
             ) as subscribe,
+            patch("src.channel_notifications.ensure_daemon") as nudge,
             patch("sys.stdout", new_callable=io.StringIO) as stdout,
         ):
             notify.subscribe(["conv-1"])
 
+        nudge.assert_called_once_with()
         subscribe.assert_called_once_with(
             "discord",
             SOURCE["id"],
@@ -79,6 +81,8 @@ class NotifyTests(unittest.TestCase):
             patch.object(notify, "notification_source", return_value=SOURCE),
             patch.object(notify, "subscribe_external_notification", return_value={}) as subscribe,
             patch.object(notify, "unsubscribe_external_notification", return_value=[]) as unsubscribe,
+            patch("src.channel_notifications.ensure_daemon"),
+            patch("src.supervisor.request_reconcile"),
             patch("sys.stdout", new_callable=io.StringIO),
         ):
             notify.dispatch("notify", ["add", "conv-1", "--delivery", "inbox"])
