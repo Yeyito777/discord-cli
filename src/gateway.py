@@ -421,10 +421,14 @@ class GatewayListener:
                 ws_op, data = self.ws.recv_data()
             except websocket.WebSocketTimeoutException:
                 continue   # timeout is expected — lets signals run
-            except (ConnectionError, websocket.WebSocketException, OSError):
+            except (ConnectionError, websocket.WebSocketException, OSError) as e:
+                if self.running:
+                    self._log(f"Connection lost: {e or type(e).__name__}")
                 return
 
             if ws_op == 8:   # close frame
+                code = int.from_bytes(data[:2], "big") if len(data) >= 2 else None
+                self._log(f"Gateway closed the connection (code {code})")
                 return
 
             data = self._decompress(data)
@@ -444,8 +448,10 @@ class GatewayListener:
             elif op == 10:   # Hello (mid-session)
                 self.heartbeat_interval = event["d"]["heartbeat_interval"]
             elif op == 7:    # Reconnect requested
+                self._log("Gateway requested a reconnect")
                 return
             elif op == 9:    # Invalid session
+                self._log("Gateway invalidated the session")
                 self.session_id = None
                 time.sleep(random.uniform(1, 5))
                 return
