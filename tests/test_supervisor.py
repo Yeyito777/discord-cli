@@ -59,6 +59,7 @@ class SupervisorTestCase(unittest.TestCase):
             ("listener_dir", listener_dir),
             ("runtime_root", lambda: root),
             ("_log", lambda message: None),
+            ("START_SPACING_SECONDS", 0.0),
         ]:
             patcher = patch.object(supervisor, target, value)
             patcher.start()
@@ -173,6 +174,21 @@ class SupervisorLifecycleTests(SupervisorTestCase):
         sup._reconcile_now()
         sup.step(101.0)
         self.assertEqual(set(sup.gateways), {("paramount", "__notify__"), ("paramount", PREFIX + A)})
+
+    def test_starts_are_spaced_out_account_gateway_first(self):
+        self.subscriptions = [channel("paramount", A), channel("paramount", B)]
+        sup = self.make()
+        with patch.object(supervisor, "START_SPACING_SECONDS", 5.0):
+            sup.step(100.0)
+            running = lambda: {key for key, gateway in sup.gateways.items() if gateway.proc}
+            self.assertEqual(running(), {("paramount", "__notify__")})
+            sup.step(104.0)
+            self.assertEqual(len(running()), 1)
+            sup.step(105.0)
+            sup.step(109.0)
+            self.assertEqual(len(running()), 2)
+            sup.step(110.0)
+            self.assertEqual(len(running()), 3)
 
     def test_registry_failure_keeps_running_listeners(self):
         self.subscriptions = [channel("paramount", A)]

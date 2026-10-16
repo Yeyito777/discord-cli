@@ -41,6 +41,9 @@ RECONCILE_SECONDS = 15.0
 BACKOFF_SECONDS = (1, 2, 5, 10, 30, 60)
 STABLE_SECONDS = 300.0
 STOP_GRACE_SECONDS = 4.0
+# Discord invalidates sessions (op 9) that identify at the same moment on one
+# account, so Gateway starts are spaced out.
+START_SPACING_SECONDS = 5.0
 
 
 def _log(message):
@@ -165,22 +168,26 @@ class Gateway:
         self.next_start = now + delay
         _log(f"{self}: {reason}; restarting in {delay}s")
 
-    def tick(self, now):
-        """Keep the process running: restart it with backoff after it exits."""
+    def tick(self, now, *, may_start=True):
+        """Keep the process running: restart it with backoff after it exits.
+
+        Returns True when it attempted a start.
+        """
         if self.proc is not None:
             code = self.proc.poll()
             if code is None:
-                return
+                return False
             self.proc = None
             self._backoff(now, f"exited with code {code}")
-        if now < self.next_start:
-            return
+        if now < self.next_start or not may_start:
+            return False
         try:
             self.start(now)
         except Exception as exc:
             self.proc = None
             self.started = now
             self._backoff(now, f"start failed: {exc}")
+        return True
 
     def terminate(self):
         if self.proc is not None and self.proc.poll() is None:
@@ -208,6 +215,7 @@ class Supervisor:
         self.running = True
         self.reconcile_requested = True
         self.next_reconcile = 0.0
+        self.next_spawn = 0.0
 
     def refresh(self):
         """Re-read the authoritative registries; keep the last good view on failure."""
@@ -229,12 +237,14 @@ class Supervisor:
         for gateway in retired:
             gateway.wait(time.monotonic() + STOP_GRACE_SECONDS)
             _log(f"{gateway}: stopped (no enabled subscription)")
-        for key in sorted(self.desired):
+        # DMs/@mentions first, then channels.
+        for key in sorted(self.desired, key=lambda key: (key[1] != ACCOUNT_GATEWAY, key)):
             gateway = self.gateways.get(key)
             if gateway is None:
                 registered = key[0] in self.registered
                 gateway = self.gateways[key] = Gateway(*key, registered=registered)
-            gateway.tick(now)
+            if gateway.tick(now, may_start=now >= self.next_spawn):
+                self.next_spawn = now + START_SPACING_SECONDS
 
     def shutdown(self):
         gateways = list(self.gateways.values())

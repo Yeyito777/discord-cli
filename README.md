@@ -26,8 +26,9 @@ sends one after subscribe/unsubscribe/start). It runs:
 
 Each Gateway is a child process with its own `DISCORD_ACCOUNT` and keeps its
 per-account/channel singleton lock, so there is exactly one collector per
-source. A Gateway that exits is restarted with backoff (1 s up to 60 s), and a
-copy started outside the daemon is replaced. Gateways reconnect through network
+source. Starts are spaced 5 s apart, because Discord invalidates sessions that
+identify at the same moment. A Gateway that exits is restarted with backoff
+(1 s up to 60 s), and a copy started outside the daemon is replaced. Gateways reconnect through network
 drops themselves, backing off while connects keep failing. exocortexd restarts
 the daemon, and kills its whole process group on stop, so nothing depends on
 the process that ran the CLI.
