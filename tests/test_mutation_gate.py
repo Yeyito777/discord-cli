@@ -1,3 +1,4 @@
+import http.client
 import json
 import os
 import tempfile
@@ -76,3 +77,69 @@ class MutationGateTests(unittest.TestCase):
         api.refresh_attachment_urls(["https://cdn.discordapp.com/attachments/1/2/a.gif"])
         api.get("/users/@me")
         self.assertEqual(conn.request.call_count, 2)
+
+
+class SendIdempotencyTests(unittest.TestCase):
+    """A send is never repeated automatically; the client nonce dedupes."""
+
+    def setUp(self):
+        for item in (
+            patch.object(api, "_headers", return_value={"Authorization": "test-token"}),
+            patch("src.accounts.ensure_mutation_allowed"),
+            patch("src.accounts.audit_event"),
+            patch("src.typing_keeper.stop_quietly"),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def connection(self, first_error):
+        class Conn:
+            sock = None
+            requests = []
+
+            def request(self, method, url, data, headers):
+                Conn.requests.append(data)
+
+            def getresponse(self):
+                if len(Conn.requests) == 1 and first_error:
+                    raise first_error
+                return Mock(status=200, read=Mock(return_value=b'{"id": "77"}'))
+
+            def close(self):
+                pass
+
+        conn = Conn()
+        patcher = patch.object(api, "_get_connection", return_value=[conn, True, 0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return conn
+
+    def test_timeout_after_sending_is_reported_unknown_not_resent(self):
+        conn = self.connection(TimeoutError("timed out"))
+        with self.assertRaisesRegex(api.UnknownOutcome, "Outcome unknown"):
+            api.send_message("123456789012345678", "hello once")
+        self.assertEqual(len(conn.requests), 1)
+
+    def test_uploads_are_not_resent_either(self):
+        conn = self.connection(ConnectionResetError("reset"))
+        with tempfile.NamedTemporaryFile(suffix=".txt") as f:
+            f.write(b"data")
+            f.flush()
+            with self.assertRaises(api.UnknownOutcome):
+                api.send_message_with_files("1", [f.name], content="hi")
+        self.assertEqual(len(conn.requests), 1)
+
+    def test_messages_carry_a_fresh_enforced_nonce(self):
+        conn = self.connection(None)
+        api.send_message("1", "a")
+        api.send_message("1", "b")
+        bodies = [json.loads(body) for body in conn.requests]
+        self.assertTrue(all(body["enforce_nonce"] is True for body in bodies))
+        self.assertNotEqual(bodies[0]["nonce"], bodies[1]["nonce"])
+        self.assertTrue(all(body["nonce"].isdigit() for body in bodies))
+
+    def test_idempotent_requests_still_reconnect_once(self):
+        conn = self.connection(http.client.RemoteDisconnected("stale keepalive"))
+        with patch.object(api.http.client, "HTTPSConnection", return_value=conn):
+            api.get("/users/@me")
+        self.assertEqual(len(conn.requests), 2)

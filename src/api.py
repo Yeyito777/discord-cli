@@ -314,11 +314,25 @@ def _maybe_retry_with_vimbrowser_captcha(
 
 
 _READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+# Only requests that are safe to repeat are re-sent after a dropped keepalive.
+# A POST (send, reply, thread, interaction) that may have reached Discord is
+# never repeated: its outcome is reported as unknown instead.
+_RETRYABLE_METHODS = _READ_METHODS | {"PUT", "PATCH", "DELETE"}
+DISCORD_EPOCH_MS = 1_420_070_400_000
+
+
+def new_nonce():
+    """A snowflake-shaped nonce, as the client sends with every message."""
+    return str((int(time.time() * 1000) - DISCORD_EPOCH_MS) << 22 | uuid.uuid4().int % (1 << 22))
+
+
+class UnknownOutcome(RuntimeError):
+    """The request was sent but no answer arrived; Discord may have applied it."""
 
 
 def _request(method, path, body=None, body_bytes=None, token=None, params=None,
              extra_headers=None, allow_captcha_fallback=True,
-             retry_connection_failure=True, audit=True, mutating=None):
+             retry_connection_failure=None, audit=True, mutating=None):
     """Make an API request with connection pooling. Returns parsed JSON.
 
     ``audit=False`` skips the mutation receipt for non-GET requests that do not
@@ -333,6 +347,8 @@ def _request(method, path, body=None, body_bytes=None, token=None, params=None,
     if mutating:
         from src.accounts import ensure_mutation_allowed
         ensure_mutation_allowed(f"{method.upper()} {path}")
+    if retry_connection_failure is None:
+        retry_connection_failure = method.upper() in _RETRYABLE_METHODS
 
     url = f"{API_BASE}{path}"
 
@@ -348,9 +364,11 @@ def _request(method, path, body=None, body_bytes=None, token=None, params=None,
     entry = _get_connection()
     conn = entry[0]
 
+    sent = False
     try:
         try:
             conn.request(method, url, data, headers)
+            sent = True
             resp = conn.getresponse()
             raw = resp.read()
         except (BrokenPipeError, ConnectionResetError, http.client.RemoteDisconnected, TimeoutError) as e:
@@ -362,9 +380,9 @@ def _request(method, path, body=None, body_bytes=None, token=None, params=None,
                 with _pool_lock:
                     if entry in _pool:
                         _pool.remove(entry)
-                raise RuntimeError(
-                    "Network failure after sending a non-idempotent Discord request; "
-                    "Discord may have accepted it. Verify before retrying."
+                raise UnknownOutcome(
+                    f"Outcome unknown: the connection failed after sending {method.upper()} {path} "
+                    f"({type(e).__name__}); Discord may have accepted it. Check before retrying."
                 ) from e
             # Server closed keepalive — reconnect
             try:
@@ -433,6 +451,11 @@ def _request(method, path, body=None, body_bytes=None, token=None, params=None,
         with _pool_lock:
             if entry in _pool:
                 _pool.remove(entry)
+        if sent and method.upper() not in _READ_METHODS:
+            raise UnknownOutcome(
+                f"Outcome unknown: network error after sending {method.upper()} {path} ({e}); "
+                "Discord may have accepted it. Check before retrying."
+            ) from e
         raise RuntimeError(f"Network error: {e}")
 
     finally:
@@ -567,7 +590,9 @@ def _stop_typing(channel_id):
 def send_message(channel_id, content, reply_to=None, tts=False):
     """Send a message to a channel."""
     _stop_typing(channel_id)
-    body = {"content": content, "tts": tts}
+    # enforce_nonce makes Discord return the existing message instead of
+    # creating a second one if the same nonce arrives twice.
+    body = {"content": content, "tts": tts, "nonce": new_nonce(), "enforce_nonce": True, "flags": 0}
     if reply_to:
         body["message_reference"] = {"message_id": reply_to}
     return post(f"/channels/{channel_id}/messages", body=body)
@@ -587,7 +612,7 @@ def send_message_with_files(channel_id, file_paths, content=None, reply_to=None,
     boundary = f"----ExoDiscord{uuid.uuid4().hex}"
 
     # Build payload_json
-    payload = {"tts": tts}
+    payload = {"tts": tts, "nonce": new_nonce(), "enforce_nonce": True, "flags": 0}
     if content:
         payload["content"] = content
     if reply_to:
