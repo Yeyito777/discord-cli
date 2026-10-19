@@ -291,6 +291,29 @@ def _is_mutating(cmd: str, argv: list[str]) -> bool:
     }
 
 
+def ensure_mutation_allowed(action: str) -> None:
+    """Enforce account policy for one Discord write where the request is sent.
+
+    ``api._request`` calls this before any non-read request, so the rule holds
+    however a command or flag was spelled.  ``preflight`` only fails early and
+    prints the identity banner.
+    """
+    registry = load_registry()
+    if not registry["accounts"]:
+        return  # unmigrated legacy login: a single, full-access account
+    if len(registry["accounts"]) > 1 and os.environ.get(ACCOUNT_EXPLICIT_ENV) != "1":
+        raise AccountError(
+            "Multiple Discord accounts are configured; this command requires "
+            f"'-a/--account <alias>'. Nothing was sent ({action})."
+        )
+    account = selected_account()
+    if account.get("access", "read-only") != "full":
+        raise AccountError(
+            f"Discord account '{account['alias']}' is read-only. Nothing was sent ({action}). "
+            f"Run 'discord account access {account['alias']} full' to enable writes."
+        )
+
+
 def preflight(cmd: str, argv: list[str]) -> None:
     """Validate account selection/access and print an identity banner."""
     registry = load_registry()

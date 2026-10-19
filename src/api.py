@@ -313,16 +313,26 @@ def _maybe_retry_with_vimbrowser_captcha(
     return True, replay.body
 
 
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
 def _request(method, path, body=None, body_bytes=None, token=None, params=None,
              extra_headers=None, allow_captcha_fallback=True,
-             retry_connection_failure=True, audit=True):
+             retry_connection_failure=True, audit=True, mutating=None):
     """Make an API request with connection pooling. Returns parsed JSON.
 
     ``audit=False`` skips the mutation receipt for non-GET requests that do not
-    change Discord state (e.g. attachment URL refreshes).
+    change Discord state (e.g. attachment URL refreshes).  Every request that
+    may change Discord state (``mutating``, default: any non-read method) must
+    pass the account policy first; nothing is sent otherwise.
     """
     if body is not None and body_bytes is not None:
         raise ValueError("Provide either body or body_bytes, not both")
+    if mutating is None:
+        mutating = method.upper() not in _READ_METHODS
+    if mutating:
+        from src.accounts import ensure_mutation_allowed
+        ensure_mutation_allowed(f"{method.upper()} {path}")
 
     url = f"{API_BASE}{path}"
 
@@ -699,6 +709,7 @@ def refresh_attachment_urls(urls):
             body={"attachment_urls": urls[i:i + 50]},
             audit=False,
             allow_captcha_fallback=False,
+            mutating=False,
         )
         for item in (data or {}).get("refreshed_urls", []):
             result[item.get("original")] = item.get("refreshed")
