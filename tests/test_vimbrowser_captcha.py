@@ -176,6 +176,12 @@ class VimbrowserCaptchaTests(unittest.TestCase):
 
 
 class ApiCaptchaFallbackTests(unittest.TestCase):
+    def setUp(self):
+        # Never read the real account registry or token.
+        headers = patch.object(api, "_headers", return_value={"Authorization": "test-token"})
+        headers.start()
+        self.addCleanup(headers.stop)
+
     def test_replays_request_in_vimbrowser_and_returns_response(self):
         raw = json.dumps(CAPTCHA_PAYLOAD).encode()
         with (
