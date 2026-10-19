@@ -30,18 +30,10 @@ if str(PROJECT_DIR) not in sys.path:
 
 import websocket
 
+from src import fingerprint
 from src.accounts import listener_dir, selected_account
 
-# ─── Client fingerprint (matches api.py) ─────────────────────────────────────
-
-_CLIENT_VERSION = "0.0.115"
-_ELECTRON_VERSION = "37.6.0"
-_CHROME_VERSION = "138.0.7204.251"
-_USER_AGENT = (
-    f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    f"(KHTML, like Gecko) discord/{_CLIENT_VERSION} "
-    f"Chrome/{_CHROME_VERSION} Electron/{_ELECTRON_VERSION} Safari/537.36"
-)
+_USER_AGENT = fingerprint.USER_AGENT
 
 GATEWAY_HOST = "discord.com"
 ZLIB_SUFFIX = b"\x00\x00\xff\xff"
@@ -50,23 +42,61 @@ NOTIFY_LISTENER_DIR = listener_dir()
 NOTIFY_LOCK_PATH = NOTIFY_LISTENER_DIR / "__notify__.lock"
 NOTIFY_PID_PATH = NOTIFY_LISTENER_DIR / "__notify__.pid"
 NOTIFICATION_SEEN_LIMIT = 200
+# Close codes after which reconnecting with the same token cannot work:
+# 4004 authentication failed (token revoked or changed), 4010 invalid shard,
+# 4011 sharding required, 4012 invalid API version, 4013/4014 invalid or
+# disallowed intents.  Identifying again only adds failed logins.
+FATAL_CLOSE_CODES = {4004, 4010, 4011, 4012, 4013, 4014}
+CREDENTIALS_RECHECK_SECONDS = 60
+PRESENCE_STATUSES = {"online", "idle", "dnd", "invisible"}
 
-# ─── Build number ────────────────────────────────────────────────────────────
-
-_build_number = None
+# ─── Account status setting ─────────────────────────────────────────────────
 
 
-def _get_build_number():
-    """Fetch Discord's current client build number (cached)."""
-    global _build_number
-    if _build_number is not None:
-        return _build_number
+def _protobuf_fields(data):
+    """Top-level (field number, value) pairs of a protobuf message."""
+    i, out = 0, []
+
+    def varint():
+        nonlocal i
+        result = shift = 0
+        while True:
+            byte = data[i]
+            i += 1
+            result |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                return result
+
+    while i < len(data):
+        key = varint()
+        number, wire = key >> 3, key & 7
+        if wire == 0:
+            value = varint()
+        elif wire == 1:
+            value, i = data[i:i + 8], i + 8
+        elif wire == 2:
+            length = varint()
+            value, i = data[i:i + length], i + length
+        elif wire == 5:
+            value, i = data[i:i + 4], i + 4
+        else:
+            raise ValueError(f"unsupported protobuf wire type {wire}")
+        out.append((number, value))
+    return out
+
+
+def settings_status(proto_b64):
+    """PreloadedUserSettings.status.status (online/idle/dnd/invisible), or None."""
+    import base64
+
     try:
-        from src.api import _get_build_number as _api_build
-        _build_number = _api_build()
-    except Exception:
-        _build_number = 510733
-    return _build_number
+        settings = _protobuf_fields(base64.b64decode(proto_b64 or ""))
+        status_settings = next(v for n, v in settings if n == 11)          # StatusSettings
+        wrapper = next(v for n, v in _protobuf_fields(status_settings) if n == 1)  # StringValue
+        return next(v for n, v in _protobuf_fields(wrapper) if n == 1).decode()
+    except (StopIteration, ValueError, IndexError, TypeError, UnicodeDecodeError):
+        return None
 
 
 # ─── Gateway listener ────────────────────────────────────────────────────────
@@ -230,6 +260,7 @@ class GatewayListener:
         seconds.
         """
         while self.running:
+            self._close_code = None
             try:
                 self._channel_notify_state("connecting")
                 if self.notification_source:
@@ -238,9 +269,46 @@ class GatewayListener:
                 self._receive_loop()
             except Exception as e:
                 self._log(f"Error: {e}")
+            if self.running and self._close_code in FATAL_CLOSE_CODES:
+                self._wait_for_new_credentials(self._close_code)
+                continue
             self._channel_notify_state("reconnecting" if self.running else "stopped")
             if self.running:
                 self._stopping.wait(self._reconnect_delay())
+
+    def _credentials_mtime(self):
+        from src.accounts import credentials_file
+
+        try:
+            alias = (self.account or {}).get("alias")
+            path = credentials_file(None if alias in (None, "legacy") else alias)
+            return path.stat().st_mtime_ns
+        except (OSError, RuntimeError):
+            return None
+
+    def _wait_for_new_credentials(self, code):
+        """Stop identifying with a token Discord rejected until it is replaced."""
+        alias = (self.account or {}).get("alias", "?")
+        self._log(
+            f"Discord rejected this session for good (close code {code}); not reconnecting "
+            f"until the token changes ('discord -a {alias} login')"
+        )
+        self._channel_notify_state("token-rejected")
+        self.session_id = None
+        rejected = self._credentials_mtime()
+        while self.running and self._credentials_mtime() == rejected:
+            self._stopping.wait(CREDENTIALS_RECHECK_SECONDS)
+        if not self.running:
+            return
+        from src.auth import get_token
+
+        try:
+            self.token = get_token()
+        except RuntimeError as e:
+            self._log(f"Could not read the new token: {e}")
+            return
+        self._failed_connects = 0
+        self._log("Token changed; reconnecting")
 
     def _reconnect_delay(self):
         failures = getattr(self, "_failed_connects", 0)
@@ -320,46 +388,20 @@ class GatewayListener:
                 "token": self.token,
                 "capabilities": DEFAULT_CAPABILITIES,
                 "properties": self._build_properties(),
+                # "unknown" lets Discord apply the account's own status
+                # setting (Invisible, Idle, DND), as other clients do by
+                # default; "online" here made an Invisible user show online.
                 "presence": {
                     "activities": [],
-                    "status": "online",
-                    "since": None,
+                    "status": "unknown",
+                    "since": 0,
                     "afk": False,
                 },
             },
         })
 
     def _build_properties(self):
-        try:
-            os_ver = subprocess.check_output(["uname", "-r"], text=True).strip()
-        except Exception:
-            os_ver = ""
-        locale = os.environ.get("LC_ALL") or os.environ.get("LANG")
-        locale = locale.split(".")[0] if locale else "en_US"
-
-        return {
-            "os": "Linux",
-            "browser": "Discord Client",
-            "release_channel": "stable",
-            "os_version": os_ver,
-            "os_arch": "x64",
-            "app_arch": "x64",
-            "system_locale": locale,
-            "has_client_mods": False,
-            "browser_user_agent": _USER_AGENT,
-            "browser_version": "",
-            "runtime_environment": "native",
-            "client_build_number": _get_build_number(),
-            "native_build_number": None,
-            "client_event_source": None,
-            "client_launch_id": str(uuid.uuid4()),
-            "client_heartbeat_session_id": str(uuid.uuid4()),
-            "client_version": _CLIENT_VERSION,
-            "window_manager": (
-                f"{os.environ.get('XDG_CURRENT_DESKTOP', 'unknown')},"
-                f"{os.environ.get('GDMSESSION', 'unknown')}"
-            ),
-        }
+        return fingerprint.super_properties()
 
     # ─── Heartbeat ───────────────────────────────────────────────────────────
 
@@ -429,6 +471,7 @@ class GatewayListener:
             if ws_op == 8:   # close frame
                 code = int.from_bytes(data[:2], "big") if len(data) >= 2 else None
                 self._log(f"Gateway closed the connection (code {code})")
+                self._close_code = code
                 return
 
             data = self._decompress(data)
@@ -473,6 +516,7 @@ class GatewayListener:
             self.session_id = d["session_id"]
             self.resume_url = d.get("resume_gateway_url")
             self.my_id = d["user"]["id"]
+            self._log_presence(d)
             name = d["user"].get("global_name") or d["user"]["username"]
             if getattr(self, "notification_channel", None):
                 self._build_name_maps(d)
@@ -501,6 +545,16 @@ class GatewayListener:
             self._on_notify(event_type, d)
         else:
             self._on_channel(event_type, d)
+
+    def _log_presence(self, ready):
+        """Record the account's status setting and what Discord shows for this session."""
+        setting = settings_status(ready.get("user_settings_proto"))
+        shown = next(
+            (s.get("status") for s in ready.get("sessions") or []
+             if isinstance(s, dict) and s.get("session_id") == self.session_id),
+            None,
+        )
+        self._log(f"Presence: account setting {setting or 'unset'}, this session {shown or 'not listed'}")
 
     def _subscribe_notification_channel(self):
         """Enable the user Gateway guild stream on identify and resume.

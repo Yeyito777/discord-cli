@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import sys
 
 from src import api
 from src import format as fmt
@@ -157,8 +158,14 @@ def threads(argv):
     g = resolve_guild(args.server)
     data = api.get_active_threads(g["id"])
     thread_list = data.get("threads", [])
+    failed = data.get("failed") or []
+    if failed:
+        names = ", ".join(f"#{ch.get('name', ch.get('id'))}" for ch, _error in failed[:5])
+        more = f" and {len(failed) - 5} more" if len(failed) > 5 else ""
+        print(f"  Warning: could not list threads in {len(failed)} channel(s) ({names}{more}); "
+              f"first error: {failed[0][1]}", file=sys.stderr)
     if not thread_list:
-        print("  No active threads.")
+        print("  No active threads." + (" (list incomplete)" if failed else ""))
         return
     lines = []
     for t in thread_list:

@@ -4,6 +4,7 @@ import json
 import sys
 from urllib import error, request
 
+from src import fingerprint
 from src.accounts import (
     credentials_file,
     read_token,
@@ -13,11 +14,6 @@ from src.accounts import (
 )
 
 API_ME_URL = "https://discord.com/api/v9/users/@me"
-VALIDATION_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) discord/0.0.115 "
-    "Chrome/138.0.7204.251 Electron/37.6.0 Safari/537.36"
-)
 
 
 class AuthError(RuntimeError):
@@ -68,11 +64,7 @@ def validate_token(token):
 
     req = request.Request(
         API_ME_URL,
-        headers={
-            "Accept": "application/json",
-            "Authorization": token,
-            "User-Agent": VALIDATION_USER_AGENT,
-        },
+        headers=fingerprint.rest_headers(token),
         method="GET",
     )
 

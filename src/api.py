@@ -1,10 +1,7 @@
 """Discord REST API client — mirrors Discord desktop client requests.
 
-Impersonates the Discord desktop client (Electron) rather than the web client.
-This avoids cookie/TLS fingerprint mismatches that come with pretending to be
-a browser. Uses http.client for keepalive connection pooling.
-
-Header fingerprinting based on endcord (https://github.com/sparklost/endcord).
+Presents the Discord desktop client identity from ``fingerprint``.  Uses
+http.client for keepalive connection pooling.
 """
 
 import base64
@@ -19,107 +16,13 @@ import time
 import urllib.parse
 import uuid
 
+from src import fingerprint
 from src.auth import get_token
 
 API_HOST = "discord.com"
 API_BASE = "/api/v9"
 
-# ─── Desktop client fingerprint ──────────────────────────────────────────────
-# Mimics the Discord desktop client (Electron) on Linux.
-# This is what endcord uses and it's less suspicious than pretending to be
-# a browser, because there are no cookies or TLS fingerprint to mismatch.
-
-_CLIENT_VERSION = "0.0.115"
-_ELECTRON_VERSION = "37.6.0"
-_CHROME_VERSION = "138.0.7204.251"
-_USER_AGENT = (
-    f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    f"(KHTML, like Gecko) discord/{_CLIENT_VERSION} "
-    f"Chrome/{_CHROME_VERSION} Electron/{_ELECTRON_VERSION} Safari/537.36"
-)
-
-# ─── Build number ────────────────────────────────────────────────────────────
-
-_build_number = None
-
-
-def _get_build_number():
-    """Fetch Discord's current client build number from their JS bundle."""
-    global _build_number
-    if _build_number is not None:
-        return _build_number
-
-    try:
-        conn = http.client.HTTPSConnection(API_HOST, 443, timeout=10)
-        conn.request("GET", "/app", headers={"User-Agent": _USER_AGENT})
-        resp = conn.getresponse()
-        html = resp.read().decode("utf-8", errors="replace")
-        conn.close()
-
-        match = re.search(r'src="/assets/(web\.[a-f0-9]+\.js)"', html)
-        if not match:
-            _build_number = 510733
-            return _build_number
-
-        conn = http.client.HTTPSConnection(API_HOST, 443, timeout=10)
-        conn.request("GET", f"/assets/{match.group(1)}", headers={"User-Agent": _USER_AGENT})
-        resp = conn.getresponse()
-        js = resp.read().decode("utf-8", errors="replace")
-        conn.close()
-
-        match = re.search(r'buildNumber["\s:]*(\d+)', js)
-        _build_number = int(match.group(1)) if match else 510733
-    except Exception:
-        _build_number = 510733
-
-    return _build_number
-
-
-def _get_os_version():
-    """Get Linux kernel version."""
-    try:
-        return subprocess.check_output(["uname", "-r"], text=True).strip()
-    except Exception:
-        return ""
-
-
-def _get_system_locale():
-    """Get system locale."""
-    locale = os.environ.get("LC_ALL") or os.environ.get("LANG")
-    if locale:
-        return locale.split(".")[0]
-    return "en_US"
-
-
-def _build_super_properties():
-    """Build X-Super-Properties matching the Discord desktop client."""
-    props = {
-        "os": "Linux",
-        "browser": "Discord Client",
-        "release_channel": "stable",
-        "os_version": _get_os_version(),
-        "os_arch": "x64",
-        "app_arch": "x64",
-        "system_locale": _get_system_locale(),
-        "has_client_mods": False,
-        "browser_user_agent": _USER_AGENT,
-        "browser_version": "",
-        "runtime_environment": "native",
-        "client_build_number": _get_build_number(),
-        "native_build_number": None,
-        "client_event_source": None,
-        # UUIDs generated once per session, like the real client
-        "client_launch_id": str(uuid.uuid4()),
-        "client_heartbeat_session_id": str(uuid.uuid4()),
-        "client_version": _CLIENT_VERSION,
-    }
-    wm = os.environ.get("XDG_CURRENT_DESKTOP", "unknown")
-    session = os.environ.get("GDMSESSION", "unknown")
-    props["window_manager"] = f"{wm},{session}"
-
-    return base64.b64encode(
-        json.dumps(props, separators=(",", ":")).encode()
-    ).decode()
+USER_AGENT = fingerprint.USER_AGENT
 
 
 # ─── Connection pool ─────────────────────────────────────────────────────────
@@ -170,13 +73,12 @@ def _release_connection(entry):
 # ─── Headers ─────────────────────────────────────────────────────────────────
 
 _cached_token = None
-_cached_super_props = None
 _cached_headers = None
 
 
 def _headers(token=None):
     """Build request headers matching the Discord desktop client."""
-    global _cached_token, _cached_super_props, _cached_headers
+    global _cached_token, _cached_headers
 
     if token is None:
         if _cached_token is None:
@@ -186,22 +88,7 @@ def _headers(token=None):
     if _cached_headers is not None and token == _cached_token:
         return _cached_headers
 
-    if _cached_super_props is None:
-        _cached_super_props = _build_super_properties()
-
-    _cached_headers = {
-        "Accept": "*/*",
-        "Authorization": token,
-        "Content-Type": "application/json",
-        "Priority": "u=1",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "cross-site",
-        "User-Agent": _USER_AGENT,
-        "X-Super-Properties": _cached_super_props,
-        "X-Discord-Locale": "en-US",
-        "X-Discord-Timezone": "America/Chicago",
-    }
+    _cached_headers = fingerprint.rest_headers(token)
     _cached_token = token
     return _cached_headers
 
@@ -326,13 +213,41 @@ def new_nonce():
     return str((int(time.time() * 1000) - DISCORD_EPOCH_MS) << 22 | uuid.uuid4().int % (1 << 22))
 
 
+RATE_LIMIT_MAX_WAIT = 10.0
+
+
+class RateLimited(RuntimeError):
+    """Discord answered 429; the request was not processed."""
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _retry_after(resp, raw):
+    try:
+        body = json.loads(raw)
+        if isinstance(body, dict) and body.get("retry_after") is not None:
+            return max(0.0, float(body["retry_after"]))
+    except (ValueError, TypeError):
+        pass
+    for name in ("Retry-After", "X-RateLimit-Reset-After"):
+        try:
+            value = resp.getheader(name)
+            if value is not None:
+                return max(0.0, float(value))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return None
+
+
 class UnknownOutcome(RuntimeError):
     """The request was sent but no answer arrived; Discord may have applied it."""
 
 
 def _request(method, path, body=None, body_bytes=None, token=None, params=None,
              extra_headers=None, allow_captcha_fallback=True,
-             retry_connection_failure=None, audit=True, mutating=None):
+             retry_connection_failure=None, audit=True, mutating=None, _rate_limited=False):
     """Make an API request with connection pooling. Returns parsed JSON.
 
     ``audit=False`` skips the mutation receipt for non-GET requests that do not
@@ -415,6 +330,25 @@ def _request(method, path, body=None, body_bytes=None, token=None, params=None,
                 result_id = result.get("id") if isinstance(result, dict) else None
                 audit_event(f"discord-api:{method.upper()}", target=path, result_id=result_id)
             return result
+
+        if status == 429:
+            wait = _retry_after(resp, raw)
+            if not _rate_limited and wait is not None and wait <= RATE_LIMIT_MAX_WAIT:
+                # A 429 means Discord did not process the request, so one
+                # identical retry after the advised wait cannot duplicate it.
+                time.sleep(wait + 0.05)
+                return _request(
+                    method, path, body=body, body_bytes=body_bytes, token=token, params=params,
+                    extra_headers=extra_headers, allow_captcha_fallback=allow_captcha_fallback,
+                    retry_connection_failure=retry_connection_failure, audit=audit,
+                    mutating=mutating, _rate_limited=True,
+                )
+            advised = f"{wait:.1f} s" if wait is not None else "a while"
+            raise RateLimited(
+                f"Rate limited by Discord on {method.upper()} {path}; nothing was done. "
+                f"Retry after {advised}.",
+                wait,
+            )
 
         handled, result = _maybe_retry_with_vimbrowser_captcha(
             method,
@@ -829,6 +763,7 @@ def get_active_threads(guild_id):
     text_channels = [c for c in channels if c.get("type", 0) in (0, 5, 15, 16)]
 
     all_threads = []
+    failed = []
     for ch in text_channels:
         try:
             data = get(
@@ -841,10 +776,10 @@ def get_active_threads(guild_id):
                 },
             )
             all_threads.extend(data.get("threads", []))
-        except RuntimeError:
-            pass
+        except RuntimeError as e:
+            failed.append((ch, str(e)))
 
-    return {"threads": all_threads}
+    return {"threads": all_threads, "failed": failed}
 
 
 def get_thread_messages(thread_id, limit=50, before=None):
