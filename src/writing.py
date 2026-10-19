@@ -108,6 +108,7 @@ def _resolve_mentions(text, guild_id=None):
 
 def send(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord send",
         description="Send a message. Message text is read exactly from stdin.",
         epilog="Inline message arguments are not accepted. Stdin is optional only for file-only messages.",
@@ -143,6 +144,7 @@ def send(argv):
 
 def reply(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord reply",
         description="Reply to a message. Reply text is read exactly from stdin.",
         epilog="Inline reply arguments are not accepted. Stdin is optional only for file-only replies.",
@@ -178,6 +180,7 @@ def reply(argv):
 
 def edit(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord edit",
         description="Edit a message. Replacement text is read exactly from stdin.",
         epilog="Inline replacement-text arguments are not accepted; stdin is required.",
@@ -195,7 +198,7 @@ def edit(argv):
 
 
 def delete(argv):
-    p = argparse.ArgumentParser(prog="discord delete", description="Delete a message.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord delete", description="Delete a message.")
     p.add_argument("channel", help="Channel ID")
     p.add_argument("message", help="Message ID")
     args = p.parse_args(argv)
@@ -205,7 +208,7 @@ def delete(argv):
 
 
 def react(argv):
-    p = argparse.ArgumentParser(prog="discord react", description="React to a message.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord react", description="React to a message.")
     p.add_argument("channel", help="Channel ID")
     p.add_argument("message", help="Message ID")
     p.add_argument("emoji", help="Emoji (e.g. 👍 or custom_name:123456)")
@@ -216,7 +219,7 @@ def react(argv):
 
 
 def unreact(argv):
-    p = argparse.ArgumentParser(prog="discord unreact", description="Remove a reaction.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord unreact", description="Remove a reaction.")
     p.add_argument("channel", help="Channel ID")
     p.add_argument("message", help="Message ID")
     p.add_argument("emoji", help="Emoji to remove")
@@ -228,11 +231,12 @@ def unreact(argv):
 
 def thread(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord thread",
         description="Create a Discord thread.",
     )
     sub = p.add_subparsers(dest="action", required=True)
-    create = sub.add_parser("create", help="Create a thread in a server channel")
+    create = sub.add_parser("create", allow_abbrev=False, help="Create a thread in a server channel")
     create.add_argument("channel", help="Parent channel name or ID")
     create.add_argument("name", help="Thread name (1-100 characters)")
     create.add_argument(

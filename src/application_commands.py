@@ -316,6 +316,7 @@ def _guild_channel(channel_target, guild_target=None):
 
 def commands(argv):
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord commands",
         description="List Discord application commands available in a server channel.",
     )

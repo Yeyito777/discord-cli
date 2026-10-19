@@ -9,7 +9,7 @@ from src.invite import join_server
 
 
 def join(argv):
-    p = argparse.ArgumentParser(prog="discord join", description="Join a server via invite link.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord join", description="Join a server via invite link.")
     p.add_argument("invite", help="Invite link or code (e.g. discord.gg/abc123 or abc123)")
     args = p.parse_args(argv)
 
@@ -27,6 +27,7 @@ def _close_private_channel(target: str) -> None:
 
 def leave(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord leave",
         description="Leave a server, or close/leave a DM or group DM.",
     )
@@ -50,6 +51,7 @@ def leave(argv):
 
 def typing(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord typing",
         description="Show the typing indicator until this account's next send in the channel, or a timeout.",
     )
@@ -78,7 +80,7 @@ def typing(argv):
 
 
 def read(argv):
-    p = argparse.ArgumentParser(prog="discord read", description="Mark channel as read.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord read", description="Mark channel as read.")
     p.add_argument("channel", help="Channel ID")
     p.add_argument("message", nargs="?", help="Message ID to mark read up to (default: latest)")
     args = p.parse_args(argv)

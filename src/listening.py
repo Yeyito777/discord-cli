@@ -37,6 +37,7 @@ def _is_our_gateway_pid(pid):
 
 def listen(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord listen",
         description="Start listening to a channel, DM, or group DM in real-time.",
     )
@@ -197,6 +198,7 @@ def _start_notify_listener():
 
 def unlisten(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord unlisten",
         description="Stop listening to a channel, DM, or group DM.",
     )
@@ -329,6 +331,7 @@ def _resolve_target(target, guild, dm):
 
 def listeners(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord listeners",
         description="List active listeners.",
     )

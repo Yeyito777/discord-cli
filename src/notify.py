@@ -305,6 +305,7 @@ def _stop_notify_pids(pids):
 
 def _subscribe(argv, *, prog="discord notify subscribe"):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog=prog, description="Subscribe an Exocortex conversation to Discord notifications."
     )
     p.add_argument("conv_id", help="Exocortex conversation ID")
@@ -349,6 +350,7 @@ def add(argv):
 
 def _unsubscribe(argv, *, prog="discord notify unsubscribe"):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog=prog, description="Unsubscribe an Exocortex conversation from Discord notifications."
     )
     p.add_argument("conv_id", nargs="?", help="Exocortex conversation ID")
@@ -394,6 +396,7 @@ def remove(argv):
 
 def label(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord notify label",
         description="Set a local label for a Discord sender (keyed by user ID).",
     )
@@ -436,6 +439,7 @@ def _label_sort_key(item):
 
 def list_config(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord notify list",
         description="Show core subscriptions and local Discord sender labels.",
     )
@@ -494,6 +498,7 @@ def _enabled_subscriptions(source):
 
 def start(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord notify start", description="Start the notification listener."
     )
     _channel_options(p)
@@ -524,6 +529,7 @@ def start(argv):
 
 def stop(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord notify stop", description="Stop the notification listener."
     )
     _channel_options(p)

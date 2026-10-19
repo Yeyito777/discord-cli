@@ -194,6 +194,7 @@ def _fetch_message(channel_id, message_id):
 
 def download(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord download",
         description="Download attachment(s) from a Discord message.",
         epilog=(

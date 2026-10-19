@@ -10,14 +10,14 @@ from src.resolve import resolve_guild, resolve_channel, resolve_dm
 
 
 def guilds(argv):
-    p = argparse.ArgumentParser(prog="discord guilds", description="List your servers.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord guilds", description="List your servers.")
     p.parse_args(argv)
     data = api.get_guilds()
     print(fmt.format_guilds(data))
 
 
 def guild(argv):
-    p = argparse.ArgumentParser(prog="discord guild", description="Show server details.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord guild", description="Show server details.")
     p.add_argument("target", help="Server name or ID")
     args = p.parse_args(argv)
     g = resolve_guild(args.target)
@@ -26,7 +26,7 @@ def guild(argv):
 
 
 def channels(argv):
-    p = argparse.ArgumentParser(prog="discord channels", description="List channels in a server.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord channels", description="List channels in a server.")
     p.add_argument("server", help="Server name or ID")
     args = p.parse_args(argv)
     g = resolve_guild(args.server)
@@ -35,7 +35,7 @@ def channels(argv):
 
 
 def messages(argv):
-    p = argparse.ArgumentParser(prog="discord messages", description="Read messages from a channel.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord messages", description="Read messages from a channel.")
     p.add_argument("channel", help="Channel name or ID")
     p.add_argument("-g", "--guild", "--server", dest="guild", help="Server name or ID (required if using channel name)")
     p.add_argument("-n", "--limit", type=int, default=20, help="Number of messages (default: 20)")
@@ -57,7 +57,7 @@ def messages(argv):
 
 
 def dms(argv):
-    p = argparse.ArgumentParser(prog="discord dms", description="List DM conversations.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord dms", description="List DM conversations.")
     p.parse_args(argv)
     data = api.get_dm_channels()
     print(fmt.format_dms(data))
@@ -65,6 +65,7 @@ def dms(argv):
 
 def dm(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord dm",
         description="Read DMs, or send with --send and message text on stdin.",
         epilog="Inline --send values are not accepted. Stdin is optional only for file-only DMs.",
@@ -116,7 +117,7 @@ def dm(argv):
 
 
 def search(argv):
-    p = argparse.ArgumentParser(prog="discord search", description="Search messages.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord search", description="Search messages.")
     p.add_argument("query", help="Search query")
     p.add_argument("-g", "--guild", "--server", dest="guild", help="Server to search in")
     p.add_argument("-c", "--channel", help="Channel to search in")
@@ -137,7 +138,7 @@ def search(argv):
 
 
 def pins(argv):
-    p = argparse.ArgumentParser(prog="discord pins", description="Get pinned messages.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord pins", description="Get pinned messages.")
     p.add_argument("channel", help="Channel ID")
     args = p.parse_args(argv)
 
@@ -149,7 +150,7 @@ def pins(argv):
 
 
 def threads(argv):
-    p = argparse.ArgumentParser(prog="discord threads", description="List active threads in a server.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord threads", description="List active threads in a server.")
     p.add_argument("server", help="Server name or ID")
     args = p.parse_args(argv)
 
@@ -169,7 +170,7 @@ def threads(argv):
 
 
 def members(argv):
-    p = argparse.ArgumentParser(prog="discord members", description="List or search server members.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord members", description="List or search server members.")
     p.add_argument("server", help="Server name or ID")
     p.add_argument("-q", "--query", help="Search for members by name")
     p.add_argument("-n", "--limit", type=int, default=50, help="Max results")
@@ -184,7 +185,7 @@ def members(argv):
 
 
 def me(argv):
-    p = argparse.ArgumentParser(prog="discord me", description="Show current user info.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord me", description="Show current user info.")
     p.parse_args(argv)
 
     data = api.get_me()

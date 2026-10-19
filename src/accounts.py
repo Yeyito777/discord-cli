@@ -342,7 +342,7 @@ def _validate_owner_access(owner: str, access: str) -> None:
 
 
 def add_account(argv) -> None:
-    p = argparse.ArgumentParser(prog="discord account add", description="Add a named Discord account.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord account add", description="Add a named Discord account.")
     p.add_argument("alias")
     p.add_argument("--owner", choices=("assistant", "user", "other"), required=True)
     p.add_argument("--access", choices=("read-only", "full"), default="read-only")
@@ -377,7 +377,7 @@ def add_account(argv) -> None:
 
 
 def migrate_legacy(argv) -> None:
-    p = argparse.ArgumentParser(prog="discord account migrate", description="Migrate the legacy login into a named account.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord account migrate", description="Migrate the legacy login into a named account.")
     p.add_argument("alias")
     p.add_argument("--owner", choices=("assistant", "user", "other"), required=True)
     p.add_argument("--access", choices=("read-only", "full"), default="full")
@@ -411,7 +411,7 @@ def migrate_legacy(argv) -> None:
 
 
 def list_accounts(argv) -> None:
-    p = argparse.ArgumentParser(prog="discord accounts", description="List configured Discord accounts.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord accounts", description="List configured Discord accounts.")
     p.parse_args(argv)
     registry = load_registry()
     if not registry["accounts"]:
@@ -433,7 +433,7 @@ def list_accounts(argv) -> None:
 
 
 def set_default(argv) -> None:
-    p = argparse.ArgumentParser(prog="discord account default")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord account default")
     p.add_argument("alias")
     args = p.parse_args(argv)
     alias = normalize_alias(args.alias)
@@ -446,7 +446,7 @@ def set_default(argv) -> None:
 
 
 def set_access(argv) -> None:
-    p = argparse.ArgumentParser(prog="discord account access")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord account access")
     p.add_argument("alias")
     p.add_argument("access", choices=("read-only", "full"))
     p.add_argument("--yes", action="store_true", help="Confirm enabling write access")
@@ -463,7 +463,7 @@ def set_access(argv) -> None:
 
 
 def set_notify_account(argv) -> None:
-    p = argparse.ArgumentParser(prog="discord account notify")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord account notify")
     p.add_argument("alias")
     args = p.parse_args(argv)
     alias = normalize_alias(args.alias)
@@ -477,7 +477,7 @@ def set_notify_account(argv) -> None:
 
 
 def remove_account(argv) -> None:
-    p = argparse.ArgumentParser(prog="discord account remove")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord account remove")
     p.add_argument("alias")
     p.add_argument("--yes", action="store_true", help="Confirm removal of credentials and account-local state")
     args = p.parse_args(argv)

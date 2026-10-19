@@ -148,6 +148,7 @@ def _count(value):
 
 def search(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord gifs search",
         description="Search GIFs like Discord's GIF picker. Send a result's URL as message text to post it.",
     )
@@ -160,7 +161,7 @@ def search(argv):
 
 
 def trending(argv):
-    p = argparse.ArgumentParser(prog="discord gifs trending", description="Show trending GIFs from Discord's GIF picker.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord gifs trending", description="Show trending GIFs from Discord's GIF picker.")
     p.add_argument("-n", "--limit", type=_count, default=10, help=f"Number of results (default: 10, max: {MAX_RESULTS})")
     p.add_argument("--json", action="store_true", help="Print JSON")
     args = p.parse_args(argv)
@@ -234,6 +235,7 @@ def _now():
 
 def save(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord gifs save",
         description="Save (or update) a GIF URL in the local library with tags describing when to use it.",
         epilog="Saving an existing URL merges tags and replaces --title/--note/--source when given.",
@@ -293,7 +295,7 @@ def save(argv):
 
 
 def remove(argv):
-    p = argparse.ArgumentParser(prog="discord gifs remove", description="Remove a GIF from the local library.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord gifs remove", description="Remove a GIF from the local library.")
     p.add_argument("url", help="Saved GIF URL")
     args = p.parse_args(argv)
     url = canonical_attachment_url(args.url.strip()) or args.url.strip()
@@ -373,7 +375,7 @@ def _format_entries(entries):
 
 
 def list_cmd(argv):
-    p = argparse.ArgumentParser(prog="discord gifs list", description="List saved GIFs, most recently updated first.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord gifs list", description="List saved GIFs, most recently updated first.")
     p.add_argument("-n", "--limit", type=int, help="Show at most N entries")
     p.add_argument("--json", action="store_true", help="Print JSON")
     args = p.parse_args(argv)
@@ -385,6 +387,7 @@ def list_cmd(argv):
 
 def find(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord gifs find",
         description="Find saved GIFs by tags or words in title/note. Matches any term; best matches first.",
     )
@@ -406,6 +409,7 @@ def find(argv):
 
 def check(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord gifs check",
         description="Check that saved Discord uploads still exist. Provider GIF pages are not checked.",
     )
@@ -428,7 +432,7 @@ def check(argv):
 
 
 def tags(argv):
-    p = argparse.ArgumentParser(prog="discord gifs tags", description="List tags in the GIF library with counts.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord gifs tags", description="List tags in the GIF library with counts.")
     p.parse_args(argv)
     counts = {}
     for entry in load_library()["gifs"]:
@@ -535,6 +539,7 @@ def _compact(msg):
 
 def learn(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="discord gifs learn",
         description=(
             "Scan recent channel history for GIFs and print each with surrounding messages, "
