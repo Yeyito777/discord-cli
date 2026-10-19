@@ -2,34 +2,49 @@
 
 import re
 from src import api
-from src.private_channels import private_channel_name, private_channel_participants
+from src.private_channels import (
+    private_channel_name,
+    private_channel_participants,
+    summarize_participants,
+)
 
 
-def _fuzzy_match(query, candidates, key):
-    """Find best fuzzy match from candidates.
+class AmbiguousTarget(RuntimeError):
+    """A name matched more than one possible target; nothing was chosen."""
 
-    Returns the best matching candidate or None.
-    Priority: exact match > starts with > contains (case-insensitive).
+
+def _pick(query, candidates, key, *, what, describe):
+    """Return the one candidate a name means, or raise listing the choices.
+
+    Tiers: exact (case-insensitive) > starts with > contains.  The first tier
+    with any match decides; more than one match there is an error, never a
+    guess.  Messages must not go to "the closest" channel or person.
     """
     query_lower = query.lower()
-
-    exact = [c for c in candidates if key(c).lower() == query_lower]
-    if exact:
-        return exact[0]
-
-    starts = [c for c in candidates if key(c).lower().startswith(query_lower)]
-    if len(starts) == 1:
-        return starts[0]
-
-    contains = [c for c in candidates if query_lower in key(c).lower()]
-    if len(contains) == 1:
-        return contains[0]
-
-    # If multiple matches, prefer shortest name (most specific)
-    if contains:
-        return min(contains, key=lambda c: len(key(c)))
-
+    tiers = (
+        lambda name: name == query_lower,
+        lambda name: name.startswith(query_lower),
+        lambda name: query_lower in name,
+    )
+    for matches_tier in tiers:
+        matches = [c for c in candidates if matches_tier(str(key(c) or "").lower())]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            listing = "\n".join(f"  {describe(c)}" for c in matches[:15])
+            more = f"\n  … and {len(matches) - 15} more" if len(matches) > 15 else ""
+            raise AmbiguousTarget(
+                f'"{query}" matches {len(matches)} {what}; use an ID instead:\n{listing}{more}'
+            )
     return None
+
+
+def _describe_guild(guild):
+    return f"{guild.get('name', '?')} ({guild.get('id', '?')})"
+
+
+def _describe_named_channel(channel):
+    return f"#{channel.get('name', '?')} ({channel.get('id', '?')})"
 
 
 def resolve_guild(target):
@@ -45,7 +60,8 @@ def resolve_guild(target):
             return {"id": target, "name": target}
 
     guilds = api.get_guilds()
-    match = _fuzzy_match(target, guilds, lambda g: g.get("name", ""))
+    match = _pick(target, guilds, lambda g: g.get("name", ""),
+                  what="servers", describe=_describe_guild)
     if match:
         return match
 
@@ -55,11 +71,15 @@ def resolve_guild(target):
     )
 
 
+TEXT_CHANNEL_TYPES = {0, 5, 10, 11, 12, 15, 16}
+
+
 def resolve_channel(target, guild_id=None):
     """Resolve a channel by name or ID.
 
-    If guild_id is provided, searches that guild's channels.
-    Returns channel dict, or raises RuntimeError.
+    If guild_id is provided, searches that guild's text-capable channels.
+    Returns channel dict, or raises RuntimeError (AmbiguousTarget when a name
+    matches several channels).
     """
     # Snowflake ID
     if re.match(r'^\d{17,20}$', target):
@@ -75,16 +95,9 @@ def resolve_channel(target, guild_id=None):
         )
 
     channels = api.get_guild_channels(guild_id)
-    # Filter to text-like channels (text, announcement, thread, forum)
-    text_types = {0, 5, 10, 11, 12, 15, 16}
-    text_channels = [c for c in channels if c.get("type", 0) in text_types]
-
-    match = _fuzzy_match(target, text_channels, lambda c: c.get("name", ""))
-    if match:
-        return match
-
-    # Also try all channels
-    match = _fuzzy_match(target, channels, lambda c: c.get("name", ""))
+    text_channels = [c for c in channels if c.get("type", 0) in TEXT_CHANNEL_TYPES]
+    match = _pick(target.lstrip("#"), text_channels, lambda c: c.get("name", ""),
+                  what="channels", describe=_describe_named_channel)
     if match:
         return match
 
@@ -94,10 +107,34 @@ def resolve_channel(target, guild_id=None):
     )
 
 
+def _recipient_names(recipient):
+    return [
+        str(recipient.get(field) or "").lower()
+        for field in ("username", "global_name", "display_name")
+        if recipient.get(field)
+    ]
+
+
+def _describe_private(channel):
+    if channel.get("type") == 1:
+        recipient = (channel.get("recipients") or [{}])[0]
+        username = recipient.get("username") or "?"
+        shown = recipient.get("global_name") or recipient.get("display_name")
+        who = f"{shown} (@{username})" if shown and shown != username else f"@{username}"
+        return f"DM with {who} ({channel.get('id', '?')})"
+    members = summarize_participants(private_channel_participants(channel))
+    if channel.get("name"):
+        return f'group DM "{channel["name"]}" with {members} ({channel.get("id", "?")})'
+    return f'group DM with {members} ({channel.get("id", "?")})'
+
+
 def resolve_dm(target):
     """Resolve a DM channel by username or ID.
 
-    Returns channel dict, or raises RuntimeError.
+    Exact 1:1 matches win: exact username, then exact display name, then an
+    exact group DM name.  Otherwise a name must match exactly one DM or group
+    DM by prefix or substring.  Anything ambiguous raises AmbiguousTarget with
+    the candidates; a group DM is never chosen over an exact 1:1 match.
     """
     # Snowflake ID
     if re.match(r'^\d{17,20}$', target):
@@ -106,35 +143,66 @@ def resolve_dm(target):
         except RuntimeError:
             return {"id": target, "name": target}
 
-    dms = api.get_dm_channels()
+    dms = [dm for dm in api.get_dm_channels() if dm.get("type") in (1, 3)]
+    direct = [dm for dm in dms if dm.get("type") == 1]
+    groups = [dm for dm in dms if dm.get("type") == 3]
+    query = target.lstrip("@").lower()
 
-    query = target.lower()
-    username_query = target.lstrip("@").lower()
+    def unique(matches, tier):
+        if len(matches) > 1:
+            listing = "\n".join(f"  {_describe_private(m)}" for m in matches[:15])
+            raise AmbiguousTarget(
+                f'"{target}" {tier} {len(matches)} conversations; use a channel ID instead:\n{listing}'
+            )
+        return matches[0] if matches else None
 
-    # Search DM recipients by username or display name
-    for dm in dms:
-        if dm.get("type") == 1:  # Direct DM
-            for r in dm.get("recipients", []):
-                name = (r.get("global_name", "") or r.get("display_name", "") or "")
-                uname = r.get("username", "") or ""
-                if (
-                    query in name.lower()
-                    or query in uname.lower()
-                    or username_query == uname.lower()
-                ):
-                    return dm
-        elif dm.get("type") == 3:  # Group DM
-            group_name = private_channel_name(dm)
-            if query in group_name.lower():
-                return dm
-            for participant in private_channel_participants(dm):
-                if query in participant.lower():
-                    return dm
+    def recipients(dm):
+        return [r for r in dm.get("recipients", []) if isinstance(r, dict)]
+
+    exact_tiers = (
+        ([dm for dm in direct if any(str(r.get("username") or "").lower() == query for r in recipients(dm))],
+         "is the exact username in"),
+        ([dm for dm in direct if any(
+            query in (str(r.get("global_name") or "").lower(), str(r.get("display_name") or "").lower())
+            for r in recipients(dm))],
+         "is the exact display name in"),
+        ([dm for dm in groups if private_channel_name(dm).lower() == query], "is the exact name of"),
+    )
+    for matches, tier in exact_tiers:
+        match = unique(matches, tier)
+        if match:
+            return match
+
+    def loosely(dm):
+        names = (
+            [name for r in recipients(dm) for name in _recipient_names(r)]
+            if dm.get("type") == 1
+            else [private_channel_name(dm).lower()] + [p.lower() for p in private_channel_participants(dm)]
+        )
+        return any(query in name for name in names)
+
+    match = unique([dm for dm in dms if loosely(dm)], "partly matches")
+    if match:
+        return match
 
     raise RuntimeError(
         f'Cannot resolve DM target "{target}". '
         f"Use 'discord dms' to list your conversations."
     )
+
+
+def describe_destination(channel, guild=None):
+    """One line naming where a message went: name, ID, and server or DM partner."""
+    if channel.get("type") in (1, 3):
+        return _describe_private(channel)
+    name = channel.get("name") or channel.get("id", "?")
+    where = f"#{name} ({channel.get('id', '?')})"
+    guild_id = channel.get("guild_id") or (guild or {}).get("id")
+    if guild and guild.get("name") and str(guild.get("id")) == str(guild_id):
+        return f"{where} in {guild['name']} ({guild_id})"
+    if guild_id:
+        return f"{where} in server {guild_id}"
+    return where
 
 
 def parse_message_link(link):

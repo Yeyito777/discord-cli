@@ -7,7 +7,7 @@ import sys
 
 from src import api
 from src.payload import read_stdin_text, reject_inline_text, validate_message_length
-from src.resolve import resolve_guild, resolve_channel
+from src.resolve import describe_destination, resolve_guild, resolve_channel
 
 
 def _validate_files(file_paths):
@@ -123,7 +123,7 @@ def send(argv):
     reject_inline_text(p, args.inline_text, label="message text")
     text = read_stdin_text(p, label="message text", required=not args.files)
 
-    guild_id = None
+    guild_id = g = None
     if args.guild:
         g = resolve_guild(args.guild)
         guild_id = g["id"]
@@ -139,7 +139,7 @@ def send(argv):
         )
     else:
         data = api.send_message(ch["id"], text, reply_to=args.reply)
-    print(f"Sent. Message ID: {data['id']}")
+    print(f"Sent to {describe_destination(ch, g)}. Message ID: {data['id']}")
 
 
 def reply(argv):
@@ -159,7 +159,7 @@ def reply(argv):
     reject_inline_text(p, args.inline_text, label="reply text")
     text = read_stdin_text(p, label="reply text", required=not args.files)
 
-    guild_id = None
+    guild_id = g = None
     if args.guild:
         g = resolve_guild(args.guild)
         guild_id = g["id"]
@@ -175,7 +175,7 @@ def reply(argv):
         )
     else:
         data = api.send_message(ch["id"], text, reply_to=args.message)
-    print(f"Replied. Message ID: {data['id']}")
+    print(f"Replied to {args.message} in {describe_destination(ch, g)}. Message ID: {data['id']}")
 
 
 def edit(argv):
@@ -194,7 +194,7 @@ def edit(argv):
     text = read_stdin_text(p, label="replacement text")
     validate_message_length(p, text, label="replacement text")
     api.edit_message(args.channel, args.message, text)
-    print(f"Edited.")
+    print(f"Edited message {args.message} in channel {args.channel}.")
 
 
 def delete(argv):
@@ -204,7 +204,7 @@ def delete(argv):
     args = p.parse_args(argv)
 
     api.delete_message(args.channel, args.message)
-    print(f"Deleted.")
+    print(f"Deleted message {args.message} in channel {args.channel}.")
 
 
 def react(argv):
@@ -215,7 +215,7 @@ def react(argv):
     args = p.parse_args(argv)
 
     api.add_reaction(args.channel, args.message, args.emoji)
-    print(f"Reacted {args.emoji}.")
+    print(f"Reacted {args.emoji} to message {args.message} in channel {args.channel}.")
 
 
 def unreact(argv):
@@ -226,7 +226,7 @@ def unreact(argv):
     args = p.parse_args(argv)
 
     api.remove_reaction(args.channel, args.message, args.emoji)
-    print(f"Removed {args.emoji}.")
+    print(f"Removed {args.emoji} from message {args.message} in channel {args.channel}.")
 
 
 def thread(argv):

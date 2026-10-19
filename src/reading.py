@@ -6,7 +6,7 @@ import os
 from src import api
 from src import format as fmt
 from src.payload import read_stdin_text, reject_inline_text, validate_message_length
-from src.resolve import resolve_guild, resolve_channel, resolve_dm
+from src.resolve import describe_destination, resolve_guild, resolve_channel, resolve_dm
 
 
 def guilds(argv):
@@ -106,7 +106,7 @@ def dm(argv):
             data = api.send_message_with_files(channel_id, args.files, content=text)
         else:
             data = api.send_message(channel_id, text)
-        print(f"Sent. Message ID: {data['id']}")
+        print(f"Sent to {describe_destination(d)}. Message ID: {data['id']}")
         return
 
     data = api.get_messages(channel_id, limit=args.limit, before=args.before)
