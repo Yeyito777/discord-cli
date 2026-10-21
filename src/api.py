@@ -461,6 +461,21 @@ def get_guild_channels(guild_id):
     return get(f"/guilds/{guild_id}/channels")
 
 
+def create_guild_channel(guild_id, name, *, channel_type=0, topic=None, parent_id=None):
+    """Create a channel in a guild; never resent after an ambiguous failure."""
+    body = {"name": name, "type": channel_type}
+    if topic is not None:
+        body["topic"] = topic
+    if parent_id is not None:
+        body["parent_id"] = parent_id
+    return post_once(f"/guilds/{guild_id}/channels", body=body)
+
+
+def set_channel_positions(guild_id, positions):
+    """Reorder guild channels: ``positions`` is a list of {"id", "position"}."""
+    return patch(f"/guilds/{guild_id}/channels", body=positions)
+
+
 def get_guild_members(guild_id, limit=100):
     """Get members of a guild (limited by permissions)."""
     return get(f"/guilds/{guild_id}/members", params={"limit": str(limit)})

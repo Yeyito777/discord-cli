@@ -7,6 +7,23 @@ in `config/` (override with `DISCORD_CONFIG_DIR`), which is not tracked by git.
 
 Tests: `.venv/bin/python3 -m unittest discover -s tests -t .`
 
+## Channels
+
+```sh
+discord -a ALIAS channel create SERVER NAME [--type text|voice|announcement|category] [--topic T] [--position top|N] [--parent CATEGORY]
+discord -a ALIAS channel move CHANNEL --position top|N [-g SERVER]
+```
+
+Both need Manage Channels and an explicit `-a` when several accounts exist.
+`create` POSTs `/guilds/{id}/channels` (never resent after an ambiguous
+failure) and refuses a same-name, same-type channel in the same category. With
+`--position` it then reorders; `move` does only that. A position is a 0-based
+index among the channel's siblings (same category, or the top level), `top` being
+0, and N past the end means last. Reordering renumbers the siblings 0..n-1 and
+PATCHes `/guilds/{id}/channels` with only the entries that changed. If the
+reorder fails after the channel was created, the error gives the new ID and the
+`move` command to retry.
+
 ## Notifications
 
 Exocortex owns routing: `discord notify subscribe CONV [--channel ID --guild G]`

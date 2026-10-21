@@ -107,6 +107,22 @@ def resolve_channel(target, guild_id=None):
     )
 
 
+def resolve_category(target, guild_id):
+    """Resolve a channel category (type 4) in a guild by name or ID."""
+    categories = [c for c in api.get_guild_channels(guild_id) if c.get("type") == 4]
+    if re.match(r'^\d{17,20}$', target):
+        match = next((c for c in categories if c["id"] == target), None)
+    else:
+        match = _pick(target, categories, lambda c: c.get("name", ""),
+                      what="categories", describe=_describe_named_channel)
+    if match:
+        return match
+    raise RuntimeError(
+        f'Cannot resolve category "{target}" in the server. '
+        f"Use 'discord channels <server>' to list categories."
+    )
+
+
 def _recipient_names(recipient):
     return [
         str(recipient.get(field) or "").lower()
