@@ -652,13 +652,30 @@ class GatewayListener:
             "channel_id": channel_id,
             "msg_id": d.get("id", ""),
         }
+        # Keep actionable attachment IDs/names, never expiring signed URLs.
+        # Voice-message URLs live only in memory (``_voice_urls``) until the
+        # publisher transcribes them; they are never logged or published.
+        from src.voice import is_voice_attachment
+
+        notif["attachments"] = []
+        voice_urls = {}
+        for attachment in d.get("attachments", []):
+            if not isinstance(attachment, dict):
+                continue
+            entry = {key: attachment[key] for key in ("id", "filename", "size", "content_type")
+                     if key in attachment}
+            if is_voice_attachment(attachment, d.get("flags")):
+                entry["voice"] = True
+                urls = [attachment[key] for key in ("url", "proxy_url") if attachment.get(key)]
+                if urls:
+                    voice_urls[str(attachment.get("id", ""))] = urls
+            notif["attachments"].append(entry)
+        if voice_urls:
+            notif["_voice_urls"] = voice_urls
+        stickers = [s.get("name") or "sticker" for s in d.get("sticker_items") or [] if isinstance(s, dict)]
+        if stickers:
+            notif["stickers"] = stickers
         if channel_scope:
-            # Keep actionable attachment IDs/names, never expiring signed URLs.
-            notif["attachments"] = [
-                {key: attachment[key] for key in ("id", "filename", "size", "content_type")
-                 if key in attachment}
-                for attachment in d.get("attachments", []) if isinstance(attachment, dict)
-            ]
             reference = d.get("message_reference") or {}
             if reference.get("message_id"):
                 notif["reply_to"] = {"msg_id": reference["message_id"]}
@@ -693,7 +710,7 @@ class GatewayListener:
             notif["channel_name"] = ch_info.get("name", "?")
 
         # Always log to file
-        self._write(json.dumps(notif) + "\n")
+        self._write(json.dumps({k: v for k, v in notif.items() if not k.startswith("_")}) + "\n")
 
         # Exocortex owns subscription routing and delivery.
         self._queue_notification(notif)
@@ -846,6 +863,7 @@ class GatewayListener:
     def _publish_notification(self, notif):
         from src.exocortex import publish_external_notification
 
+        self._transcribe_voice_attachments(notif)
         text, seen_updates = self._format_notification_batch([notif])
         if not text:
             self._log("Skipped stale notification event")
@@ -872,6 +890,37 @@ class GatewayListener:
             self._mark_notification_seen(channel_id, msg_ids)
         self._log(f"Published notification event {event_id}")
         return result
+
+    def _transcribe_voice_attachments(self, notif):
+        """Attach transcripts to voice attachments once; retries reuse them."""
+        voice_urls = notif.pop("_voice_urls", None) or {}
+        for attachment in notif.get("attachments") or []:
+            if not attachment.get("voice") or "transcript" in attachment:
+                continue
+            urls = voice_urls.get(str(attachment.get("id", "")))
+            transcript = None
+            if urls:
+                from src.voice import transcribe_voice
+                try:
+                    transcript = transcribe_voice(urls, attachment.get("content_type"))
+                except Exception as exc:
+                    self._log(f"Voice transcription failed: {exc}")
+            attachment["transcript"] = transcript
+
+    @staticmethod
+    def _notification_message_content(n):
+        """Message text plus one line per voice note, sticker and attachment."""
+        lines = [n["content"]] if n.get("content") else []
+        for attachment in n.get("attachments") or []:
+            if attachment.get("voice"):
+                transcript = attachment.get("transcript")
+                if transcript:
+                    lines.append(f"🎤 {transcript}")
+                    continue
+                lines.append("🎤 voice message (transcription failed)")
+            lines.append(f"[attachment:{attachment.get('id', '?')}] {attachment.get('filename', 'file')}")
+        lines.extend(f"[sticker] {name}" for name in n.get("stickers") or [])
+        return "\n".join(lines) or "[empty message]"
 
     @staticmethod
     def _notification_occurred_at_ms(value):
@@ -1029,12 +1078,7 @@ class GatewayListener:
             name = n.get("display_name") or n.get("author", "?")
             author_id = n.get("author_id", "")
             actor = self._notification_actor(author_id, name, labels)
-            content = n.get("content") or "[message]"
-            if n.get("attachments"):
-                content += "\n" + "\n".join(
-                    f"[attachment:{a.get('id', '?')}] {a.get('filename', 'file')}"
-                    for a in n["attachments"]
-                )
+            content = self._notification_message_content(n)
             msg_id = n.get("msg_id", "")
             id_line = f"\n[msg:{msg_id}]" if msg_id else ""
             reply_marker = self._notification_reply_marker(n.get("reply_to"))
