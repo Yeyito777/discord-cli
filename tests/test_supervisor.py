@@ -115,7 +115,8 @@ class SupervisorLifecycleTests(SupervisorTestCase):
         self.assertEqual(proc.argv[2:], [PREFIX + A, str(self.root / "paramount" / f"{PREFIX}{A}.log")])
         self.assertEqual(proc.kwargs["env"]["DISCORD_ACCOUNT"], "paramount")
         self.assertNotIn("start_new_session", proc.kwargs)
-        self.assertIsNone(sup.gateways[("paramount", "__notify__")].proc.kwargs["stderr"])
+        self.assertEqual(sup.gateways[("paramount", "__notify__")].proc.kwargs["stderr"].name,
+                         str(self.root / "paramount" / "__notify__.err"))
 
     def test_restarts_dead_listener_with_backoff(self):
         self.subscriptions = [channel("paramount", A)]

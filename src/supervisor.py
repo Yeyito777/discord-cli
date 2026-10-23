@@ -179,18 +179,14 @@ class Gateway:
             _log(f"{self}: stopped unsupervised PID(s) {', '.join(map(str, stale))}")
             if alive:
                 raise RuntimeError(f"unsupervised PID(s) {alive} survived SIGKILL")
-        # The account Gateway keeps logging to service.log as before; channel
-        # Gateways keep their per-channel .err file next to the state file.
-        stderr = None if self.key == ACCOUNT_GATEWAY else open(self.files()[1], "a")
-        try:
+        # Each Gateway logs to <key>.err next to its state file, which the
+        # Gateway itself rotates; config/service.log keeps only this loop.
+        with open(self.files()[1], "a") as stderr:
             # Same process group as this daemon: exocortexd's group kill stops it.
             self.proc = subprocess.Popen(
                 self.command(), cwd=PROJECT_DIR, env=self.env(),
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
             )
-        finally:
-            if stderr:
-                stderr.close()
         self.started = now
         self.progress_at = now
         self.last_updated = None

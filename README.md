@@ -94,8 +94,8 @@ channel to be ready; `notify stop --channel` refuses while subscriptions remain.
 stops the whole daemon, channel listeners included. Runtime files (PID, lock,
 state, log, err) live in `$XDG_RUNTIME_DIR/discord-cli/<config-hash>/<alias>/`
 (on macOS without it, `~/Library/Caches/discord-cli/…`, because macOS cleans
-`/tmp`), and the daemon's PID in `supervisor.pid` one level up. Daemon logs go
-to `config/service.log`.
+`/tmp`), and the daemon's PID in `supervisor.pid` one level up. Each Gateway logs to
+its `<key>.err` there; the daemon's own lines go to `config/service.log`.
 
 Don't rely on a process started from an Exocortex turn to outlive it. Each turn
 runs in a transient systemd unit, and its whole cgroup, `setsid` children
