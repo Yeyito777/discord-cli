@@ -282,7 +282,7 @@ class ChannelLifecycleTests(unittest.TestCase):
             self.assertEqual(exocortex._socket_path(), Path("/tmp/example-instance.sock"))
 
     def test_process_identity_is_account_channel_and_path_specific(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(lifecycle, "listener_dir", return_value=Path(tmp)):
+        with tempfile.TemporaryDirectory() as tmp, patch("src.listener_state.listener_dir", return_value=Path(tmp)):
             files = lifecycle.paths(C)
             files["pid"].write_text("123")
             expected = f"python {lifecycle.PROJECT_DIR / 'src/gateway.py'} {lifecycle.PREFIX}{C} {files['log']}"
@@ -308,7 +308,7 @@ class ChannelLifecycleTests(unittest.TestCase):
 
     def test_start_launches_stopped_daemon_and_timeout_does_not_kill_worker(self):
         with (tempfile.TemporaryDirectory() as tmp,
-              patch.object(lifecycle, "listener_dir", return_value=Path(tmp)),
+              patch("src.listener_state.listener_dir", return_value=Path(tmp)),
               patch("src.supervisor.request_reconcile", return_value=None),
               patch("src.exocortex.manage_external_tool_daemon", return_value={"message": "started"}) as daemon,
               patch.object(lifecycle, "listener_status", return_value="connecting (PID 123)"),

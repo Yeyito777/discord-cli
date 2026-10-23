@@ -93,6 +93,13 @@ def _headers(token=None):
     return _cached_headers
 
 
+def reset_token_cache():
+    """Forget the cached token so a long-lived process re-reads credentials."""
+    global _cached_token, _cached_headers
+    _cached_token = None
+    _cached_headers = None
+
+
 # ─── Core request ────────────────────────────────────────────────────────────
 
 def _build_headers(token=None, extra_headers=None):

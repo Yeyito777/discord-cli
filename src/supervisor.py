@@ -16,6 +16,13 @@ is at most one collector per source.  Gateways reconnect through network drops
 on their own; this loop restarts any that exit, with backoff, and re-reads the
 registry every ``RECONCILE_SECONDS`` or at once on SIGHUP (sent by the CLI
 after subscribe/unsubscribe/start).
+
+Health: a Gateway's main thread rewrites its state file at least every 30 s.
+One that stops doing so for ``STALL_SECONDS`` is wedged and gets killed and
+restarted.  One that stays out of ``ready`` for ``ALERT_SECONDS`` (at once for
+a rejected token) is reported to the conversations subscribed to its source,
+once per outage, followed by a recovery notice.  Both clocks are monotonic, so
+time asleep (a laptop lid) never counts as an outage.
 """
 
 import os
@@ -28,6 +35,7 @@ from pathlib import Path
 
 from src.accounts import listener_dir, load_registry, runtime_root
 from src.channel_notifications import PREFIX
+from src.listener_state import ago, read_state
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 GATEWAY_SCRIPT = PROJECT_DIR / "src" / "gateway.py"
@@ -44,6 +52,10 @@ STOP_GRACE_SECONDS = 4.0
 # Discord invalidates sessions (op 9) that identify at the same moment on one
 # account, so Gateway starts are spaced out.
 START_SPACING_SECONDS = 5.0
+HEALTH_CHECK_SECONDS = 5.0
+STALL_SECONDS = 180.0
+ALERT_SECONDS = 600.0
+ALERT_RETRY_SECONDS = 60.0
 
 
 def _log(message):
@@ -96,6 +108,11 @@ def _core_subscriptions():
     return list_external_notification_subscriptions(tool_name="discord")
 
 
+def _core_publish(source_id, event_id, text, data):
+    from src.exocortex import publish_external_notification
+    return publish_external_notification("discord", source_id, event_id, text, data=data, timeout_seconds=5)
+
+
 class Gateway:
     """One supervised Gateway process for (account alias, gateway key)."""
 
@@ -107,9 +124,26 @@ class Gateway:
         self.started = 0.0
         self.failures = 0
         self.next_start = 0.0
+        # Health (supervisor monotonic clock)
+        self.next_health = 0.0
+        self.last_updated = None
+        self.progress_at = 0.0
+        self.unready_since = None
+        self.outage_id = None
+        self.alerted = False
+        self.next_alert = 0.0
 
     def __str__(self):
         return f"{self.alias}/{self.key}"
+
+    def source_id(self):
+        if self.key == ACCOUNT_GATEWAY:
+            return f"account:{self.alias}:notifications"
+        return f"account:{self.alias}:channel:{self.key[len(PREFIX):]}:messages"
+
+    def describe_source(self):
+        what = "DMs and @mentions" if self.key == ACCOUNT_GATEWAY else f"channel [ch:{self.key[len(PREFIX):]}]"
+        return f"Discord ({self.alias}) {what}"
 
     def files(self):
         root = listener_dir(self.alias)
@@ -158,6 +192,8 @@ class Gateway:
             if stderr:
                 stderr.close()
         self.started = now
+        self.progress_at = now
+        self.last_updated = None
         _log(f"{self}: started PID {self.proc.pid}")
 
     def _backoff(self, now, reason):
@@ -189,6 +225,72 @@ class Gateway:
             self._backoff(now, f"start failed: {exc}")
         return True
 
+    def check_health(self, now, publish):
+        """Restart a wedged Gateway; tell subscribers about a long outage, once."""
+        if now < self.next_health:
+            return
+        self.next_health = now + HEALTH_CHECK_SECONDS
+        running = self.proc is not None and self.proc.poll() is None
+        state = read_state(self.key, self.alias) if running else None
+        if state and state.get("pid") != self.proc.pid:
+            state = None
+        if running:
+            updated = state.get("updated") if state else None
+            if updated != self.last_updated:
+                self.last_updated, self.progress_at = updated, now
+            elif now - self.progress_at >= STALL_SECONDS:
+                _log(f"{self}: no progress for {int(now - self.progress_at)}s "
+                     f"(status {state.get('status') if state else 'unknown'}); killing it for a restart")
+                self.progress_at = now
+                try:
+                    self.proc.kill()
+                except OSError:
+                    pass
+        status = (state or {}).get("status") or ("starting" if running else "stopped")
+        if status == "ready":
+            if self.alerted and now >= self.next_alert:
+                down = ago(time.time() - self.outage_id) if self.outage_id else "a while"
+                if self._publish(publish, f"listener-recovered:{self.key}:{self.outage_id}",
+                                 f"Recovered: {self.describe_source()} is connected again after {down}. "
+                                 "Messages sent while it was down are delivered late, marked as such.",
+                                 "recovered"):
+                    self.alerted = False
+                else:
+                    self.next_alert = now + ALERT_RETRY_SECONDS
+            if not self.alerted:
+                self.unready_since = self.outage_id = None
+            return
+        if self.unready_since is None:
+            self.unready_since, self.outage_id = now, int(time.time())
+        threshold = 0.0 if status == "token-rejected" else ALERT_SECONDS
+        if self.alerted or now - self.unready_since < threshold or now < self.next_alert:
+            return
+        detail = (state or {}).get("detail")
+        text = (f"{self.describe_source()} has not been connected for "
+                f"{ago(now - self.unready_since)} (status: {status}"
+                + (f"; last error: {detail}" if detail else "") + "). "
+                "New messages are not arriving. It keeps retrying and delivers what was missed "
+                "once it reconnects.")
+        if status == "token-rejected":
+            text = (f"{self.describe_source()} stopped: Discord rejected the account token "
+                    f"({detail or 'run discord login'}). Nothing arrives until the token is replaced.")
+        if self._publish(publish, f"listener-down:{self.key}:{self.outage_id}", text, status):
+            self.alerted = True
+        else:
+            self.next_alert = now + ALERT_RETRY_SECONDS
+
+    def _publish(self, publish, event_id, text, status):
+        _log(f"{self}: {text}")
+        try:
+            publish(self.source_id(), event_id, f"[Discord listener notice] {text}", {
+                "schemaVersion": 1, "accountAlias": self.alias, "kind": "listener_health",
+                "status": status, "content": text,
+            })
+            return True
+        except Exception as exc:
+            _log(f"{self}: could not publish the listener notice: {exc}")
+            return False
+
     def terminate(self):
         if self.proc is not None and self.proc.poll() is None:
             self.proc.terminate()
@@ -205,9 +307,10 @@ class Gateway:
 
 
 class Supervisor:
-    def __init__(self, account_alias, *, list_subscriptions=None, registry=load_registry):
+    def __init__(self, account_alias, *, list_subscriptions=None, registry=load_registry, publish=None):
         self.account_alias = account_alias
         self.list_subscriptions = list_subscriptions or _core_subscriptions
+        self.publish = publish or _core_publish
         self.registry = registry
         self.registered = set(registry()["accounts"])
         self.desired = {(account_alias, ACCOUNT_GATEWAY)} if account_alias else set()
@@ -245,6 +348,7 @@ class Supervisor:
                 gateway = self.gateways[key] = Gateway(*key, registered=registered)
             if gateway.tick(now, may_start=now >= self.next_spawn):
                 self.next_spawn = now + START_SPACING_SECONDS
+            gateway.check_health(now, self.publish)
 
     def shutdown(self):
         gateways = list(self.gateways.values())

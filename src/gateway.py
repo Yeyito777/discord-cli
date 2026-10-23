@@ -30,7 +30,7 @@ if str(PROJECT_DIR) not in sys.path:
 
 import websocket
 
-from src import fingerprint
+from src import fingerprint, listener_state
 from src.accounts import listener_dir, selected_account
 
 _USER_AGENT = fingerprint.USER_AGENT
@@ -47,7 +47,26 @@ NOTIFICATION_SEEN_LIMIT = 200
 # 4011 sharding required, 4012 invalid API version, 4013/4014 invalid or
 # disallowed intents.  Identifying again only adds failed logins.
 FATAL_CLOSE_CODES = {4004, 4010, 4011, 4012, 4013, 4014}
-CREDENTIALS_RECHECK_SECONDS = 60
+CREDENTIALS_RECHECK_SECONDS = 30
+# Closing with 1000/1001 ends the Discord session; any other code (or no close
+# frame) keeps it resumable, so a reconnect replays missed events.
+RESUMABLE_CLOSE_CODE = 4000
+CONNECT_TIMEOUT_SECONDS = 15  # TLS + HELLO on a slow or just-woken network
+RECV_TIMEOUT_SECONDS = 1      # short so SIGTERM is handled promptly
+# Re-register the notification source once per exocortexd instance; while
+# exocortexd is unreachable, retry on this schedule instead of every reconnect.
+REGISTER_BACKOFF_SECONDS = (5, 10, 30, 60, 120, 300)
+REGISTER_CHECK_SECONDS = 5
+PUBLISH_BACKOFF_SECONDS = (2, 5, 10, 30, 60)
+LOG_REPEAT_SECONDS = 300
+CURSOR_SAVE_SECONDS = 10
+HANDLED_IDS_LIMIT = 1000
+# Backfill after a fresh session (a resume replays events itself).
+BACKFILL_CHANNEL_LIMIT = 50
+BACKFILL_DM_CHANNELS = 10
+BACKFILL_DM_LIMIT = 20
+BACKFILL_MENTIONS_LIMIT = 25
+BACKFILL_MAX_AGE_SECONDS = 3 * 24 * 3600
 PRESENCE_STATUSES = {"online", "idle", "dnd", "invisible"}
 
 # ─── Account status setting ─────────────────────────────────────────────────
@@ -119,6 +138,7 @@ class GatewayListener:
 
         self.notification_source = None
         self.notification_channel = None
+        # pid/lock/state/err files of a notification Gateway (either kind).
         self._channel_notify_paths = None
         from src.channel_notifications import PREFIX, paths
         if self.channel_id.startswith(PREFIX):
@@ -129,6 +149,7 @@ class GatewayListener:
         if self.channel_id == "__notify__":
             from src.notify import notification_source
             self.notification_source = notification_source(self.account)
+            self._channel_notify_paths = listener_state.gateway_paths("__notify__")
 
         self.running = True
         # Set from the signal handler so waits end at once on shutdown.
@@ -155,12 +176,38 @@ class GatewayListener:
         self._notification_lock = threading.Lock()
         self._notification_active = False
         self._notification_seen = {}  # channel_id -> {ids, order}
+        self._pending_ids = set()      # queued message IDs not yet published
+
+        self._init_health()
 
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
 
         if self.notification_source:
             self._acquire_notify_singleton()
+            self._seen_max = listener_state.load_cursor(self.channel_id)
+
+    def _init_health(self):
+        """Liveness, registration, cursor and log-bound bookkeeping."""
+        now = time.time()
+        self._health = {
+            "status": "starting", "since": now, "connected_since": None,
+            "last_event": None, "last_delivery": None, "reconnects": 0, "detail": None,
+        }
+        self._ready = False
+        self._sessions = 0
+        self._next_housekeeping = 0.0
+        self._registered_identity = None
+        self._register_failures = 0
+        self._next_register = 0.0
+        self._seen_max = None
+        self._cursor_saved = None
+        self._next_cursor_save = 0.0
+        self._handled_ids = set()
+        self._handled_order = deque()
+        self._last_message_ids = {}  # channel_id → last_message_id from READY
+        self._channel_guilds = {}    # channel_id → guild_id from READY
+        self._repeats = {}           # throttled log key → [next allowed, suppressed count]
 
     def _shutdown(self, signum=None, frame=None):
         sig_name = signal.Signals(signum).name if signum else "?"
@@ -179,28 +226,78 @@ class GatewayListener:
             except OSError:
                 pass
 
-    def _acquire_notify_singleton(self):
-        NOTIFY_LISTENER_DIR.mkdir(parents=True, exist_ok=True)
+    def _singleton_paths(self):
         files = getattr(self, "_channel_notify_paths", None)
-        lock_path = files["lock"] if files else NOTIFY_LOCK_PATH
-        pid_path = files["pid"] if files else NOTIFY_PID_PATH
+        return (files["lock"], files["pid"]) if files else (NOTIFY_LOCK_PATH, NOTIFY_PID_PATH)
+
+    @staticmethod
+    def _try_lock(lock_path):
+        """An exclusively locked fd for ``lock_path``; raises BlockingIOError if held."""
         lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        except BaseException:
             os.close(lock_fd)
+            raise
+        os.ftruncate(lock_fd, 0)
+        os.write(lock_fd, f"{os.getpid()}\n".encode())
+        return lock_fd
+
+    def _acquire_notify_singleton(self):
+        lock_path, pid_path = self._singleton_paths()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            lock_fd = self._try_lock(lock_path)
+        except BlockingIOError:
             existing_pid = "?"
             try:
                 existing_pid = pid_path.read_text().strip() or "?"
             except OSError:
                 pass
             raise SystemExit(f"Notify listener already running (PID {existing_pid})")
-
-        os.ftruncate(lock_fd, 0)
-        os.write(lock_fd, f"{os.getpid()}\n".encode())
         self._notify_lock_fd = lock_fd
-        pid_path.write_text(f"{os.getpid()}\n")
+        listener_state.write_json_atomic(pid_path, os.getpid())
         atexit.register(self._release_notify_singleton)
+
+    def _verify_notify_singleton(self):
+        """Repair the lock and PID files if something deleted them.
+
+        macOS cleans /tmp of files untouched for days; a lock file unlinked
+        while held excludes nobody, so a second Gateway could start beside
+        this one.  Re-create both, or exit if another Gateway already holds
+        the replacement lock.
+        """
+        if getattr(self, "_notify_lock_fd", None) is None:
+            return
+        lock_path, pid_path = self._singleton_paths()
+        try:
+            held = os.fstat(self._notify_lock_fd)
+            try:
+                current = os.stat(lock_path)
+                same = (current.st_ino, current.st_dev) == (held.st_ino, held.st_dev)
+            except FileNotFoundError:
+                same = False
+            if not same:
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    new_fd = self._try_lock(lock_path)
+                except BlockingIOError:
+                    self._log("Another Gateway holds the replacement lock; exiting")
+                    self.running = False
+                    self._stopping.set()
+                    return
+                os.close(self._notify_lock_fd)
+                self._notify_lock_fd = new_fd
+                self._log("Lock file was missing; re-created it")
+            try:
+                pid_ok = pid_path.read_text().strip() == str(os.getpid())
+            except OSError:
+                pid_ok = False
+            if not pid_ok:
+                listener_state.write_json_atomic(pid_path, os.getpid())
+                self._log("PID file was missing or replaced; restored it")
+        except OSError as exc:
+            self._log_repeated("singleton", f"Singleton check failed: {exc}")
 
     def _release_notify_singleton(self):
         files = getattr(self, "_channel_notify_paths", None)
@@ -252,29 +349,46 @@ class GatewayListener:
     # ─── Main loop ───────────────────────────────────────────────────────────
 
     def run(self):
-        """Register the source, then connect and run until stopped.
+        """Connect and run until stopped.
 
         Reconnects forever.  Consecutive attempts that never reach READY or
-        RESUMED (network down, exocortexd restarting, channel inaccessible)
-        back off up to about a minute instead of re-identifying every few
-        seconds.
+        RESUMED (network down, channel inaccessible) back off up to about a
+        minute instead of re-identifying every few seconds.  Exocortex being
+        unreachable never stops the Discord connection: registration and
+        publishing retry on their own schedules while events keep queueing.
         """
+        try:
+            while self.running:
+                self._close_code = None
+                try:
+                    self._channel_notify_state("connecting")
+                    self._connect()
+                    self._receive_loop()
+                except Exception as e:
+                    self._log(f"Error: {e}")
+                    if hasattr(self, "_health"):
+                        self._health["detail"] = str(e)[:300]
+                self._ready = False
+                if self.running and self._close_code in FATAL_CLOSE_CODES:
+                    self._wait_for_new_credentials(self._close_code)
+                    continue
+                self._channel_notify_state("reconnecting" if self.running else "stopped")
+                if self.running:
+                    self._wait(self._reconnect_delay())
+        finally:
+            self._save_cursor(force=True)
+            self._channel_notify_state("stopped")
+
+    def _wait(self, seconds):
+        """Sleep up to ``seconds``, ending at once on shutdown, keeping state fresh."""
+        deadline = time.monotonic() + seconds
         while self.running:
-            self._close_code = None
-            try:
-                self._channel_notify_state("connecting")
-                if self.notification_source:
-                    self._register_notification_source()
-                self._connect()
-                self._receive_loop()
-            except Exception as e:
-                self._log(f"Error: {e}")
-            if self.running and self._close_code in FATAL_CLOSE_CODES:
-                self._wait_for_new_credentials(self._close_code)
-                continue
-            self._channel_notify_state("reconnecting" if self.running else "stopped")
-            if self.running:
-                self._stopping.wait(self._reconnect_delay())
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if self._stopping.wait(min(remaining, listener_state.STATE_WRITE_SECONDS)):
+                return
+            self._housekeeping()
 
     def _credentials_mtime(self):
         from src.accounts import credentials_file
@@ -286,28 +400,51 @@ class GatewayListener:
         except (OSError, RuntimeError):
             return None
 
+    def _use_token(self, token):
+        from src import api
+
+        self.token = token
+        api.reset_token_cache()  # REST calls in this process use it too
+        self.session_id = None
+        self._failed_connects = 0
+
     def _wait_for_new_credentials(self, code):
-        """Stop identifying with a token Discord rejected until it is replaced."""
+        """Stop identifying with a token Discord rejected until it is replaced.
+
+        The token file may already have been refreshed while this process kept
+        the old token in memory (a long-lived Gateway outlives logins), so the
+        file is compared first.
+        """
+        from src.auth import get_token
+
         alias = (self.account or {}).get("alias", "?")
+        try:
+            on_disk = get_token()
+        except RuntimeError:
+            on_disk = None
+        if on_disk and on_disk != self.token:
+            self._log(f"Discord rejected this session (close code {code}); the token file "
+                      "has a different token, reconnecting with it")
+            self._use_token(on_disk)
+            return
         self._log(
             f"Discord rejected this session for good (close code {code}); not reconnecting "
             f"until the token changes ('discord -a {alias} login')"
         )
-        self._channel_notify_state("token-rejected")
+        self._channel_notify_state("token-rejected", f"close code {code}: run 'discord -a {alias} login'")
         self.session_id = None
         rejected = self._credentials_mtime()
         while self.running and self._credentials_mtime() == rejected:
             self._stopping.wait(CREDENTIALS_RECHECK_SECONDS)
+            self._housekeeping()
         if not self.running:
             return
-        from src.auth import get_token
-
         try:
-            self.token = get_token()
+            token = get_token()
         except RuntimeError as e:
             self._log(f"Could not read the new token: {e}")
             return
-        self._failed_connects = 0
+        self._use_token(token)
         self._log("Token changed; reconnecting")
 
     def _reconnect_delay(self):
@@ -315,12 +452,245 @@ class GatewayListener:
         self._failed_connects = failures + 1
         return min(60, random.uniform(1, 5) * 2 ** min(failures, 4))
 
-    def _channel_notify_state(self, status):
+    # ─── Health, registration and housekeeping ───────────────────────────────
+
+    def _channel_notify_state(self, status, detail=None):
+        """Record a status transition (any notification Gateway) and write it now."""
+        health = getattr(self, "_health", None)
+        if health is None or not getattr(self, "_channel_notify_paths", None):
+            return
+        if status != health["status"]:
+            health["status"] = status
+            health["since"] = time.time()
+        if detail is not None:
+            health["detail"] = detail
+        self._write_state()
+
+    def _write_state(self):
         files = getattr(self, "_channel_notify_paths", None)
-        if files:
-            tmp = files["state"].with_suffix(".state.tmp")
-            tmp.write_text(json.dumps({"pid": os.getpid(), "status": status}))
-            tmp.replace(files["state"])
+        if not files or not hasattr(self, "_health"):
+            return
+        try:
+            listener_state.write_json_atomic(files["state"], {
+                "pid": os.getpid(), **self._health, "updated": time.time(),
+                "registered": self._registered_identity is not None,
+                "pending": len(getattr(self, "_pending_ids", ())),
+            })
+        except OSError as exc:
+            self._log_repeated("state", f"Could not write state: {exc}")
+
+    def _housekeeping(self):
+        """Periodic duties of the main thread; cheap enough to call every second."""
+        if not hasattr(self, "_health") or not self.notification_source:
+            return
+        now = time.monotonic()
+        self._maybe_register(now)
+        self._save_cursor()
+        if now < self._next_housekeeping:
+            return
+        self._next_housekeeping = now + listener_state.STATE_WRITE_SECONDS
+        self._verify_notify_singleton()
+        files = self._channel_notify_paths or {}
+        if files.get("err") and listener_state.rotate_stderr(files["err"]):
+            self._log("Rotated the error log")
+        listener_state.rotate_if_large(Path(self.output_file))
+        self._write_state()
+
+    def _exocortex_identity(self):
+        """Identity of the exocortexd socket: changes whenever exocortexd restarts."""
+        path = getattr(self, "_socket_file", None)
+        if path is None:
+            from src.exocortex import _socket_path
+            path = self._socket_file = _socket_path()  # resolving it runs git
+        try:
+            info = os.stat(path)
+        except OSError:
+            return None
+        return (info.st_dev, info.st_ino, info.st_ctime_ns)
+
+    def _maybe_register(self, now):
+        """Register the source once per exocortexd instance, after Discord is ready.
+
+        Registration marks the source online in Exocortex, so it waits for a
+        live Gateway session; failures back off instead of repeating every
+        reconnect.
+        """
+        if not self._ready or now < self._next_register:
+            return
+        identity = self._exocortex_identity()
+        if identity is None or identity == self._registered_identity:
+            self._next_register = now + REGISTER_CHECK_SECONDS
+            return
+        try:
+            self._register_notification_source()
+        except Exception as exc:
+            delay = REGISTER_BACKOFF_SECONDS[min(self._register_failures, len(REGISTER_BACKOFF_SECONDS) - 1)]
+            self._register_failures += 1
+            self._next_register = now + delay
+            self._log_repeated("register", f"Could not register with exocortexd ({exc}); retrying in {delay}s")
+            return
+        self._registered_identity = identity
+        self._register_failures = 0
+        self._repeats.pop("register", None)
+        self._write_state()
+
+    def _log_repeated(self, key, message):
+        """Log the first occurrence, then at most every LOG_REPEAT_SECONDS."""
+        repeats = getattr(self, "_repeats", None)
+        if repeats is None:
+            self._log(message)
+            return
+        now = time.monotonic()
+        entry = repeats.get(key)
+        if entry and now < entry[0]:
+            entry[1] += 1
+            return
+        suppressed = entry[1] if entry else 0
+        repeats[key] = [now + LOG_REPEAT_SECONDS, 0]
+        self._log(message + (f" (repeated {suppressed} more times)" if suppressed else ""))
+
+    # ─── Delivery cursor and backfill ────────────────────────────────────────
+
+    @staticmethod
+    def _snowflake_at(epoch_seconds):
+        return str(max(0, int(epoch_seconds * 1000) - 1420070400000) << 22)
+
+    def _note_handled(self, msg_id):
+        """Advance the cursor past a message; False if it was already handled."""
+        if not msg_id or not str(msg_id).isdigit():
+            return True
+        handled = getattr(self, "_handled_ids", None)
+        if handled is None:
+            return True
+        if msg_id in handled:
+            return False
+        handled.add(msg_id)
+        self._handled_order.append(msg_id)
+        while len(self._handled_order) > HANDLED_IDS_LIMIT:
+            handled.discard(self._handled_order.popleft())
+        if self._seen_max is None or int(msg_id) > int(self._seen_max):
+            self._seen_max = str(msg_id)
+        return True
+
+    def _durable_cursor(self):
+        """Highest ID such that every message up to it has been delivered or skipped."""
+        if self._seen_max is None:
+            return None
+        bound = int(self._seen_max)
+        with self._notification_lock:
+            pending = [int(i) for i in self._pending_ids if str(i).isdigit()]
+        if pending:
+            bound = min(bound, min(pending) - 1)
+        return str(bound)
+
+    def _save_cursor(self, force=False):
+        if not getattr(self, "notification_source", None) or not hasattr(self, "_health"):
+            return
+        now = time.monotonic()
+        if not force and now < self._next_cursor_save:
+            return
+        self._next_cursor_save = now + CURSOR_SAVE_SECONDS
+        cursor = self._durable_cursor()
+        if cursor is None or cursor == self._cursor_saved:
+            return
+        try:
+            listener_state.save_cursor(self.channel_id, cursor)
+            self._cursor_saved = cursor
+        except OSError as exc:
+            self._log_repeated("cursor", f"Could not save the delivery cursor: {exc}")
+
+    def _backfill(self):
+        """Deliver messages that arrived while no Gateway session was listening.
+
+        Runs after a fresh READY (a RESUMED replays missed events itself).
+        Bounded: the latest BACKFILL_* messages per source; anything beyond
+        that, or a failed fetch, becomes one explicit notice instead of a
+        silent gap.  Exocortex deduplicates by message ID, so overlap with
+        events already delivered is harmless.
+        """
+        after = self._seen_max
+        if after is None:
+            # First run: nothing to catch up on; start the cursor now.
+            self._seen_max = self._snowflake_at(time.time())
+            return
+        floor = max(int(after), int(self._snowflake_at(time.time() - BACKFILL_MAX_AGE_SECONDS)))
+        messages, gaps = [], []
+
+        def fetch(channel_id, limit, guild_id=None):
+            known = self._last_message_ids.get(channel_id)
+            if known and str(known).isdigit() and int(known) <= floor:
+                return  # READY says nothing newer was posted
+            batch = api.get_messages(channel_id, limit=limit) or []
+            newer = [m for m in batch if isinstance(m, dict) and str(m.get("id", "")).isdigit()
+                     and int(m["id"]) > floor]
+            if len(batch) >= limit and len(newer) == len(batch):
+                gaps.append(channel_id)
+            for message in newer:
+                message.setdefault("channel_id", channel_id)
+                if guild_id:
+                    message.setdefault("guild_id", guild_id)
+            messages.extend(newer)
+
+        from src import api
+        try:
+            if self.notification_channel:
+                guild_id = self._channel_guilds.get(self.notification_channel)
+                fetch(self.notification_channel, BACKFILL_CHANNEL_LIMIT, guild_id)
+            else:
+                channels = sorted(
+                    (cid for cid, last in self._last_message_ids.items()
+                     if cid in self._private_channels and str(last or "").isdigit() and int(last) > floor),
+                    key=lambda cid: int(self._last_message_ids[cid]), reverse=True,
+                )
+                for channel_id in channels[:BACKFILL_DM_CHANNELS]:
+                    fetch(channel_id, BACKFILL_DM_LIMIT)
+                if len(channels) > BACKFILL_DM_CHANNELS:
+                    gaps.extend(channels[BACKFILL_DM_CHANNELS:])
+                mentions = api.get("/users/@me/mentions", params={
+                    "limit": str(BACKFILL_MENTIONS_LIMIT), "roles": "false", "everyone": "false",
+                }) or []
+                for message in mentions:
+                    if not isinstance(message, dict) or not str(message.get("id", "")).isdigit():
+                        continue
+                    if int(message["id"]) <= floor:
+                        continue
+                    guild_id = message.get("guild_id") or self._channel_guilds.get(message.get("channel_id"))
+                    if guild_id:  # without it a server mention would look like a DM
+                        messages.append({**message, "guild_id": guild_id})
+        except Exception as exc:
+            self._log(f"Backfill failed: {exc}")
+            self._queue_notice(
+                f"backfill-failed:{after}",
+                f"The Discord listener reconnected after a gap but could not fetch messages sent "
+                f"while it was down ({exc}). Messages since "
+                f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(listener_state.snowflake_ms(after) / 1000))} "
+                "may be missing; check the source directly.",
+            )
+            return
+
+        delivered = 0
+        for message in sorted({m["id"]: m for m in messages}.values(), key=lambda m: int(m["id"])):
+            if self._handle_message(message, backfilled=True):
+                delivered += 1
+        if delivered:
+            self._log(f"Backfilled {delivered} message(s) missed while disconnected")
+        if gaps:
+            self._queue_notice(
+                f"backfill-gap:{after}",
+                f"The Discord listener was disconnected long enough that only the latest messages "
+                f"were delivered late; older missed messages exist in {len(gaps)} channel(s): "
+                + ", ".join(f"[ch:{cid}]" for cid in gaps[:10]),
+            )
+
+    def _queue_notice(self, event_id, text):
+        self._queue_notification({"type": "notice", "event_id": event_id, "text": text})
+
+    def _handle_message(self, d, *, backfilled=False):
+        """Route one MESSAGE_CREATE exactly once (live or backfilled)."""
+        if not self._note_handled(str(d.get("id") or "")):
+            return False
+        self._on_notify("MESSAGE_CREATE", d, backfilled=backfilled)
+        return True
 
     # ─── Connection ──────────────────────────────────────────────────────────
 
@@ -341,10 +711,10 @@ class GatewayListener:
                     },
                 })
                 self._start_heartbeat()
-                self._log("Resumed session")
+                self._log("Resuming session")
                 return
-            except Exception:
-                self._log("Resume failed, fresh connect")
+            except Exception as exc:
+                self._log(f"Resume failed ({exc}), fresh connect")
                 self.session_id = None
 
         url = self._get_gateway_url()
@@ -354,16 +724,16 @@ class GatewayListener:
         self._start_heartbeat()
 
     def _ws_open(self, url):
-        """Open a new WebSocket connection, closing any existing one."""
+        """Open a new WebSocket connection, closing any existing one resumably."""
         if self.ws:
             try:
-                self.ws.close()
+                self.ws.close(status=RESUMABLE_CLOSE_CODE, timeout=1)
             except Exception:
                 pass
 
         self._inflator = zlib.decompressobj()
         self.ws = websocket.WebSocket()
-        self.ws.settimeout(1)   # short timeout so SIGTERM is handled promptly
+        self.ws.settimeout(CONNECT_TIMEOUT_SECONDS)
         self.ws.connect(
             f"{url}/?v=9&encoding=json&compress=zlib-stream",
             header=[
@@ -417,9 +787,13 @@ class GatewayListener:
         while self.running and self._hb_gen == gen:
             if not self.heartbeat_acked:
                 self._log("Heartbeat ACK missed")
+                # Drop the socket without a close frame: the session stays
+                # resumable and the blocked receive returns at once.
+                sock = getattr(self.ws, "sock", None)
                 try:
-                    self.ws.close()
-                except Exception:
+                    if sock is not None:
+                        sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
                     pass
                 return
             self.heartbeat_acked = False
@@ -447,6 +821,7 @@ class GatewayListener:
         if isinstance(data, bytes):
             data = data.decode("utf-8")
         msg = json.loads(data)
+        self.ws.settimeout(RECV_TIMEOUT_SECONDS)
         return msg["d"]["heartbeat_interval"]
 
     def _decompress(self, data):
@@ -459,6 +834,7 @@ class GatewayListener:
     def _receive_loop(self):
         """Process gateway events until the connection drops."""
         while self.running:
+            self._housekeeping()
             try:
                 ws_op, data = self.ws.recv_data()
             except websocket.WebSocketTimeoutException:
@@ -474,6 +850,8 @@ class GatewayListener:
                 self._close_code = code
                 return
 
+            if hasattr(self, "_health"):
+                self._health["last_event"] = time.time()
             data = self._decompress(data)
             if not data:
                 continue
@@ -494,9 +872,11 @@ class GatewayListener:
                 self._log("Gateway requested a reconnect")
                 return
             elif op == 9:    # Invalid session
-                self._log("Gateway invalidated the session")
-                self.session_id = None
-                time.sleep(random.uniform(1, 5))
+                resumable = event.get("d") is True
+                self._log(f"Gateway invalidated the session ({'resumable' if resumable else 'not resumable'})")
+                if not resumable:
+                    self.session_id = None
+                self._stopping.wait(random.uniform(1, 5))
                 return
             elif op == 0:    # Dispatch
                 self.sequence = event.get("s")
@@ -521,7 +901,6 @@ class GatewayListener:
             if getattr(self, "notification_channel", None):
                 self._build_name_maps(d)
                 self._subscribe_notification_channel()
-                self._channel_notify_state("ready")
 
             if self.channel_id == "__notify__":
                 self._build_name_maps(d)
@@ -532,19 +911,45 @@ class GatewayListener:
             else:
                 self._write(f"--- Listening as {name} · channel {self.channel_id} ---\n\n")
             self._failed_connects = 0
+            self._on_session_ready(fresh=True)
             return
 
         if event_type == "RESUMED":
             if getattr(self, "notification_channel", None):
                 self._subscribe_notification_channel()
-            self._channel_notify_state("ready")
             self._failed_connects = 0
+            self._on_session_ready(fresh=False)
             return
 
         if self.channel_id == "__notify__" or getattr(self, "notification_channel", None):
-            self._on_notify(event_type, d)
+            if event_type == "MESSAGE_CREATE":
+                self._handle_message(d)
+            else:
+                self._on_notify(event_type, d)
         else:
             self._on_channel(event_type, d)
+
+    def _on_session_ready(self, *, fresh):
+        """A live Gateway session: mark ready, register, catch up after a gap."""
+        if not getattr(self, "notification_source", None):
+            return
+        health = getattr(self, "_health", None)
+        if health is not None:
+            self._ready = True
+            self._sessions += 1
+            if self._sessions > 1:
+                health["reconnects"] += 1
+            health["connected_since"] = time.time()
+            health["detail"] = None
+        self._channel_notify_state("ready")
+        if health is None:
+            return
+        self._log(f"Session {'ready' if fresh else 'resumed'}")
+        if fresh:
+            self._backfill()
+        if not self._register_failures:
+            self._next_register = 0.0
+        self._maybe_register(time.monotonic())
 
     def _log_presence(self, ready):
         """Record the account's status setting and what Discord shows for this session."""
@@ -568,6 +973,8 @@ class GatewayListener:
         if not guild_id:
             raise RuntimeError("Notification channel is not a server channel")
         self._channels[self.notification_channel] = {"name": channel.get("name", "?")}
+        if hasattr(self, "_channel_guilds"):
+            self._channel_guilds[self.notification_channel] = guild_id
         # Send directly: a failed send must not be reported as ready.
         self.ws.send(json.dumps({
             "op": 14,
@@ -590,7 +997,7 @@ class GatewayListener:
         elif event_type == "MESSAGE_DELETE":
             self._write(f"  [message {d.get('id', '?')} deleted]\n\n")
 
-    def _on_notify(self, event_type, d):
+    def _on_notify(self, event_type, d, *, backfilled=False):
         """Handle events for the notification listener — DMs and @mentions."""
         channel_scope = getattr(self, "notification_channel", None)
         if channel_scope and (
@@ -625,7 +1032,8 @@ class GatewayListener:
 
         is_dm = d.get("guild_id") is None
         if is_dm and self._is_call_message(d):
-            self._on_notify_call_message(d)
+            if not backfilled:  # a call that rang while disconnected is over
+                self._on_notify_call_message(d)
             return
 
         mentions_me = any(
@@ -652,6 +1060,8 @@ class GatewayListener:
             "channel_id": channel_id,
             "msg_id": d.get("id", ""),
         }
+        if backfilled:
+            notif["backfilled"] = True
         # Keep actionable attachment IDs/names, never expiring signed URLs.
         # Voice-message URLs live only in memory (``_voice_urls``) until the
         # publisher transcribes them; they are never logged or published.
@@ -830,6 +1240,9 @@ class GatewayListener:
         """Add an event to the asynchronous, retryable IPC publisher queue."""
         with self._notification_lock:
             self._notification_queue.append(notif)
+            pending = getattr(self, "_pending_ids", None)
+            if pending is not None and notif.get("msg_id"):
+                pending.add(str(notif["msg_id"]))
             if self._notification_active:
                 return
             self._notification_active = True
@@ -837,7 +1250,12 @@ class GatewayListener:
         threading.Thread(target=self._notification_sender, daemon=True).start()
 
     def _notification_sender(self):
-        """Publish queued events; event IDs make uncertain retries deduplicable."""
+        """Publish queued events; event IDs make uncertain retries deduplicable.
+
+        While exocortexd is unreachable, events stay queued (in order) and
+        retries back off up to a minute with one log line per few minutes.
+        """
+        failures = 0
         while self.running:
             with self._notification_lock:
                 if not self._notification_queue:
@@ -851,32 +1269,60 @@ class GatewayListener:
                 try:
                     self._publish_notification(notif)
                 except Exception as exc:
-                    self._log(f"Notification publish failed: {exc}")
+                    self._log_repeated("publish", f"Notification publish failed: {exc}")
                     retry_from = index
                     break
+                with self._notification_lock:
+                    getattr(self, "_pending_ids", set()).discard(str(notif.get("msg_id") or ""))
 
             if retry_from is not None:
                 with self._notification_lock:
                     self._notification_queue[0:0] = batch[retry_from:]
-                time.sleep(2)
+                delay = PUBLISH_BACKOFF_SECONDS[min(failures, len(PUBLISH_BACKOFF_SECONDS) - 1)]
+                failures += 1
+                self._stopping.wait(delay)
+            elif failures:
+                failures = 0
+                getattr(self, "_repeats", {}).pop("publish", None)
+                self._log("Notification publishing recovered")
+
+    def _publish_notice(self, notif):
+        from src.exocortex import publish_external_notification
+
+        alias = str((getattr(self, "account", None) or {}).get("alias") or "")
+        return publish_external_notification(
+            "discord", self.notification_source["id"], notif["event_id"],
+            f"[Discord listener notice] {notif['text']}",
+            data={"schemaVersion": 1, "accountAlias": alias, "kind": "listener_notice",
+                  "content": notif["text"]},
+        )
 
     def _publish_notification(self, notif):
         from src.exocortex import publish_external_notification
 
+        if notif.get("type") == "notice":
+            result = self._publish_notice(notif)
+            self._log(f"Published listener notice {notif['event_id']}")
+            return result
         self._transcribe_voice_attachments(notif)
         text, seen_updates = self._format_notification_batch([notif])
         if not text:
             self._log("Skipped stale notification event")
             return None
+        if notif.get("backfilled"):
+            text += "\n(sent while the Discord listener was disconnected; delivered late)"
 
         event_id = self._notification_event_id(notif)
+        data = self._notification_data(notif)
+        if notif.get("backfilled"):
+            data["backfilled"] = True
         result = publish_external_notification(
             "discord",
             self.notification_source["id"],
             event_id,
             text,
             occurred_at=self._notification_occurred_at_ms(notif.get("ts")),
-            data=self._notification_data(notif),
+            data=data,
         )
         failures = [
             delivery for delivery in (result.get("deliveries") or [])
@@ -888,6 +1334,8 @@ class GatewayListener:
             )
         for channel_id, msg_ids in seen_updates.items():
             self._mark_notification_seen(channel_id, msg_ids)
+        if hasattr(self, "_health"):
+            self._health["last_delivery"] = time.time()
         self._log(f"Published notification event {event_id}")
         return result
 
@@ -1265,11 +1713,16 @@ class GatewayListener:
                     "name": ch.get("name", "?"),
                     "guild_name": gname,
                 }
+                if hasattr(self, "_channel_guilds"):
+                    self._channel_guilds[ch["id"]] = gid
+                    self._last_message_ids[ch["id"]] = ch.get("last_message_id")
 
         # Build metadata for private channels
         self._private_channels = {}
         for ch in ready_data.get("private_channels", []):
             self._remember_private_channel(ch)
+            if hasattr(self, "_last_message_ids") and ch.get("id"):
+                self._last_message_ids[ch["id"]] = ch.get("last_message_id")
 
     # ─── Output ──────────────────────────────────────────────────────────────
 
