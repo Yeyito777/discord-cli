@@ -134,6 +134,8 @@ class ApplicationCommandTests(unittest.TestCase):
         with (
             patch.object(api, "_get_connection", return_value=entry),
             patch.object(api, "_build_headers", return_value={}),
+            patch("src.accounts.ensure_mutation_allowed"),  # not the real account registry
+            patch("src.accounts.audit_event"),
             self.assertRaisesRegex(RuntimeError, "may have accepted"),
         ):
             api.post_once("/interactions", body={"type": 2})
