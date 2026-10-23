@@ -188,11 +188,38 @@ class GatewayBehaviourTests(unittest.TestCase):
         listener._credentials_mtime = lambda: next(mtimes)
         waits = []
         listener._stopping = Mock(wait=lambda seconds: waits.append(seconds))
-        with patch("src.auth.get_token", return_value="new-token"):
+        with (patch("src.auth.get_token", side_effect=["old-token", "new-token"]),
+              patch("src.api.reset_token_cache") as reset):
             listener.run()
         self.assertEqual(attempts, ["old-token", "new-token"])
         self.assertEqual(waits, [gateway.CREDENTIALS_RECHECK_SECONDS] * 2)
-        listener._channel_notify_state.assert_any_call("token-rejected")
+        listener._channel_notify_state.assert_any_call(
+            "token-rejected", "close code 4004: run 'discord -a personal login'")
+        reset.assert_called_once_with()
+
+    def test_rejected_token_uses_a_token_file_refreshed_while_running(self):
+        # A Gateway that outlived a login holds the old token in memory: the
+        # file already has a new one, so it reconnects at once instead of
+        # waiting for another change (the Mac's 16-day 4004 loop).
+        listener = self.listener()
+        attempts = []
+
+        def connect():
+            attempts.append(listener.token)
+            if len(attempts) == 2:
+                listener.running = False
+
+        listener._connect = connect
+        listener._receive_loop = lambda: setattr(listener, "_close_code", 4004)
+        listener.notification_source = None
+        listener._credentials_mtime = Mock(return_value=1)
+        listener._stopping = Mock(wait=Mock(return_value=False))
+        with (patch("src.auth.get_token", return_value="refreshed-token"),
+              patch("src.api.reset_token_cache") as reset):
+            listener.run()
+        self.assertEqual(attempts, ["old-token", "refreshed-token"])
+        listener._stopping.wait.assert_not_called()
+        reset.assert_called_once_with()
 
     def test_ordinary_close_still_reconnects_with_backoff(self):
         listener = self.listener()

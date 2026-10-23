@@ -453,9 +453,12 @@ def list_config(argv):
     labels = get_labels()
 
     print(f"  Source: {source['label']} ({source['id']})")
+    from src.channel_notifications import daemon_status, listener_status
     if args.channel:
-        from src.channel_notifications import daemon_status, listener_status
         print(f"  Listener: {listener_status(source['id'].split(':')[3])}, {daemon_status()}")
+    else:
+        from src.listener_state import gateway_status
+        print(f"  Listener: {gateway_status('__notify__')}, {daemon_status()}")
     print("  Subscriptions:")
     if subscriptions:
         for subscription in sorted(
@@ -484,6 +487,40 @@ def list_config(argv):
                 print(f"    {user_id} → {entry}")
     else:
         print("    (none)")
+
+
+def status(argv):
+    """Every notification Gateway of this config root, all accounts."""
+    p = argparse.ArgumentParser(
+        allow_abbrev=False,
+        prog="discord notify status",
+        description="Show the health of every Discord notification listener.",
+    )
+    p.parse_args(argv)
+    from src.accounts import load_registry
+    from src.channel_notifications import daemon_status
+    from src.listener_state import gateway_status
+    from src.supervisor import ACCOUNT_GATEWAY, desired_gateways
+
+    print(f"  Daemon: {daemon_status()}")
+    aliases = set(load_registry()["accounts"])
+    try:
+        subscriptions = list_external_notification_subscriptions(tool_name=TOOL_NAME)
+        expected = desired_gateways(subscriptions, aliases, supervised_notify_alias())
+    except Exception as exc:
+        print(f"  Subscriptions: unavailable ({exc}); showing listeners found on disk")
+        expected = set()
+    found = {
+        (alias, path.name[:-len(".pid")])
+        for alias in aliases
+        for path in listener_dir(alias).glob("*.pid")
+    }
+    if not expected | found:
+        print("  Listeners: (none)")
+    for alias, key in sorted(expected | found, key=lambda item: (item[0], item[1] != ACCOUNT_GATEWAY, item[1])):
+        label = "DMs/@mentions" if key == ACCOUNT_GATEWAY else f"channel {key.removeprefix('__channel_notify__')}"
+        note = "" if (alias, key) in expected or not expected else " (no subscription)"
+        print(f"  {alias} · {label}: {gateway_status(key, alias)}{note}")
 
 
 def _enabled_subscriptions(source):
@@ -569,11 +606,14 @@ def _run_daemon_mode(argv):
     # remains an authoritative migration marker.
     _migrate_relay_targets()
 
-    from src.accounts import LEGACY_CREDENTIALS_FILE
+    from src.accounts import LEGACY_CREDENTIALS_FILE, account_count
     from src.supervisor import Supervisor
 
-    alias = selected_alias(required=False)
-    if alias is None and LEGACY_CREDENTIALS_FILE.exists():
+    # Only the account chosen with 'discord account notify' always listens for
+    # DMs/@mentions; falling back to the default account would start a second
+    # account-wide Gateway on a machine that only hosts channel subscriptions.
+    alias = supervised_notify_alias()
+    if alias is None and not account_count() and LEGACY_CREDENTIALS_FILE.exists():
         alias = "legacy"
     Supervisor(alias).run()
 
@@ -587,17 +627,19 @@ _COMMANDS = {
     "remove": remove,
     "label": label,
     "list": list_config,
+    "status": status,
     "start": start,
     "stop": stop,
 }
 
 
 def _print_help():
-    print("usage: discord notify <subscribe|unsubscribe|list|label|start|stop> [args]")
+    print("usage: discord notify <subscribe|unsubscribe|list|status|label|start|stop> [args]")
     print()
     print("  subscribe CONV_ID [--delivery wake|inbox]  Subscribe via Exocortex core")
     print("  unsubscribe CONV_ID | --subscription-id ID  Remove the account subscription")
-    print("  list                                      Show subscriptions and local labels")
+    print("  list                                      Show subscriptions, listener health, labels")
+    print("  status                                    Health of every listener (all accounts)")
     print("  label USER_ID [LABEL]                     Manage local sender labels")
     print("  start | stop                              Manage the notification daemon")
     print("  add | remove                              Aliases for subscribe/unsubscribe")

@@ -60,6 +60,7 @@ class SupervisorTestCase(unittest.TestCase):
             ("runtime_root", lambda: root),
             ("_log", lambda message: None),
             ("START_SPACING_SECONDS", 0.0),
+            ("read_state", lambda key, alias=None: None),
         ]:
             patcher = patch.object(supervisor, target, value)
             patcher.start()
@@ -70,6 +71,7 @@ class SupervisorTestCase(unittest.TestCase):
     def make(self, alias: "str | None" = "paramount"):
         return supervisor.Supervisor(
             alias, list_subscriptions=lambda: list(self.subscriptions), registry=lambda: REGISTRY,
+            publish=lambda *args: None,
         )
 
 
@@ -310,7 +312,7 @@ class SupervisorCliTests(SupervisorTestCase):
 
     def test_daemon_mode_migrates_then_supervises_account(self):
         with (patch.object(notify, "_migrate_relay_targets") as migrate,
-              patch.object(notify, "selected_alias", return_value="paramount"),
+              patch.object(notify, "supervised_notify_alias", return_value="paramount"),
               patch.object(supervisor.Supervisor, "__init__", return_value=None) as init,
               patch.object(supervisor.Supervisor, "run") as run):
             notify.main(["__daemon__"])

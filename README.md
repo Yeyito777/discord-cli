@@ -34,10 +34,13 @@ creates a core subscription to one of two sources per account,
 The supervised daemon (manifest `daemon`, `python -m src.notify __daemon__`,
 see `src/supervisor.py`) owns every Gateway that collects them. It reads the
 core subscription registry at start, every 15 s, and at once on SIGHUP (the CLI
-sends one after subscribe/unsubscribe/start). It runs:
+sends one after subscribe/unsubscribe/start). Keep the manifest `daemon` block:
+without it no Gateway runs at all, channel subscriptions included. It runs:
 
-- the DMs/@mentions Gateway of the supervised account (`discord account notify`),
-  always, and of any other account while it has an enabled subscription;
+- the DMs/@mentions Gateway of the supervised account (`discord account notify
+  ALIAS`; `--none` on a machine that should only run its channel
+  subscriptions), always, and of any other account while it has an enabled
+  subscription;
 - one `__channel_notify__<id>` Gateway per subscribed channel and account,
   stopped after the last unsubscribe.
 
@@ -45,14 +48,43 @@ Each Gateway is a child process with its own `DISCORD_ACCOUNT` and keeps its
 per-account/channel singleton lock, so there is exactly one collector per
 source. Starts are spaced 5 s apart, because Discord invalidates sessions that
 identify at the same moment. A Gateway that exits is restarted with backoff
-(1 s up to 60 s), and a copy started outside the daemon is replaced. Gateways reconnect through network
-drops themselves, backing off while connects keep failing. exocortexd restarts
-the daemon, and kills its whole process group on stop, so nothing depends on
-the process that ran the CLI.
+(1 s up to 60 s), and a copy started outside the daemon is replaced. exocortexd
+restarts the daemon, and kills its whole process group on stop, so nothing
+depends on the process that ran the CLI.
+
+Staying connected, and failing loudly when it can't:
+
+- Gateways reconnect through network drops and sleep themselves, backing off
+  while connects keep failing. They close sockets without a 1000/1001 close
+  frame so Discord lets them resume, which replays the events in between.
+- A rejected token (close 4004 and other fatal codes) stops identifying. If the
+  token file already holds a different token, the Gateway switches to it at
+  once; otherwise it waits for `discord -a ALIAS login`.
+- The source is registered with exocortexd after the Gateway is ready, then
+  once per exocortexd instance (the socket's identity), with backoff while
+  exocortexd is unreachable. Discord stays connected meanwhile, and events
+  queue until publishing works again.
+- After a fresh session (process start, invalidated session), the Gateway
+  fetches what arrived since its delivery cursor
+  (`config/accounts/<alias>/listener-cursors/<key>.json`). For a channel that
+  is the channel; for DMs/@mentions, the DM channels READY reports as newer
+  plus `/users/@me/mentions`. It's bounded (50 per channel, 10 DM channels of
+  20, 25 mentions, 3 days). Late messages say so, and anything past the bound,
+  or a failed fetch, becomes one explicit notice. Exocortex deduplicates by
+  message ID.
+- Each Gateway's main thread rewrites `<key>.state` (status, connected since,
+  last Gateway event, last delivery, reconnects, last error) at least every
+  30 s. The daemon kills and restarts a Gateway whose state stops updating for
+  3 min. One that is not `ready` for 10 min of awake time (at once for a
+  rejected token) gets a `[Discord listener notice]` published to the
+  conversations subscribed to its source, then a recovery notice.
+- `.err` and `.log` files rotate to `.1` at 2 MB. Repeated errors are logged at
+  most every 5 min.
 
 ```sh
 discord -a ALIAS notify subscribe CONV --channel ID --guild G   # waits for "ready"
-discord -a ALIAS notify list --channel ID --guild G             # Listener: ready (PID …), supervised by …
+discord -a ALIAS notify list [--channel ID --guild G]           # Listener: ready (PID …) · connected 3h05m · last Gateway event 8s ago · …
+discord notify status                                           # every listener, all accounts
 discord -a ALIAS notify unsubscribe CONV --channel ID           # last one stops the listener
 ```
 
@@ -60,9 +92,10 @@ discord -a ALIAS notify unsubscribe CONV --channel ID           # last one stops
 channel to be ready; `notify stop --channel` refuses while subscriptions remain.
 `notify start|stop` without `--channel`, for the supervised account, starts or
 stops the whole daemon, channel listeners included. Runtime files (PID, lock,
-state, log, err) live in `$XDG_RUNTIME_DIR/discord-cli/<config-hash>/<alias>/`,
-and the daemon's PID in `supervisor.pid` one level up. Daemon logs go to
-`config/service.log`.
+state, log, err) live in `$XDG_RUNTIME_DIR/discord-cli/<config-hash>/<alias>/`
+(on macOS without it, `~/Library/Caches/discord-cli/…`, because macOS cleans
+`/tmp`), and the daemon's PID in `supervisor.pid` one level up. Daemon logs go
+to `config/service.log`.
 
 Don't rely on a process started from an Exocortex turn to outlive it. Each turn
 runs in a transient systemd unit, and its whole cgroup, `setsid` children

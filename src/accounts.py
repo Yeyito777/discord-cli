@@ -175,6 +175,10 @@ def runtime_root() -> Path:
     runtime_home = os.environ.get("XDG_RUNTIME_DIR", "").strip()
     if runtime_home:
         base = Path(runtime_home) / "discord-cli"
+    elif sys.platform == "darwin":
+        # macOS deletes /tmp files untouched for 3 days, including the lock
+        # and PID files of a Gateway that runs for weeks.
+        base = Path.home() / "Library" / "Caches" / "discord-cli"
     else:
         base = Path("/tmp") / f"discord-cli-{os.getuid()}"
     config_id = hashlib.sha256(str(CONFIG_ROOT.resolve()).encode()).hexdigest()[:12]
@@ -486,16 +490,28 @@ def set_access(argv) -> None:
 
 
 def set_notify_account(argv) -> None:
-    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord account notify")
-    p.add_argument("alias")
+    p = argparse.ArgumentParser(
+        allow_abbrev=False, prog="discord account notify",
+        description="Choose the account whose DMs/@mentions the Discord daemon always listens for.",
+    )
+    target = p.add_mutually_exclusive_group(required=True)
+    target.add_argument("alias", nargs="?")
+    target.add_argument("--none", action="store_true",
+                        help="No always-on DM/@mention listener (e.g. another machine runs it); "
+                             "subscribed channels still get theirs")
     args = p.parse_args(argv)
-    alias = normalize_alias(args.alias)
     registry = load_registry()
-    if alias not in registry["accounts"]:
-        raise AccountError(f"Discord account '{alias}' is not configured.")
-    registry["notify_account"] = alias
-    save_registry(registry)
-    print(f"Supervised notification account: {alias}")
+    if args.none:
+        registry["notify_account"] = None  # an absent key would default to default_account
+        save_registry(registry)
+        print("Supervised notification account: none")
+    else:
+        alias = normalize_alias(args.alias)
+        if alias not in registry["accounts"]:
+            raise AccountError(f"Discord account '{alias}' is not configured.")
+        registry["notify_account"] = alias
+        save_registry(registry)
+        print(f"Supervised notification account: {alias}")
     print("Restart the Discord notification daemon for this change to take effect.")
 
 

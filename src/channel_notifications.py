@@ -5,13 +5,12 @@ Gateway per subscribed channel and stops it after the last unsubscribe.  The CLI
 only nudges the daemon and reads the Gateway's PID/state files.
 """
 
-import json
 import re
-import subprocess
 import time
 from pathlib import Path
 
-from src.accounts import listener_dir
+from src.listener_state import gateway_paths, gateway_status
+from src.listener_state import owned_pid as owned_gateway_pid
 
 PREFIX = "__channel_notify__"
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -20,36 +19,17 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 def paths(channel_id, alias=None):
     if not re.fullmatch(r"\d{17,20}", channel_id):
         raise ValueError("Expected a channel snowflake")
-    root = listener_dir(alias)
-    return {suffix: root / f"{PREFIX}{channel_id}.{suffix}"
-            for suffix in ("pid", "lock", "log", "err", "state")}
+    return gateway_paths(f"{PREFIX}{channel_id}", alias)
 
 
 def owned_pid(channel_id, alias=None):
-    files = paths(channel_id, alias)
-    try:
-        pid = int(files["pid"].read_text().strip())
-        # macOS has no /proc; ps works on both supported Unix platforms.
-        command = subprocess.check_output(
-            ["ps", "-p", str(pid), "-o", "command="], text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-        expected = f"{PROJECT_DIR / 'src' / 'gateway.py'} {PREFIX}{channel_id} {files['log']}"
-        return pid if expected in command else None
-    except (ValueError, OSError, subprocess.CalledProcessError):
-        return None
+    paths(channel_id, alias)  # validates the snowflake
+    return owned_gateway_pid(f"{PREFIX}{channel_id}", alias)
 
 
 def listener_status(channel_id, alias=None):
-    pid = owned_pid(channel_id, alias)
-    if not pid:
-        return "stopped"
-    try:
-        state = json.loads(paths(channel_id, alias)["state"].read_text())
-        status = state["status"] if state.get("pid") == pid else "starting"
-    except (OSError, ValueError, KeyError):
-        status = "starting"
-    return f"{status} (PID {pid})"
+    paths(channel_id, alias)
+    return gateway_status(f"{PREFIX}{channel_id}", alias)
 
 
 def daemon_status():
