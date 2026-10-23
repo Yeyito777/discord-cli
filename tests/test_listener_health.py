@@ -518,6 +518,11 @@ class DaemonAccountTests(unittest.TestCase):
                 accounts.set_notify_account(["paramount"])
                 self.assertEqual(accounts.supervised_notify_alias(), "paramount")
 
+    def test_status_is_a_read_for_every_account(self):
+        from src import accounts
+        self.assertFalse(accounts._is_mutating("notify", ["status"]))
+        self.assertTrue(accounts._is_mutating("notify", ["start"]))
+
 
 if __name__ == "__main__":
     unittest.main()

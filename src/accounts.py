@@ -286,7 +286,7 @@ def _is_mutating(cmd: str, argv: list[str]) -> bool:
         # --sen is therefore also --send and must not bypass account policy.
         return any(value == "--send" or value.startswith("--send=") or value.startswith("--sen") for value in argv)
     if cmd == "notify":
-        return bool(argv and argv[0] not in {"list", "help", "-h", "--help"})
+        return bool(argv and argv[0] not in {"list", "status", "help", "-h", "--help"})
     return cmd in {
         "send", "reply", "edit", "delete", "del", "react", "unreact",
         "listen", "unlisten", "join", "leave",
