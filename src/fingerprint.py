@@ -15,15 +15,18 @@ import time
 import uuid
 from pathlib import Path
 
-CLIENT_VERSION = "0.0.115"
-ELECTRON_VERSION = "37.6.0"
-CHROME_VERSION = "138.0.7204.251"
+# Linux stable 1.0.167 (2026-10-28): updates.discord.com manifest, versions read
+# from the package's build_info.json and Discord binary. Discord refuses phone
+# verification ("update your app") from the old 0.0.x line.
+CLIENT_VERSION = "1.0.167"
+ELECTRON_VERSION = "44.9.3"
+CHROME_VERSION = "152.0.7977.167"
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     f"(KHTML, like Gecko) discord/{CLIENT_VERSION} "
     f"Chrome/{CHROME_VERSION} Electron/{ELECTRON_VERSION} Safari/537.36"
 )
-FALLBACK_BUILD_NUMBER = 641803  # observed 2026-10-19
+FALLBACK_BUILD_NUMBER = 653945  # observed 2026-10-28
 BUILD_NUMBER_TTL = 12 * 60 * 60
 
 # One launch per process, shared by REST and Gateway like a single client run.
