@@ -334,6 +334,22 @@ class ApiCaptchaFallbackTests(unittest.TestCase):
                     "POST", "/invites/example", body={}, status=400, raw=raw,
                 )
 
+    def test_anti_abuse_block_is_named_despite_unknown_message(self):
+        raw = json.dumps(CAPTCHA_PAYLOAD).encode()
+        blocked = captcha.BrowserReplayResult(
+            status=403,
+            text='{"message": "Unknown Message", "code": 10008}',
+            body={"message": "Unknown Message", "code": 10008},
+        )
+        with (
+            patch.object(captcha, "complete_invite", return_value=blocked),
+            patch.object(api, "get", return_value={}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Unknown Message.*anti-abuse"):
+                api._maybe_retry_with_vimbrowser_captcha(
+                    "POST", "/invites/example", body={}, status=400, raw=raw,
+                )
+
     def test_unavailable_browser_error_retains_captcha_reason(self):
         raw = json.dumps(CAPTCHA_PAYLOAD).encode()
         unavailable = captcha.VimbrowserUnavailable(

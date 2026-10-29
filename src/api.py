@@ -194,6 +194,7 @@ def _maybe_retry_with_vimbrowser_captcha(
         raise RuntimeError(
             "Discord rejected the request replayed by vimbrowser after captcha "
             f"completion (HTTP {replay.status}): {replay.text[:500]}"
+            f"{_anti_abuse_note(replay.status, replay.body)}"
         )
 
     if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
@@ -246,6 +247,13 @@ def _retry_after(resp, raw):
         except (ValueError, TypeError, AttributeError):
             continue
     return None
+
+
+def _anti_abuse_note(status, body):
+    """Discord's anti-abuse block reads "Unknown Message"; say what it is."""
+    if status == 403 and isinstance(body, dict) and body.get("code") == 10008:
+        return " — Discord's anti-abuse system blocked this request"
+    return ""
 
 
 class UnknownOutcome(RuntimeError):
@@ -373,13 +381,14 @@ def _request(method, path, body=None, body_bytes=None, token=None, params=None,
             return result
 
         # Error handling
+        err = None
         try:
             err = json.loads(raw)
             msg = err.get("message", raw.decode("utf-8", errors="replace"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             msg = raw.decode("utf-8", errors="replace") if raw else f"HTTP {status}"
 
-        raise RuntimeError(f"HTTP {status}: {msg}")
+        raise RuntimeError(f"HTTP {status}: {msg}{_anti_abuse_note(status, err)}")
 
     except Exception as e:
         if isinstance(e, RuntimeError):
