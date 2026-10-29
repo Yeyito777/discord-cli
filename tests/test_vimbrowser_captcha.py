@@ -49,6 +49,8 @@ class FakeInviteIpc:
         self.closed = None
         self.cleared = None
         self.clicked = False
+        self.calls = []
+        self.page_error = None
 
     def require_context_tabs(self):
         pass
@@ -66,11 +68,22 @@ class FakeInviteIpc:
         if "has_action" in script:
             return json.dumps({"has_code": True, "has_action": True, "body": "Invite"})
         if "action.click" in script:
+            self.calls.append("click")
             self.clicked = True
             return True
+        if "unable to accept invite" in script:
+            return json.dumps({
+                "error": self.page_error,
+                "captcha": False,
+                "body": f"bbchallenge\n{self.page_error}" if self.page_error else "",
+            })
         raise AssertionError(f"Unexpected invite script: {script[:80]}")
 
+    def network_capture_on(self, tab_id, url_prefix):
+        self.calls.append(("capture", tab_id, url_prefix))
+
     def network_clear(self, tab_id):
+        self.calls.append("clear")
         self.cleared = tab_id
 
     def network_list(self, tab_id):
@@ -149,6 +162,88 @@ class VimbrowserCaptchaTests(unittest.TestCase):
         self.assertEqual(ipc.cleared, 23)
         self.assertTrue(ipc.clicked)
         self.assertEqual(ipc.closed, 23)
+
+    def test_invite_turns_network_capture_on_before_clicking(self):
+        # vimbrowser records nothing until capture is on, which left the CLI
+        # blind to Discord's answer and waiting out its whole timeout.
+        ipc = FakeInviteIpc()
+        with patch.object(captcha, "_context_name", return_value="discord-paramount"):
+            captcha.complete_invite("example", "account-token", ipc=ipc, timeout_secs=2)
+        self.assertEqual(
+            ipc.calls,
+            [("capture", 23, "https://discord.com/api/"), "clear", "click"],
+        )
+
+    def test_invite_refusal_is_returned_from_any_api_version(self):
+        ipc = FakeInviteIpc()
+        ipc.network_list = lambda tab_id: [
+            {
+                "id": 3,
+                "url": "https://discord.com/api/v9/invites/examplelonger",
+                "method": "POST",
+                "status": 200,
+                "complete": True,
+            },
+            {
+                "id": 4,
+                "url": "https://discord.com/api/v10/invites/example?inputValue=example",
+                "method": "POST",
+                "status": 403,
+                "complete": True,
+            },
+        ]
+        ipc.network_body = lambda tab_id, request_id: (
+            '{"message":"Missing Access","code":50001}'
+        )
+        with patch.object(captcha, "_context_name", return_value="discord-paramount"):
+            result = captcha.complete_invite("example", "account-token", ipc=ipc, timeout_secs=2)
+        self.assertEqual(result.status, 403)
+        self.assertEqual(result.body["code"], 50001)
+
+    def test_invite_page_error_fails_fast_when_response_is_not_captured(self):
+        ipc = FakeInviteIpc()
+        ipc.network_list = lambda tab_id: []
+        ipc.page_error = "Unable to accept invite"
+        with (
+            patch.object(captcha, "_context_name", return_value="discord-paramount"),
+            patch.object(captcha, "_PAGE_ERROR_GRACE_SECS", 0.0),
+        ):
+            with self.assertRaisesRegex(
+                captcha.VimbrowserCaptchaError,
+                "refused the invite.*Unable to accept invite",
+            ):
+                captcha.complete_invite("example", "account-token", ipc=ipc, timeout_secs=30)
+        self.assertEqual(ipc.closed, 23)
+
+    def test_invite_membership_is_not_polled_every_second(self):
+        ipc = FakeInviteIpc()
+        ipc.network_list = lambda tab_id: []
+        clock = [1000.0]
+        checks = []
+
+        def membership_check():
+            checks.append(clock[0])
+            return None
+
+        def fake_sleep(seconds):
+            clock[0] += seconds
+
+        with (
+            patch.object(captcha, "_context_name", return_value="discord-paramount"),
+            patch.object(captcha.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(captcha.time, "sleep", side_effect=fake_sleep),
+        ):
+            with self.assertRaisesRegex(captcha.VimbrowserCaptchaError, "timed out"):
+                captcha.complete_invite(
+                    "example",
+                    "account-token",
+                    ipc=ipc,
+                    timeout_secs=30,
+                    membership_check=membership_check,
+                )
+        self.assertLessEqual(len(checks), 30 / captcha._MEMBERSHIP_POLL_SECS + 1)
+        gaps = [b - a for a, b in zip(checks, checks[1:])]
+        self.assertTrue(all(gap >= captcha._MEMBERSHIP_POLL_SECS for gap in gaps))
 
     def test_invite_redirect_success_is_detected_from_membership(self):
         ipc = FakeInviteIpc()

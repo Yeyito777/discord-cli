@@ -25,6 +25,12 @@ from src.accounts import selected_alias
 
 DEFAULT_TIMEOUT_SECS = 300
 _REQUIRED_IPC_COMMAND = "open-background-context-tab"
+_DISCORD_API_PREFIX = "https://discord.com/api/"
+# Each check lists every guild; once a second trips Discord's rate limit.
+_MEMBERSHIP_POLL_SECS = 5.0
+# Fallback for a refusal the network capture missed. Long enough that an error
+# left over from the captcha round does not end a join still in flight.
+_PAGE_ERROR_GRACE_SECS = 10.0
 
 
 class VimbrowserCaptchaError(RuntimeError):
@@ -204,6 +210,10 @@ class VimbrowserIpc:
             )
         return matches[0]["id"]
 
+    def network_capture_on(self, tab_id: int, url_prefix: str) -> None:
+        # Capture is off by default; without it network_list stays empty.
+        self.send_json(f"network {tab_id} capture on {url_prefix}")
+
     def network_clear(self, tab_id: int) -> None:
         self.send_json(f"network {tab_id} clear")
 
@@ -344,16 +354,44 @@ def _wait_for_invite_action(ipc: VimbrowserIpc, tab_id: int, code: str,
     )
 
 
+def _invite_page_error_script() -> str:
+    return """
+    (() => {
+      const text = document.body?.innerText || '';
+      const match = text.match(/unable to accept invite|invite invalid/i);
+      return JSON.stringify({
+        error: match ? match[0] : null,
+        captcha: !!document.querySelector('iframe[src*="hcaptcha"]'),
+        body: text.slice(0, 500)
+      });
+    })()
+    """
+
+
+def _invite_page_error(ipc: VimbrowserIpc, tab_id: int) -> str | None:
+    """Return the page text when Discord web shows a final invite error."""
+    try:
+        raw = ipc.eval(tab_id, _invite_page_error_script())
+        state = json.loads(raw) if isinstance(raw, str) else {}
+    except (VimbrowserCaptchaError, json.JSONDecodeError):
+        return None
+    if not state.get("error") or state.get("captcha"):
+        return None
+    return str(state.get("body") or state["error"]).replace("\n", " ")[:240]
+
+
 def _invite_network_result(ipc: VimbrowserIpc, tab_id: int, code: str,
                            deadline: float, *, expected_guild_id: str | None = None,
                            expected_guild_name: str | None = None,
                            membership_check=None) -> BrowserReplayResult:
-    expected = f"/api/v9/invites/{code}"
+    # Discord web may use any API version and add a query string.
+    expected = re.compile(rf"/api/v\d+/invites/{re.escape(code)}(?:[?#]|$)")
     seen_failures = set()
     next_membership_check = 0.0
+    page_error_since = None
     while time.monotonic() < deadline:
         for request in reversed(ipc.network_list(tab_id)):
-            if request.get("method") != "POST" or expected not in str(request.get("url") or ""):
+            if request.get("method") != "POST" or not expected.search(str(request.get("url") or "")):
                 continue
             if not request.get("complete"):
                 continue
@@ -375,8 +413,18 @@ def _invite_network_result(ipc: VimbrowserIpc, tab_id: int, code: str,
                 return BrowserReplayResult(status=status, text=text, body=body)
 
         now = time.monotonic()
+        page_error = _invite_page_error(ipc, tab_id)
+        if page_error is None:
+            page_error_since = None
+        elif page_error_since is None:
+            page_error_since = now
+        elif now - page_error_since >= _PAGE_ERROR_GRACE_SECS:
+            raise VimbrowserCaptchaError(
+                "Discord web refused the invite and its response was not "
+                f"captured. Page text: {page_error}"
+            )
         if membership_check is not None and now >= next_membership_check:
-            next_membership_check = now + 1.0
+            next_membership_check = now + _MEMBERSHIP_POLL_SECS
             try:
                 guild = membership_check()
             except RuntimeError:
@@ -421,6 +469,7 @@ def complete_invite(code: str, token: str, *, timeout_secs: int | None = None,
         _wait_for_discord_page(ipc, tab_id, min(deadline, time.monotonic() + 30))
         ipc.eval(tab_id, _invite_bootstrap_script(token, code))
         _wait_for_invite_action(ipc, tab_id, code, min(deadline, time.monotonic() + 45))
+        ipc.network_capture_on(tab_id, _DISCORD_API_PREFIX)
         ipc.network_clear(tab_id)
         clicked = ipc.eval(tab_id, _click_invite_action_script())
         if clicked is not True:
