@@ -22,8 +22,10 @@ def _resolve_mentions(text, guild_id=None):
     """Replace @username with <@user_id> in outgoing messages.
 
     Checks notify config labels first (no API call), then tries guild
-    member search for server channels. Skips @everyone, @here, and
-    already-resolved mentions like <@123>.
+    member search for server channels. Skips @everyone, @here,
+    already-resolved mentions like <@123>, email addresses and URLs. A
+    mention that can't be resolved is sent as literal text (no ping) with
+    a warning on stderr.
     """
     if not text or "@" not in text:
         return text
@@ -63,7 +65,7 @@ def _resolve_mentions(text, guild_id=None):
     unresolved = []
 
     def replacer(match):
-        mention = match.group(1)
+        mention = match.group("mention")
         if mention.lower() in ("everyone", "here"):
             return match.group(0)  # leave @everyone/@here as-is
 
@@ -91,17 +93,26 @@ def _resolve_mentions(text, guild_id=None):
         unresolved.append(mention)
         return match.group(0)
 
-    # Match @username but not <@id> or email-like patterns
-    result = re.sub(r"(?<![<\w])@([\w.]{2,32})(?![\w.])", replacer, text)
+    # URLs and email addresses are matched first and left untouched; a
+    # mention is @name at a word start (nothing alphanumeric before the @).
+    def scan(match):
+        if match.group("mention") is None:
+            return match.group(0)
+        return replacer(match)
+
+    result = re.sub(
+        r"(?P<skip>https?://[^\s<>]+|[\w.+%-]+@[\w-]+(?:\.[\w-]+)+)"
+        r"|(?<![<\w])@(?P<mention>[\w.]{2,32})(?![\w.])",
+        scan, text,
+    )
 
     if unresolved:
         names = ", ".join(f"@{n}" for n in unresolved)
         print(
-            f"Error: could not resolve mention(s): {names}\n"
-            f"Hint: not found in notify.json labels or guild member search",
+            f"Warning: could not resolve mention(s): {names}; sent as plain "
+            f"text without pinging (not found in notify.json labels or guild member search)",
             file=sys.stderr,
         )
-        sys.exit(1)
 
     return result
 

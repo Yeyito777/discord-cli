@@ -170,3 +170,34 @@ class StdinPayloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MentionResolutionTests(unittest.TestCase):
+    def resolve(self, text, labels=None):
+        stderr = io.StringIO()
+        with (
+            patch("src.notify.get_labels", return_value=labels or {}),
+            contextlib.redirect_stderr(stderr),
+        ):
+            return writing._resolve_mentions(text), stderr.getvalue()
+
+    def test_email_address_is_never_a_mention(self):
+        text = "write to yeyito.linerobarcenas@mail.utoronto.ca today"
+        self.assertEqual(self.resolve(text), (text, ""))
+
+    def test_at_inside_url_is_never_a_mention(self):
+        text = "see https://x.com/@bob/status and https://a.b/c?u=@bob"
+        self.assertEqual(self.resolve(text), (text, ""))
+
+    def test_resolvable_mention_becomes_user_ping(self):
+        labels = {"123": {"username": "bob"}}
+        out, err = self.resolve("hi @bob, mail bob@mail.ca", labels)
+        self.assertEqual(out, "hi <@123>, mail bob@mail.ca")
+        self.assertEqual(err, "")
+
+    def test_unresolvable_mention_is_sent_literally_with_a_warning(self):
+        out, err = self.resolve("your @mail.utoronto.ca address")
+        self.assertEqual(out, "your @mail.utoronto.ca address")
+        self.assertIn("Warning", err)
+        self.assertIn("@mail.utoronto.ca", err)
+        self.assertIn("without pinging", err)
