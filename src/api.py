@@ -262,7 +262,8 @@ class UnknownOutcome(RuntimeError):
 
 def _request(method, path, body=None, body_bytes=None, token=None, params=None,
              extra_headers=None, allow_captcha_fallback=True,
-             retry_connection_failure=None, audit=True, mutating=None, _rate_limited=False):
+             retry_connection_failure=None, audit=True, mutating=None, _rate_limited=False,
+             socket_timeout=None):
     """Make an API request with connection pooling. Returns parsed JSON.
 
     ``audit=False`` skips the mutation receipt for non-GET requests that do not
@@ -293,6 +294,10 @@ def _request(method, path, body=None, body_bytes=None, token=None, params=None,
     headers = _build_headers(token, extra_headers)
     entry = _get_connection()
     conn = entry[0]
+    if socket_timeout:
+        conn.timeout = socket_timeout
+        if conn.sock:
+            conn.sock.settimeout(socket_timeout)
 
     sent = False
     try:
@@ -409,6 +414,10 @@ def _request(method, path, body=None, body_bytes=None, token=None, params=None,
         raise RuntimeError(f"Network error: {e}")
 
     finally:
+        if socket_timeout:
+            conn.timeout = 10
+            if conn.sock:
+                conn.sock.settimeout(10)
         _release_connection(entry)
 
 
@@ -640,6 +649,7 @@ def send_message_with_files(channel_id, file_paths, content=None, reply_to=None,
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Content-Length": str(len(body)),
         },
+        socket_timeout=max(30, len(body) / 100_000),  # Discord takes a while to answer a big upload
     )
 
 
