@@ -5,7 +5,8 @@ import argparse
 from src import api
 from src.resolve import resolve_category, resolve_channel, resolve_guild
 
-CHANNEL_TYPES = {"text": 0, "voice": 2, "category": 4, "announcement": 5}
+CHANNEL_TYPES = {"text": 0, "voice": 2, "category": 4, "announcement": 5, "forum": 15}
+TOPIC_LIMITS = {"text": 1024, "announcement": 1024, "forum": 4096}
 
 
 def parse_position(value):
@@ -61,7 +62,10 @@ def create(argv):
     p.add_argument("server", help="Server name or ID")
     p.add_argument("name", help="Channel name (1-100 characters)")
     p.add_argument("--type", choices=sorted(CHANNEL_TYPES), default="text", help="Channel type (default: text)")
-    p.add_argument("--topic", help="Channel topic (text and announcement channels, up to 1024 characters)")
+    p.add_argument("--topic", help="Channel topic: text and announcement channels up to 1024 characters, "
+                                   "or a forum's post guidelines up to 4096")
+    p.add_argument("--tag", action="append", dest="tags", metavar="NAME",
+                   help="Tag posts can use, repeatable (forum channels only, up to 20, 20 characters each)")
     p.add_argument("--position", type=parse_position, metavar="top|N",
                    help="Place it first ('top') or at index N among its siblings (default: Discord's, at the end)")
     p.add_argument("--parent", metavar="CATEGORY", help="Category name or ID to create it in")
@@ -70,10 +74,15 @@ def create(argv):
     if not 1 <= len(args.name) <= 100:
         p.error("channel name must be between 1 and 100 characters")
     if args.topic is not None:
-        if args.type not in ("text", "announcement"):
-            p.error("--topic is only valid for text and announcement channels")
-        if len(args.topic) > 1024:
-            p.error("--topic must be at most 1024 characters")
+        if args.type not in TOPIC_LIMITS:
+            p.error("--topic is only valid for text, announcement and forum channels")
+        if len(args.topic) > TOPIC_LIMITS[args.type]:
+            p.error(f"--topic must be at most {TOPIC_LIMITS[args.type]} characters")
+    if args.tags:
+        if args.type != "forum":
+            p.error("--tag is only valid for forum channels")
+        if len(args.tags) > 20 or not all(1 <= len(tag) <= 20 for tag in args.tags):
+            p.error("a forum takes up to 20 tags of 1-20 characters each")
     if args.parent and args.type == "category":
         p.error("a category cannot have a parent")
 
@@ -91,6 +100,7 @@ def create(argv):
 
     result = api.create_guild_channel(
         guild["id"], args.name, channel_type=channel_type, topic=args.topic, parent_id=parent_id,
+        tags=args.tags,
     )
     channel_id = result["id"]
     name = result.get("name") or args.name
@@ -139,7 +149,7 @@ def dispatch(cmd, argv):
         raise RuntimeError(f"Unknown channel command: {cmd}")
     if not argv or argv[0] in ("-h", "--help"):
         print("usage: discord channel {create,move} ...\n\n"
-              "  create SERVER NAME [--type text] [--topic T] [--position top|N] [--parent CATEGORY]\n"
+              "  create SERVER NAME [--type text] [--topic T] [--tag NAME ...] [--position top|N] [--parent CATEGORY]\n"
               "  move CHANNEL --position top|N [-g SERVER]")
         return
     fn = _SUBCOMMANDS.get(argv[0])

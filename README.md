@@ -10,9 +10,18 @@ Tests: `.venv/bin/python3 -m unittest discover -s tests -t .`
 ## Channels
 
 ```sh
-discord -a ALIAS channel create SERVER NAME [--type text|voice|announcement|category] [--topic T] [--position top|N] [--parent CATEGORY]
+discord -a ALIAS channel create SERVER NAME [--type text|voice|announcement|category|forum] [--topic T] [--tag NAME ...] [--position top|N] [--parent CATEGORY]
 discord -a ALIAS channel move CHANNEL --position top|N [-g SERVER]
 ```
+
+## Forum posts
+
+```sh
+printf '%s' "text" | discord -a ALIAS post FORUM "Title" [-g SERVER] [--tag NAME ...] [-f FILE ...]
+```
+
+The first image attached becomes the post's thumbnail in the forum list. Reply in the post with
+`discord send THREAD_ID`. On a forum, `channel create --topic` sets the post guidelines.
 
 Both need Manage Channels and an explicit `-a` when several accounts exist.
 `create` POSTs `/guilds/{id}/channels` (never resent after an ambiguous

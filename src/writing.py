@@ -9,6 +9,8 @@ from src import api
 from src.payload import read_stdin_text, reject_inline_text, validate_message_length
 from src.resolve import describe_destination, resolve_guild, resolve_channel
 
+FORUM_REQUIRES_TAG = 1 << 4
+
 
 def _validate_files(file_paths):
     """Validate that all file paths exist and are readable."""
@@ -240,6 +242,60 @@ def unreact(argv):
     print(f"Removed {args.emoji} from message {args.message} in channel {args.channel}.")
 
 
+def _forum_tags(parser, channel, names):
+    """Tag IDs for the names given, refusing any the forum doesn't have."""
+    available = channel.get("available_tags") or []
+    by_name = {tag["name"].lower(): tag["id"] for tag in available}
+    listing = ", ".join(tag["name"] for tag in available) or "none"
+    unknown = [name for name in names if name.lower() not in by_name]
+    if unknown:
+        parser.error(f"no such tag: {', '.join(unknown)} (this forum has: {listing})")
+    if channel.get("flags", 0) & FORUM_REQUIRES_TAG and not names:
+        parser.error(f"this forum requires a tag; use --tag (it has: {listing})")
+    return [by_name[name.lower()] for name in names]
+
+
+def post(argv):
+    p = argparse.ArgumentParser(
+        allow_abbrev=False,
+        prog="discord post",
+        description="Start a post in a forum channel. The post's text is read exactly from stdin.",
+        epilog="Inline text is not accepted. Stdin is optional only with --file. Reply in the post "
+               "with `discord send THREAD_ID`.",
+    )
+    p.add_argument("channel", help="Forum channel name or ID")
+    p.add_argument("title", help="Post title (1-100 characters)")
+    p.add_argument("inline_text", nargs="*", help=argparse.SUPPRESS)
+    p.add_argument("-g", "--guild", "--server", dest="guild", help="Server (required if using a channel name)")
+    p.add_argument("--tag", action="append", dest="tags", default=[], metavar="NAME",
+                   help="Tag to apply, by name; repeatable")
+    p.add_argument("-f", "--file", nargs="+", dest="files", metavar="PATH",
+                   help="File(s) to attach; the first image becomes the post's thumbnail")
+    args = p.parse_args(argv)
+
+    reject_inline_text(p, args.inline_text, label="post text")
+    if not 1 <= len(args.title) <= 100:
+        p.error("post title must be between 1 and 100 characters")
+    text = read_stdin_text(p, label="post text", required=not args.files)
+
+    g = resolve_guild(args.guild) if args.guild else None
+    channel = resolve_channel(args.channel, g["id"] if g else None)
+    if channel.get("type") != 15:
+        p.error("posts can only be started in a forum channel; use discord send or discord thread")
+    tag_ids = _forum_tags(p, channel, args.tags)
+    guild_id = channel.get("guild_id") or (g["id"] if g else None)
+
+    text = _resolve_mentions(text, guild_id)
+    validate_message_length(p, text, label="post text")
+    if args.files:
+        _validate_files(args.files)
+    result = api.create_forum_post(channel["id"], args.title, text, file_paths=args.files, applied_tags=tag_ids)
+
+    print(f"Posted \"{result.get('name') or args.title}\" in #{channel.get('name', channel['id'])}. Thread ID: {result['id']}")
+    if guild_id:
+        print(f"https://discord.com/channels/{guild_id}/{result['id']}")
+
+
 def thread(argv):
     p = argparse.ArgumentParser(
         allow_abbrev=False,
@@ -294,7 +350,7 @@ def thread(argv):
     allowed_parent_types = (0, 5) if args.message else (0,)
     if channel_type is not None and channel_type not in allowed_parent_types:
         if channel_type in (15, 16):
-            p.error("forum/media channels create posts, not threads; choose a text channel")
+            p.error("forum and media channels take posts, not threads; use discord post")
         p.error("threads can only be created in a compatible server text channel")
     result = api.create_thread(
         channel["id"],
@@ -326,6 +382,7 @@ _COMMANDS = {
     "react": react,
     "unreact": unreact,
     "thread": thread,
+    "post": post,
 }
 
 

@@ -7,6 +7,7 @@ http.client for keepalive connection pooling.
 import base64
 import http.client
 import json
+import mimetypes
 import os
 import re
 import ssl
@@ -486,13 +487,15 @@ def get_guild_channels(guild_id):
     return get(f"/guilds/{guild_id}/channels")
 
 
-def create_guild_channel(guild_id, name, *, channel_type=0, topic=None, parent_id=None):
+def create_guild_channel(guild_id, name, *, channel_type=0, topic=None, parent_id=None, tags=None):
     """Create a channel in a guild; never resent after an ambiguous failure."""
     body = {"name": name, "type": channel_type}
     if topic is not None:
         body["topic"] = topic
     if parent_id is not None:
         body["parent_id"] = parent_id
+    if tags:
+        body["available_tags"] = [{"name": tag} for tag in tags]
     return post_once(f"/guilds/{guild_id}/channels", body=body)
 
 
@@ -572,55 +575,31 @@ def send_message(channel_id, content, reply_to=None, tts=False):
     return post(f"/channels/{channel_id}/messages", body=body)
 
 
-def send_message_with_files(channel_id, file_paths, content=None, reply_to=None, tts=False):
-    """Send a message with file attachments using multipart/form-data.
+def _file_attachments(file_paths):
+    """Attachment metadata so Discord knows about each uploaded file."""
+    return [{"id": i, "filename": os.path.basename(fp)} for i, fp in enumerate(file_paths)]
+
+
+def _post_multipart(path, payload, file_paths, **kwargs):
+    """POST a JSON payload with files as multipart/form-data.
 
     Discord expects:
-      - A 'payload_json' part with the message body (application/json)
+      - A 'payload_json' part with the body (application/json)
       - One or more 'files[N]' parts with the actual file data
     """
-    _stop_typing(channel_id)
-    import mimetypes
-    import os
-
     boundary = f"----ExoDiscord{uuid.uuid4().hex}"
-
-    # Build payload_json
-    payload = {"tts": tts, "nonce": new_nonce(), "enforce_nonce": True, "flags": 0}
-    if content:
-        payload["content"] = content
-    if reply_to:
-        payload["message_reference"] = {"message_id": reply_to}
-
-    # Populate attachments metadata so Discord knows about each file
-    attachments = []
-    for i, fp in enumerate(file_paths):
-        attachments.append({
-            "id": i,
-            "filename": os.path.basename(fp),
-        })
-    payload["attachments"] = attachments
-
-    # Build multipart body
-    parts = []
-
-    # payload_json part
-    parts.append(
+    parts = [(
         f"--{boundary}\r\n"
         f'Content-Disposition: form-data; name="payload_json"\r\n'
         f"Content-Type: application/json\r\n"
         f"\r\n"
         f"{json.dumps(payload)}\r\n"
-    )
-
-    # File parts
+    ).encode("utf-8")]
     for i, fp in enumerate(file_paths):
         filename = os.path.basename(fp)
         mime_type = mimetypes.guess_type(fp)[0] or "application/octet-stream"
         with open(fp, "rb") as f:
             file_data = f.read()
-
-        # Header portion (text)
         header = (
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="files[{i}]"; filename="{filename}"\r\n'
@@ -628,29 +607,31 @@ def send_message_with_files(channel_id, file_paths, content=None, reply_to=None,
             f"\r\n"
         )
         parts.append(header.encode("utf-8") + file_data + b"\r\n")
-
-    # Closing boundary
-    parts.append(f"--{boundary}--\r\n")
-
-    # Combine into a single bytes body
-    body_parts = []
-    for part in parts:
-        if isinstance(part, str):
-            body_parts.append(part.encode("utf-8"))
-        else:
-            body_parts.append(part)
-    body = b"".join(body_parts)
-
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
     return _request(
         "POST",
-        f"/channels/{channel_id}/messages",
+        path,
         body_bytes=body,
         extra_headers={
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Content-Length": str(len(body)),
         },
         socket_timeout=max(30, len(body) / 100_000),  # Discord takes a while to answer a big upload
+        **kwargs,
     )
+
+
+def send_message_with_files(channel_id, file_paths, content=None, reply_to=None, tts=False):
+    """Send a message with file attachments."""
+    _stop_typing(channel_id)
+    payload = {"tts": tts, "nonce": new_nonce(), "enforce_nonce": True, "flags": 0}
+    if content:
+        payload["content"] = content
+    if reply_to:
+        payload["message_reference"] = {"message_id": reply_to}
+    payload["attachments"] = _file_attachments(file_paths)
+    return _post_multipart(f"/channels/{channel_id}/messages", payload, file_paths)
 
 
 def edit_message(channel_id, message_id, content):
@@ -793,6 +774,24 @@ def create_thread(channel_id, name, *, message_id=None,
     if thread_type == 12:
         body["invitable"] = invitable
     return post(f"/channels/{channel_id}/threads", body=body)
+
+def create_forum_post(channel_id, title, content=None, file_paths=None, applied_tags=None):
+    """Start a post in a forum channel: a thread and its first message at once.
+
+    Never resent after an ambiguous failure, since that could post it twice.
+    """
+    body = {"name": title, "message": {}}
+    if content:
+        body["message"]["content"] = content
+    if applied_tags:
+        body["applied_tags"] = applied_tags
+    path = f"/channels/{channel_id}/threads"
+    params = {"use_nested_fields": "true"}      # API v9 ignores `message` without it
+    if file_paths:
+        body["message"]["attachments"] = _file_attachments(file_paths)
+        return _post_multipart(path, body, file_paths, params=params, retry_connection_failure=False)
+    return post_once(path, body=body, params=params)
+
 
 def get_active_threads(guild_id):
     """Get active threads in a guild.

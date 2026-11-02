@@ -26,6 +26,7 @@ commands:
   pins         Get pinned messages
   threads      List active threads in a server
   thread       Create a thread                         (subcommand: create)
+  post         Start a post in a forum channel
   commands     List Discord application commands
   command      Invoke a Discord application command
   members      List or search server members
@@ -119,7 +120,7 @@ case "$cmd" in
         exec "$PYTHON" -c "import sys; from src.cli import run; run('src.gifs', 'gifs', sys.argv[1:])" "$@" ;;
     download)
         exec "$PYTHON" -c "import sys; from src.cli import run; run('src.downloading', '$cmd', sys.argv[1:])" "$@" ;;
-    send|reply|edit|delete|del|react|unreact|thread)
+    send|reply|edit|delete|del|react|unreact|thread|post)
         exec "$PYTHON" -c "import sys; from src.cli import run; run('src.writing', '$cmd', sys.argv[1:])" "$@" ;;
     channel)
         exec "$PYTHON" -c "import sys; from src.cli import run; run('src.channels', '$cmd', sys.argv[1:])" "$@" ;;

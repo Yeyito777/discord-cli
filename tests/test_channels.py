@@ -102,7 +102,7 @@ class ChannelCliTests(unittest.TestCase):
             contextlib.redirect_stdout(out),
         ):
             channels.create([GUILD, "polymarket", "--topic", "updates", "--position", "top"])
-        create.assert_called_once_with(GUILD, "polymarket", channel_type=0, topic="updates", parent_id=None)
+        create.assert_called_once_with(GUILD, "polymarket", channel_type=0, topic="updates", parent_id=None, tags=None)
         self.assertEqual(setter.call_args.args[1][0], {"id": "50", "position": 0})
         self.assertIn("Created text channel #polymarket. Channel ID: 50", out.getvalue())
         self.assertIn("Moved to position 0 (top).", out.getvalue())
