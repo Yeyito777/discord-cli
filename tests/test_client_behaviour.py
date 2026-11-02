@@ -128,10 +128,34 @@ class RateLimitTests(unittest.TestCase):
                 raise api.RateLimited("Rate limited", 30)
             return {"threads": [{"id": "t1"}]}
 
-        with patch.object(api, "get_guild_channels", return_value=channels), patch.object(api, "get", side_effect=get):
+        with (
+            patch.object(api, "get_guild_channels", return_value=channels),
+            patch.object(api, "get", side_effect=get),
+            patch.object(api.time, "sleep"),
+        ):
             result = api.get_active_threads("g")
         self.assertEqual([t["id"] for t in result["threads"]], ["t1"])
         self.assertEqual([ch["id"] for ch, _ in result["failed"]], ["2"])
+
+    def test_a_rate_limited_channel_waits_and_is_searched_again(self):
+        channels = [{"id": "1", "name": "a", "type": 0}, {"id": "2", "name": "b", "type": 0}]
+        calls = []
+
+        def get(path, **_kwargs):
+            calls.append(path)
+            if path.startswith("/channels/2") and calls.count(path) == 1:
+                raise api.RateLimited("Rate limited", 1.5)
+            return {"threads": [{"id": "t" + path.split("/")[2]}]}
+
+        with (
+            patch.object(api, "get_guild_channels", return_value=channels),
+            patch.object(api, "get", side_effect=get),
+            patch.object(api.time, "sleep") as sleep,
+        ):
+            result = api.get_active_threads("g")
+        self.assertEqual([t["id"] for t in result["threads"]], ["t1", "t2"])
+        self.assertEqual(result["failed"], [])
+        sleep.assert_called_once()
 
     def test_thread_listing_can_be_limited_to_one_channel_and_keeps_order(self):
         channels = [{"id": str(i), "name": f"c{i}", "type": 0} for i in range(1, 9)]

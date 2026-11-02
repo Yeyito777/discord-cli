@@ -14,6 +14,16 @@ discord -a ALIAS channel create SERVER NAME [--type text|voice|announcement|cate
 discord -a ALIAS channel move CHANNEL --position top|N [-g SERVER]
 ```
 
+## Threads
+
+```sh
+discord -a ALIAS threads SERVER [CHANNEL]
+```
+
+Without a channel it searches every channel one at a time, since Discord limits user accounts to about
+one thread search every few seconds per server: minutes on a big server. Name the channel or forum to
+get an answer in about a second.
+
 ## Forum posts
 
 ```sh

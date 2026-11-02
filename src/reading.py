@@ -158,6 +158,9 @@ def threads(argv):
 
     g = resolve_guild(args.server)
     only = [resolve_channel(args.channel, g["id"])["id"]] if args.channel else None
+    if not only:
+        print("  Searching every channel; Discord allows about one search every few seconds, so a big server "
+              "takes minutes. Name a channel or forum to be fast: discord threads SERVER CHANNEL", file=sys.stderr)
     data = api.get_active_threads(g["id"], only)
     thread_list = data.get("threads", [])
     failed = data.get("failed") or []

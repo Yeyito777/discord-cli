@@ -793,43 +793,44 @@ def create_forum_post(channel_id, title, content=None, file_paths=None, applied_
     return post_once(path, body=body, params=params)
 
 
-THREAD_SEARCH_WORKERS = 4
+THREAD_SEARCH_RETRIES = 8
 
 
 def get_active_threads(guild_id, channel_ids=None):
     """Get active threads in a guild, or only in the channels given.
 
     The /guilds/{id}/threads/active endpoint is bot-only, so user accounts
-    search channel by channel: a few at a time, since a big server has
-    dozens of channels at about half a second each.
+    search channel by channel. Discord limits those searches across the whole
+    server, so they go one at a time, and a channel that hits the limit waits
+    and is tried again rather than left out. Name one channel to be fast.
     """
-    from concurrent.futures import ThreadPoolExecutor
-
     channels = get_guild_channels(guild_id)
     text_channels = [c for c in channels if c.get("type", 0) in (0, 5, 15, 16)
                      and (channel_ids is None or c["id"] in channel_ids)]
 
-    def search(ch):
-        try:
-            data = get(
-                f"/channels/{ch['id']}/threads/search",
-                params={
-                    "archived": "false",
-                    "sort_by": "last_message_time",
-                    "sort_order": "desc",
-                    "limit": "25",
-                },
-            )
-            return data.get("threads", []), None
-        except RuntimeError as e:
-            return [], (ch, str(e))
-
     all_threads, failed = [], []
-    with ThreadPoolExecutor(max_workers=THREAD_SEARCH_WORKERS) as pool:
-        for found, error in pool.map(search, text_channels):  # map keeps channel order
-            all_threads.extend(found)
-            if error:
-                failed.append(error)
+    for ch in text_channels:
+        for attempt in range(THREAD_SEARCH_RETRIES + 1):
+            try:
+                data = get(
+                    f"/channels/{ch['id']}/threads/search",
+                    params={
+                        "archived": "false",
+                        "sort_by": "last_message_time",
+                        "sort_order": "desc",
+                        "limit": "25",
+                    },
+                )
+                all_threads.extend(data.get("threads", []))
+                break
+            except RateLimited as e:
+                if attempt == THREAD_SEARCH_RETRIES:
+                    failed.append((ch, str(e)))
+                else:
+                    time.sleep((e.retry_after or 5.0) + 0.1)
+            except RuntimeError as e:
+                failed.append((ch, str(e)))
+                break
 
     return {"threads": all_threads, "failed": failed}
 
