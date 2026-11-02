@@ -1,3 +1,5 @@
+import io
+import contextlib
 import base64
 import json
 import os
@@ -171,6 +173,39 @@ class RateLimitTests(unittest.TestCase):
             one = api.get_active_threads("g", ["5"])
         self.assertEqual([t["id"] for t in everything["threads"]], [f"t{i}" for i in range(1, 9)])
         self.assertEqual([t["id"] for t in one["threads"]], ["t5"])
+
+
+class ThreadsCommandTests(unittest.TestCase):
+    def run_threads(self, argv):
+        from src import reading
+        err = io.StringIO()
+        with (
+            patch.object(reading, "resolve_guild", return_value={"id": "g"}),
+            patch.object(reading, "resolve_channel", return_value={"id": "5"}),
+            patch.object(reading.api, "get_guild_channels",
+                         return_value=[{"id": str(i), "type": 0} for i in range(40)] + [{"id": "v", "type": 2}]),
+            patch.object(reading.api, "get_active_threads", return_value={"threads": [], "failed": []}) as search,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(err),
+        ):
+            reading.threads(argv)
+        return search, err.getvalue()
+
+    def test_a_channel_is_searched_alone(self):
+        search, _ = self.run_threads(["srv", "forum-preview"])
+        search.assert_called_once_with("g", ["5"])
+
+    def test_all_says_how_long_before_it_starts(self):
+        search, err = self.run_threads(["srv", "--all"])
+        self.assertEqual(len(search.call_args.args[1]), 40)
+        self.assertIn("40 channels", err)
+        self.assertIn("about 3 min", err)
+
+    def test_a_whole_server_needs_all(self):
+        with self.assertRaises(SystemExit):
+            self.run_threads(["srv"])
+        with self.assertRaises(SystemExit):
+            self.run_threads(["srv", "x", "--all"])
 
 
 class GatewayBehaviourTests(unittest.TestCase):

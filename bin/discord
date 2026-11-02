@@ -24,7 +24,7 @@ commands:
   dm           Read or send DMs
   search       Search messages                        (alias: s)
   pins         Get pinned messages
-  threads      List active threads in a server
+  threads      List active threads in a channel, or a whole server with --all
   thread       Create a thread                         (subcommand: create)
   post         Start a post in a forum channel
   commands     List Discord application commands

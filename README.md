@@ -17,12 +17,12 @@ discord -a ALIAS channel move CHANNEL --position top|N [-g SERVER]
 ## Threads
 
 ```sh
-discord -a ALIAS threads SERVER [CHANNEL]
+discord -a ALIAS threads SERVER CHANNEL     # one channel or forum, about a second
+discord -a ALIAS threads SERVER --all       # every channel, for bulk listing
 ```
 
-Without a channel it searches every channel one at a time, since Discord limits user accounts to about
-one thread search every few seconds per server: minutes on a big server. Name the channel or forum to
-get an answer in about a second.
+`--all` searches one channel at a time, since Discord limits user accounts to about one thread search
+every 4 s per server: minutes on a big server, and it says how long before it starts.
 
 ## Forum posts
 

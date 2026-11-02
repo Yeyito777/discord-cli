@@ -151,16 +151,27 @@ def pins(argv):
 
 
 def threads(argv):
-    p = argparse.ArgumentParser(allow_abbrev=False, prog="discord threads", description="List active threads in a server.")
+    p = argparse.ArgumentParser(
+        allow_abbrev=False, prog="discord threads",
+        description="List active threads in a channel or forum, or with --all in every channel of a server.",
+    )
     p.add_argument("server", help="Server name or ID")
-    p.add_argument("channel", nargs="?", help="Only this channel or forum (name or ID); much faster on big servers")
+    p.add_argument("channel", nargs="?", help="Channel or forum, name or ID (about a second)")
+    p.add_argument("--all", action="store_true",
+                   help="Search every channel instead; Discord allows about one search every 4 s, so a big "
+                        "server takes minutes (for bulk listing)")
     args = p.parse_args(argv)
+    if bool(args.channel) == args.all:
+        p.error("name a channel or forum (fast), or use --all to search every channel (minutes on a big server)")
 
     g = resolve_guild(args.server)
-    only = [resolve_channel(args.channel, g["id"])["id"]] if args.channel else None
-    if not only:
-        print("  Searching every channel; Discord allows about one search every few seconds, so a big server "
-              "takes minutes. Name a channel or forum to be fast: discord threads SERVER CHANNEL", file=sys.stderr)
+    if args.all:
+        only = [c["id"] for c in api.get_guild_channels(g["id"]) if c.get("type", 0) in (0, 5, 15, 16)]
+        minutes = len(only) * 4.5 / 60
+        wait = f"about {minutes:.0f} min" if minutes >= 1.5 else "under a minute or two"
+        print(f"  Searching {len(only)} channels one at a time ({wait}).", file=sys.stderr)
+    else:
+        only = [resolve_channel(args.channel, g["id"])["id"]]
     data = api.get_active_threads(g["id"], only)
     thread_list = data.get("threads", [])
     failed = data.get("failed") or []
