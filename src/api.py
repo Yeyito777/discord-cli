@@ -793,18 +793,23 @@ def create_forum_post(channel_id, title, content=None, file_paths=None, applied_
     return post_once(path, body=body, params=params)
 
 
-def get_active_threads(guild_id):
-    """Get active threads in a guild.
+THREAD_SEARCH_WORKERS = 4
 
-    The /guilds/{id}/threads/active endpoint is bot-only.
-    For user accounts, we fetch threads via channels.
+
+def get_active_threads(guild_id, channel_ids=None):
+    """Get active threads in a guild, or only in the channels given.
+
+    The /guilds/{id}/threads/active endpoint is bot-only, so user accounts
+    search channel by channel: a few at a time, since a big server has
+    dozens of channels at about half a second each.
     """
-    channels = get_guild_channels(guild_id)
-    text_channels = [c for c in channels if c.get("type", 0) in (0, 5, 15, 16)]
+    from concurrent.futures import ThreadPoolExecutor
 
-    all_threads = []
-    failed = []
-    for ch in text_channels:
+    channels = get_guild_channels(guild_id)
+    text_channels = [c for c in channels if c.get("type", 0) in (0, 5, 15, 16)
+                     and (channel_ids is None or c["id"] in channel_ids)]
+
+    def search(ch):
         try:
             data = get(
                 f"/channels/{ch['id']}/threads/search",
@@ -815,9 +820,16 @@ def get_active_threads(guild_id):
                     "limit": "25",
                 },
             )
-            all_threads.extend(data.get("threads", []))
+            return data.get("threads", []), None
         except RuntimeError as e:
-            failed.append((ch, str(e)))
+            return [], (ch, str(e))
+
+    all_threads, failed = [], []
+    with ThreadPoolExecutor(max_workers=THREAD_SEARCH_WORKERS) as pool:
+        for found, error in pool.map(search, text_channels):  # map keeps channel order
+            all_threads.extend(found)
+            if error:
+                failed.append(error)
 
     return {"threads": all_threads, "failed": failed}
 

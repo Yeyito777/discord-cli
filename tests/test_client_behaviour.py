@@ -133,6 +133,21 @@ class RateLimitTests(unittest.TestCase):
         self.assertEqual([t["id"] for t in result["threads"]], ["t1"])
         self.assertEqual([ch["id"] for ch, _ in result["failed"]], ["2"])
 
+    def test_thread_listing_can_be_limited_to_one_channel_and_keeps_order(self):
+        channels = [{"id": str(i), "name": f"c{i}", "type": 0} for i in range(1, 9)]
+        searched = []
+
+        def get(path, **_kwargs):
+            cid = path.split("/")[2]
+            searched.append(cid)
+            return {"threads": [{"id": "t" + cid}]}
+
+        with patch.object(api, "get_guild_channels", return_value=channels), patch.object(api, "get", side_effect=get):
+            everything = api.get_active_threads("g")
+            one = api.get_active_threads("g", ["5"])
+        self.assertEqual([t["id"] for t in everything["threads"]], [f"t{i}" for i in range(1, 9)])
+        self.assertEqual([t["id"] for t in one["threads"]], ["t5"])
+
 
 class GatewayBehaviourTests(unittest.TestCase):
     def listener(self):

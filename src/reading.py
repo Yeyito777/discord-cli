@@ -153,10 +153,12 @@ def pins(argv):
 def threads(argv):
     p = argparse.ArgumentParser(allow_abbrev=False, prog="discord threads", description="List active threads in a server.")
     p.add_argument("server", help="Server name or ID")
+    p.add_argument("channel", nargs="?", help="Only this channel or forum (name or ID); much faster on big servers")
     args = p.parse_args(argv)
 
     g = resolve_guild(args.server)
-    data = api.get_active_threads(g["id"])
+    only = [resolve_channel(args.channel, g["id"])["id"]] if args.channel else None
+    data = api.get_active_threads(g["id"], only)
     thread_list = data.get("threads", [])
     failed = data.get("failed") or []
     if failed:
