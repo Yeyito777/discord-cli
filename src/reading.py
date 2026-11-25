@@ -127,15 +127,37 @@ def search(argv):
 
     if args.guild:
         g = resolve_guild(args.guild)
-        data = api.search_guild(g["id"], content=args.query, channel_id=args.channel, limit=args.limit)
+        fetch = lambda limit, offset: api.search_guild(
+            g["id"], content=args.query, channel_id=args.channel, limit=limit, offset=offset)
     elif args.channel:
-        data = api.search_channel(args.channel, content=args.query, limit=args.limit)
+        fetch = lambda limit, offset: api.search_channel(
+            args.channel, content=args.query, limit=limit, offset=offset)
     else:
         raise RuntimeError(
             "Search requires --guild/-g or --channel/-c. "
             "Example: discord search 'hello' -g 'My Server'"
         )
-    print(fmt.format_search_results(data))
+    print(fmt.format_search_results(_search_pages(fetch, args.limit)))
+
+
+SEARCH_PAGE = 25  # Discord rejects search limits above 25 with HTTP 400
+
+
+def _search_pages(fetch, limit):
+    """Fetch up to `limit` search hits, paging by offset in Discord's 25-hit pages."""
+    limit = max(1, limit)
+    data = fetch(min(limit, SEARCH_PAGE), 0)
+    groups = list(data.get("messages", []))
+    while len(groups) < limit:
+        page = fetch(min(limit - len(groups), SEARCH_PAGE), len(groups))
+        more = page.get("messages", [])
+        if not more:
+            break
+        groups.extend(more)
+        if len(groups) >= page.get("total_results", 0):
+            break
+    data["messages"] = groups[:limit]
+    return data
 
 
 def pins(argv):
